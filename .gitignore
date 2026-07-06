@@ -8,7 +8,6 @@ assets_c/
 # Object files
 *.o
 *.ko
-*.obj
 *.elf
 
 # Linker output
