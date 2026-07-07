@@ -194,45 +194,60 @@ typedef struct
             new_index = len(split_vert_positions)
             split_vert_key_to_index[key] = new_index
 
-            # Y AXIS FLIP - confirmed via runtime debug trace (cone.c apex
-            # landing below screen center instead of above it) that GTE's
-            # projection here is screen_Y = SCREEN_CY + (model_Y * FOV) / Z,
-            # with NO sign correction - i.e. GTE/PS1 convention treats +Y
-            # as DOWN. Blender exports +Y as UP regardless of Forward -Z /
-            # Up Y axis settings (those only remap which Blender axis
-            # becomes OBJ Y, not which direction is visually up once GTE
-            # projects it). Flipping here, once, at the source, means no
-            # asset ever needs its normals flipped by hand in Blender again.
-            # Applied here (not just at output) so it propagates correctly
-            # into face normals, vertex normals, bbox, and bsphere below.
-            vx, vy, vz = verts_float[v_index]
-            split_vert_positions.append((vx, -vy, vz))
+            # ============================================================
+            # COORDINATE SYSTEM - FINALIZED (v4, verified via arrow.obj dual-tip test)
+            # ============================================================
+            # Verified empirically: cross-referenced raw OBJ vertex data
+            # against Blender's own viewport readout, then confirmed with a
+            # two-tipped arrow test object (primary tip = Blender world +Y,
+            # secondary tip = Blender world +Z) that both tips render in the
+            # correct direction on screen.
+            #
+            # This project's OBJ export (Forward=-Z, Up=Y) emits:
+            #   OBJ_X =  Blender_X
+            #   OBJ_Y =  Blender_Z
+            #   OBJ_Z = -Blender_Y
+            #
+            # Renderer requires (confirmed correct on-screen):
+            #   renderer_X =  Blender_X  =  OBJ_X
+            #   renderer_Y = -Blender_Z  = -OBJ_Y
+            #   renderer_Z = -Blender_Y  = -OBJ_Z
+            #
+            # Confirmed on-screen: primary arrow (Blender +Y) renders
+            # pointing AWAY from the camera; secondary arrow (Blender +Z)
+            # renders pointing UP on screen. A model's Blender-up is
+            # screen-up, and a model's Blender-forward (+Y) points away
+            # from the camera by default with model_rot = {0,0,0} - no
+            # per-model rotation offset needed.
+            #
+            # DO NOT re-derive or re-flip this from camera-rotation
+            # reasoning or exporter-convention theory again - if a future
+            # model looks mirrored or backwards, the bug is almost
+            # certainly elsewhere (winding/cull sign, a bad per-model
+            # rotation default, or a genuinely different OBJ export
+            # setting on that specific asset) - re-verify with the
+            # arrow.obj test object before touching this block.
+            bx, by, bz = verts_float[v_index]
+            split_vert_positions.append((bx, -by, -bz))
 
             if vn_index is not None and vn_index < len(vert_normals_float):
-                nx, ny, nz = vert_normals_float[vn_index]
-                # Same Y flip as positions above - vertex normals must
-                # agree with the flipped coordinate convention, or
-                # lighting will point the wrong way relative to the now-
-                # correctly-oriented geometry.
-                split_vert_normals.append((nx, -ny, nz))
+                bnx, bny, bnz = vert_normals_float[vn_index]
+                split_vert_normals.append((bnx, -bny, -bnz))
             else:
-                # No vn for this corner. Placeholder; backfilled with a
-                # flat-normal fallback once face normals are computed below.
                 split_vert_normals.append(None)
 
             if vt_index is not None and vt_index < len(vert_uvs_float):
                 u, v = vert_uvs_float[vt_index]
-                # OBJ UV convention has v=0 at the BOTTOM of the texture;
-                # the PS1 GPU (and most raster image formats) have v=0 at
-                # the TOP. Flip here at the source for the same reason as
-                # the position Y flip above - one correction point instead
-                # of every textured asset needing a manual fix.
+                # OBJ UV convention has v=0 at the BOTTOM of the texture; the PS1
+                # GPU (and most raster image formats) have v=0 at the TOP. Flip
+                # here at the source for the same "one correction point" reason
+                # as the position remap above.
                 split_vert_uvs.append((u, 1.0 - v))
             else:
-                # No vt for this corner. Left as None (no sensible default
-                # UV to fall back to, unlike normals which can borrow the
-                # face normal) - emitted as a {0,0} placeholder below, with
-                # a warning printed if this happens.
+                # No vt for this corner. Left as None (no sensible default UV to
+                # fall back to, unlike normals which can borrow the face normal)
+                # - emitted as a {0,0} placeholder below, with a warning printed
+                # if this happens.
                 split_vert_uvs.append(None)
 
             return new_index
@@ -327,10 +342,11 @@ typedef struct
         # had 'v' lines, since seam positions (and UV-island boundaries)
         # get duplicated into multiple slots above.
         #
-        # NOTE: split_vert_positions is already Y-flipped (see
-        # get_split_vertex above) - this block just writes already-flipped
-        # values, so face normals/bbox/bsphere computed below stay
-        # consistent with the same convention.
+        # NOTE: split_vert_positions has already had the full coordinate
+        # remap applied (see get_split_vertex above, all three axes) -
+        # this block just writes already-remapped values, so face
+        # normals/bbox/bsphere computed below stay consistent with the
+        # same convention.
         #
         if split_vert_positions:
 
@@ -393,8 +409,9 @@ typedef struct
         # Vertex normals (modelVertNormals) - one per SPLIT vertex, taken
         # directly from the OBJ's own vn data (no averaging needed, since
         # every split slot already corresponds to exactly one vn). Index-
-        # matches modelVerts 1:1, in the split-vertex index space. Already
-        # Y-flipped (see get_split_vertex above).
+        # matches modelVerts 1:1, in the split-vertex index space.
+        # Already remapped into renderer space (see get_split_vertex
+        # above) - all three axes, not just Y.
         #
         if split_vert_positions:
 

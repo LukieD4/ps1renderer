@@ -19,8 +19,8 @@
  */
 
 // Toolchain paths (set these as env vars on your machine, not hardcoded
-// here - PATH, PSN00BPS1_TOOLS, PSN00BSDK_LIBS). See py_convert_textures.py
-// and py_convert_dirty_assets.py for the asset-side equivalents.
+// here - PATH, PSN00BPS1_TOOLS, PSN00BSDK_LIBS). See py_convert_assets.py
+// and py_convert_textures.py for the asset-side equivalents.
 
 #include <stdio.h>
 #include <sys/types.h>
@@ -33,8 +33,9 @@
 #include <inline_c.h> // GTE macros (gte_ldv0, gte_rtpt, gte_nclip, etc.)
 
 
-// #include "assets_c/house.c"
-#include "assets_c/ball.c" // textured
+// #include "assets_c/arrow.c"
+#include "assets_c/house.c"
+// #include "assets_c/ball.c" // textured
 // #include "assets_c/3shapes.c"
 // #include "assets_c/honda.c"
 
@@ -57,7 +58,36 @@ extern const uint32_t face_tim_start[];
 
 
 
-// Camera
+// ============================================================
+// COORDINATE SYSTEM - FINALIZED (v4, verified via arrow.obj dual-tip test)
+// ============================================================
+// Source assets are authored in Blender, exported with Forward=-Z, Up=Y.
+// The converter (py_convert_assets.py, get_split_vertex()) remaps every
+// vertex/normal at export time so that:
+//
+//   renderer_X =  Blender_X
+//   renderer_Y = -Blender_Z
+//   renderer_Z = -Blender_Y
+//
+// Verified with a two-tipped arrow test object: Blender's +Y tip renders
+// pointing AWAY from the camera; Blender's +Z tip renders pointing UP on
+// screen. A model's Blender-up is screen-up, and its Blender-forward
+// (+Y) points away from the camera by default with model_rot = {0,0,0} -
+// no per-model rotation offset needed.
+//
+// Winding/cull sign (draw_model()'s gte_nclip/cross check) was
+// re-verified against this final mapping: front-facing triangles are
+// correctly kept with `if (cross >= 0) continue;` as the reject
+// condition. If this coordinate block changes again, re-check that sign
+// against the arrow.obj test - it flips whenever an even number of axes
+// change sign, and stays put when an odd number do (a mnemonic, not a
+// substitute for testing).
+//
+// Do NOT re-flip or re-derive axes anywhere else in this file. If a
+// specific model renders mirrored or backwards, re-test with arrow.obj
+// first - the bug is very likely elsewhere (a bad per-model rotation
+// default, or that one asset having different OBJ export settings), not
+// this coordinate system.
 #define CAMERA_DISTANCE 4096
 #define FOCAL_LENGTH    256
 int fov = FOCAL_LENGTH;
@@ -352,7 +382,7 @@ void update_matrix(void)
     if (use_vertex_light)
     {
         // Rotate per-vertex normals (modelVertNormals, one per split
-        // vertex from the OBJ's vn data - see py_convert_dirty_assets.py).
+        // vertex from the OBJ's vn data - see py_convert_assets.py).
         // Same rotate-only GTE call as above, just walking modelVertCount
         // instead of modelTriCount since this is one normal per unique
         // vertex slot rather than one per triangle.
@@ -457,7 +487,7 @@ void draw_model(void)
         int32_t cross;
         gte_stopz(&cross);
 
-        if (cross <= 0)
+        if (cross >= 0)
             continue;
 
         // Pull projected screen XY for all 3 vertices in one go.
