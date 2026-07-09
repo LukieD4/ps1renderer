@@ -1,6 +1,6 @@
 #
 build/
-assets_c/
+generated/
 
 # Prerequisites
 *.d
@@ -56,3 +56,4 @@ dkms.conf
 
 # debug information files
 *.dwo
+files.txt

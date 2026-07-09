@@ -17,19 +17,19 @@ find_package(Python3 REQUIRED)
 # ------------------------------------------------------------
 # NOTE: file(GLOB ...) runs at CMake CONFIGURE time, which is BEFORE
 # py_convert_assets.py has ever produced anything on a clean checkout -
-# so globbing assets_c/*.c as the OUTPUT here would see an empty list on
+# so globbing generated/*.c as the OUTPUT here would see an empty list on
 # first configure and the custom command would never be wired up
 # correctly (no OUTPUT = nothing for other targets to depend on).
 #
 # Instead we glob the SOURCE .obj files (these already exist in the repo)
-# and treat the whole assets_c/ directory as a single stamp file dependency
+# and treat the whole generated/ directory as a single stamp file dependency
 # via a marker, so Ninja/Make actually reruns the conversion whenever any
 # .obj/.mtl changes, without requiring the generated .c files to exist yet
 # at configure time.
 file(GLOB_RECURSE SOURCE_OBJ_FILES "${CMAKE_SOURCE_DIR}/assets/*.obj")
 file(GLOB_RECURSE SOURCE_MTL_FILES "${CMAKE_SOURCE_DIR}/assets/*.mtl")
 
-set(ASSETS_STAMP "${CMAKE_BINARY_DIR}/assets_converted.stamp")
+set(ASSETS_STAMP "${CMAKE_BINARY_DIR}/generatedonverted.stamp")
 
 add_custom_command(
     OUTPUT "${ASSETS_STAMP}"
@@ -44,25 +44,39 @@ add_custom_target(convert_assets
 )
 
 # ------------------------------------------------------------
-# 2. PNG -> TIM texture conversion
+# 2. PNG -> texture blob conversion
 # ------------------------------------------------------------
 # Same reasoning as above - depend on source PNGs + the script, not a
-# glob of assets_c output that may not exist yet. face.tim now lands
-# directly in assets_c/ (flat, no textures/ subfolder - see
-# py_convert_textures.py for why).
+# glob of generated output that may not exist yet.
+#
+# py_convert_textures.py now emits THREE fixed-path artifacts regardless
+# of how many textures are configured in its TEXTURES list:
+#   - generated/textures.bin      the concatenated TIM blob
+#   - generated/tex_blob.S        fixed .incbin of textures.bin (never
+#                                  changes shape as textures are added)
+#   - generated/tex_blob_table.c  generated offset/length table, keyed
+#                                  by material name, read by main.c at
+#                                  startup
+#
+# Because these three paths are fixed (unlike the old single-texture
+# FACE_TIM_PATH scheme where the path itself depended on which model was
+# active), we can list them directly as OUTPUT here - no per-texture
+# CMake changes are needed when TEXTURES grows.
+set(TEX_BLOB_BIN   "${CMAKE_SOURCE_DIR}/generated/textures.bin")
+set(TEX_BLOB_S     "${CMAKE_SOURCE_DIR}/generated/tex_blob.S")
+set(TEX_BLOB_TABLE "${CMAKE_SOURCE_DIR}/generated/tex_blob_table.c")
+
 file(GLOB_RECURSE SOURCE_PNG_FILES "${CMAKE_SOURCE_DIR}/assets/*/textures/*.png")
 
-set(FACE_TIM_PATH "${CMAKE_SOURCE_DIR}/assets_c/face.tim")
-
 add_custom_command(
-    OUTPUT "${FACE_TIM_PATH}"
+    OUTPUT "${TEX_BLOB_BIN}" "${TEX_BLOB_S}" "${TEX_BLOB_TABLE}"
     COMMAND "${Python3_EXECUTABLE}" -u "${CMAKE_SOURCE_DIR}/py_convert_textures.py"
     DEPENDS ${SOURCE_PNG_FILES} "${CMAKE_SOURCE_DIR}/py_convert_textures.py"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    COMMENT "Converting PNG textures into TIM files"
+    COMMENT "Converting PNG textures into a concatenated TIM blob"
 )
 add_custom_target(convert_textures
-    DEPENDS "${FACE_TIM_PATH}"
+    DEPENDS "${TEX_BLOB_BIN}" "${TEX_BLOB_S}" "${TEX_BLOB_TABLE}"
 )
 
 # ------------------------------------------------------------
@@ -77,13 +91,16 @@ add_custom_target(convert_everything
 )
 
 # ------------------------------------------------------------
-# 3. Build PS1 executable (main.c + tim_face.S)
+# 3. Build PS1 executable (main.c + generated blob table + blob .S)
 # ------------------------------------------------------------
-psn00bsdk_add_executable(template GPREL main.c tim_face.S)
-
-# Make the assembler see the absolute TIM path
-target_compile_definitions(template PRIVATE
-    FACE_TIM_PATH="${FACE_TIM_PATH}"
+# tex_blob.S replaces the old hand-maintained tim_face.S - it's now fully
+# generated (see py_convert_textures.py), so it's added as a source here
+# the same way any other generated .c file would be, not tracked as a
+# committed hand-written file. tex_blob_table.c likewise.
+psn00bsdk_add_executable(template GPREL
+    main.c
+    "${TEX_BLOB_S}"
+    "${TEX_BLOB_TABLE}"
 )
 
 # Ensure both conversion pipelines complete before building the executable

@@ -1,0 +1,11 @@
+// THIS IS A DEMO, will work on at some point.
+{
+  "camera": {
+    "pos": [0, 0, -4096],
+    "rot": [0, 0, 0]
+  },
+  "objects": [
+    { "model": "house", "palette":0, "pos": [0, 0, 0],    "rot": [0, 0, 0] },
+    { "model": "garage", "palette":0, "pos": [2000, 0, 0], "rot": [0, 1024, 0] }
+  ]
+}

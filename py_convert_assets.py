@@ -7,9 +7,9 @@ from pathlib import Path
 # Run before py_convert_textures.py!
 
 # Source/output dirs: assets (source) .obj/.mtl files go in assets/,
-# converted .c files come out in assets_c/.
+# converted .c files come out in generated/.
 ORIGIN_OBJECT_DIR = Path(__file__).resolve().parent / "assets"
-CONVERT_OBJECT_DIR = Path(__file__).resolve().parent / "assets_c"
+CONVERT_OBJECT_DIR = Path(__file__).resolve().parent / "generated"
 
 FILES_TO_BE_PROCESSED = os.walk(ORIGIN_OBJECT_DIR)
 
@@ -21,9 +21,14 @@ FIXED_POINT_MATH_UPSCALE = 1024  # converts from decimal to int, something which
 # normalized 0.0-1.0 UV, so this is just that scaled into a byte.
 UV_BYTE_SCALE = 255  # 256x256 image
 
+# Per-model triangle count is currently capped at 256 (MAX_MODEL_TRIS in
+# main.c) and material indices are stored as unsigned char (0-255), so
+# 256 distinct materials per model is the hard ceiling either way.
+MAX_MATERIALS_PER_MODEL = 256
+
 
 # Delete old dir contents so stale .c files don't linger after a model is
-# renamed/removed from assets_c/.
+# renamed/removed from generated/.
 if CONVERT_OBJECT_DIR.exists():
     for item in CONVERT_OBJECT_DIR.iterdir():
         if item.is_dir():
@@ -50,7 +55,17 @@ for root, dirs, filenames in FILES_TO_BE_PROCESSED:
         object_names = []      # 'o' lines
         group_names = []       # 'g' lines
         smoothing_groups = []  # 's' lines
-        material_uses = []     # 'usemtl' lines
+
+        # material_uses is now built as a list of (line_index_in_f_order, name)
+        # is NOT quite right either - usemtl can appear anywhere between 'f'
+        # lines, so what we actually need is "which material applies to each
+        # 'f' line in file order". We build that directly below by walking
+        # the file a second way: instead of only bucketing 'f' lines into
+        # data["f"], we also record, in the SAME order, which material name
+        # was active (the most recent 'usemtl' seen) for that specific face.
+        # This list is index-matched 1:1 with data["f"] once that's built.
+        face_material_names = []   # index-matched with data["f"], one name per face line
+        current_material_name = None
 
         with open(file, "r", newline="") as content:
             for line in content:
@@ -79,14 +94,56 @@ for root, dirs, filenames in FILES_TO_BE_PROCESSED:
                     smoothing_groups.append(content_value)
                     continue
                 if content_suffix == "usemtl":
-                    material_uses.append(content_value)
+                    # Track the currently-active material by name. This
+                    # stays active for every subsequent 'f' line until the
+                    # next 'usemtl' (or EOF) - standard OBJ semantics.
+                    current_material_name = content_value.strip()
                     continue
+
+                # 'f' lines get their active material recorded alongside them,
+                # in the same order they're appended to data["f"] below, so
+                # face_material_names[i] always corresponds to data["f"][i].
+                if content_suffix == "f":
+                    face_material_names.append(current_material_name)
 
                 # Store multiple entries of the same type
                 if content_suffix not in data:
                     data[content_suffix] = []
 
                 data[content_suffix].append(content_value)
+
+        #
+        # Build the material name -> index map, in first-seen order.
+        # A face with no 'usemtl' at all (current_material_name is None)
+        # gets bucketed into a synthetic "(none)" material at whatever
+        # index it first appears - this keeps every triangle's material
+        # field well-defined instead of leaving a gap or crashing on None.
+        #
+        material_name_to_index = {}
+        material_index_to_name = []
+
+        def get_material_index(name):
+            key = name if name is not None else "(none)"
+            if key in material_name_to_index:
+                return material_name_to_index[key]
+            new_index = len(material_index_to_name)
+            if new_index >= MAX_MATERIALS_PER_MODEL:
+                raise SystemExit(
+                    f"{filename}: exceeded MAX_MATERIALS_PER_MODEL "
+                    f"({MAX_MATERIALS_PER_MODEL}) distinct materials - "
+                    f"material index no longer fits in unsigned char / "
+                    f"MAX_MODEL_TRIS assumptions."
+                )
+            material_name_to_index[key] = new_index
+            material_index_to_name.append(key)
+            return new_index
+
+        # Pre-populate the map now (in first-seen order across the whole
+        # file) so indices are stable and match the order usemtl lines
+        # actually appeared in the source .obj, regardless of which face
+        # we assign indices to first below.
+        for name in face_material_names:
+            get_material_index(name)
 
         #
         # Debug output
@@ -97,7 +154,8 @@ for root, dirs, filenames in FILES_TO_BE_PROCESSED:
         if object_names: print(f"o: {len(object_names)} entries")
         if group_names: print(f"g: {len(group_names)} entries")
         if smoothing_groups: print(f"s: {len(smoothing_groups)} entries")
-        if material_uses: print(f"usemtl: {len(material_uses)} entries")
+        if material_index_to_name:
+            print(f"materials: {len(material_index_to_name)} distinct -> {material_index_to_name}")
 
         #
         # Phase 2: emit a .c file from the parsed data
@@ -109,9 +167,15 @@ for root, dirs, filenames in FILES_TO_BE_PROCESSED:
 
         # Do not redefine SVECTOR, <psxgte.h> already has it.
         #
-        # uv0/uv1/uv2 are now consumed by main.c's draw_model() textured
-        # path (POLY_FT3 + setUV3()), reading the same split-vertex index
-        # space as v0/v1/v2 - no longer placeholder zeros.
+        # uv0/uv1/uv2 are consumed by main.c's draw_model() textured path
+        # (POLY_FT3 + setUV3()), reading the same split-vertex index space
+        # as v0/v1/v2.
+        #
+        # material is now populated per-triangle (see get_material_index
+        # above) instead of always being 0 - it indexes into this model's
+        # own modelMaterialNames[] table below, which the texture-table
+        # lookup in main.c resolves against the texture blob's own name
+        # table at load time (see py_convert_textures.py / tex_blob.c).
         VERTEX_INDICES = """
 typedef struct
 {
@@ -197,12 +261,6 @@ typedef struct
             # ============================================================
             # COORDINATE SYSTEM - FINALIZED (v4, verified via arrow.obj dual-tip test)
             # ============================================================
-            # Verified empirically: cross-referenced raw OBJ vertex data
-            # against Blender's own viewport readout, then confirmed with a
-            # two-tipped arrow test object (primary tip = Blender world +Y,
-            # secondary tip = Blender world +Z) that both tips render in the
-            # correct direction on screen.
-            #
             # This project's OBJ export (Forward=-Z, Up=Y) emits:
             #   OBJ_X =  Blender_X
             #   OBJ_Y =  Blender_Z
@@ -213,19 +271,7 @@ typedef struct
             #   renderer_Y = -Blender_Z  = -OBJ_Y
             #   renderer_Z = -Blender_Y  = -OBJ_Z
             #
-            # Confirmed on-screen: primary arrow (Blender +Y) renders
-            # pointing AWAY from the camera; secondary arrow (Blender +Z)
-            # renders pointing UP on screen. A model's Blender-up is
-            # screen-up, and a model's Blender-forward (+Y) points away
-            # from the camera by default with model_rot = {0,0,0} - no
-            # per-model rotation offset needed.
-            #
-            # DO NOT re-derive or re-flip this from camera-rotation
-            # reasoning or exporter-convention theory again - if a future
-            # model looks mirrored or backwards, the bug is almost
-            # certainly elsewhere (winding/cull sign, a bad per-model
-            # rotation default, or a genuinely different OBJ export
-            # setting on that specific asset) - re-verify with the
+            # DO NOT re-derive or re-flip this again - re-verify with the
             # arrow.obj test object before touching this block.
             bx, by, bz = verts_float[v_index]
             split_vert_positions.append((bx, -by, -bz))
@@ -252,7 +298,8 @@ typedef struct
 
             return new_index
 
-        face_index_lists = []  # list of (v0,v1,v2) post-triangulation, indices into split_vert_positions
+        face_index_lists = []    # list of (v0,v1,v2) post-triangulation, indices into split_vert_positions
+        face_material_indices = []  # index-matched with face_index_lists, one material index per triangle
         triangle_count = 0
         missing_vn_used = False
         missing_vt_used = False
@@ -261,9 +308,16 @@ typedef struct
 
             output.append("MODEL_TRI modelTris[] = {\n")
 
-            for face in data["f"]:
+            for face_line_index, face in enumerate(data["f"]):
 
                 verts = face.split()
+
+                # Resolve this face's material index once per face line
+                # (every triangle produced by triangulating this face -
+                # relevant for quads/ngons below - shares the same material,
+                # since OBJ 'usemtl' applies at the face level, not per-corner).
+                face_material_name = face_material_names[face_line_index]
+                material_index = get_material_index(face_material_name)
 
                 corner_split_indices = []
 
@@ -297,12 +351,13 @@ typedef struct
                         f"    {{ {corner_split_indices[0]}, {corner_split_indices[1]}, {corner_split_indices[2]}, "
                         f"0, 0, 0, "
                         f"{corner_split_indices[0]}, {corner_split_indices[1]}, {corner_split_indices[2]}, "
-                        f"0 }},\n"
+                        f"{material_index} }},\n"
                     )
 
                     face_index_lists.append(
                         (corner_split_indices[0], corner_split_indices[1], corner_split_indices[2])
                     )
+                    face_material_indices.append(material_index)
 
                     triangle_count += 1
 
@@ -317,12 +372,13 @@ typedef struct
                             f"    {{ {corner_split_indices[0]}, {corner_split_indices[n]}, {corner_split_indices[n + 1]}, "
                             f"0, 0, 0, "
                             f"{corner_split_indices[0]}, {corner_split_indices[n]}, {corner_split_indices[n + 1]}, "
-                            f"0 }},\n"
+                            f"{material_index} }},\n"
                         )
 
                         face_index_lists.append(
                             (corner_split_indices[0], corner_split_indices[n], corner_split_indices[n + 1])
                         )
+                        face_material_indices.append(material_index)
 
                         triangle_count += 1
 
@@ -337,16 +393,27 @@ typedef struct
                   f"modelUVs for those corners will be emitted as {{0, 0}} placeholders.")
 
         #
+        # Material name table - modelMaterialNames[] - one C string per
+        # distinct material index, in the same order as get_material_index
+        # assigned them (first-seen order in the .obj). main.c's texture
+        # table lookup matches these names against the texture blob's own
+        # name table (see py_convert_textures.py) to resolve tri->material
+        # to an actual TPAGE/CLUT at runtime - this indirection is what
+        # lets material index 0 in house.c and material index 0 in some
+        # other model.c refer to completely different textures safely.
+        #
+        output.append(f"const unsigned int modelMaterialCount = {len(material_index_to_name)};\n")
+        output.append("const char *modelMaterialNames[] = {\n")
+        for name in material_index_to_name:
+            escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+            output.append(f'    "{escaped}",\n')
+        output.append("};\n\n")
+
+        #
         # Vertices (modelVerts) - emitted from the SPLIT array, not the raw
         # OBJ 'v' list. modelVerts may contain more entries than the OBJ
         # had 'v' lines, since seam positions (and UV-island boundaries)
         # get duplicated into multiple slots above.
-        #
-        # NOTE: split_vert_positions has already had the full coordinate
-        # remap applied (see get_split_vertex above, all three axes) -
-        # this block just writes already-remapped values, so face
-        # normals/bbox/bsphere computed below stay consistent with the
-        # same convention.
         #
         if split_vert_positions:
 
@@ -389,8 +456,6 @@ typedef struct
                 length = math.sqrt(nx * nx + ny * ny + nz * nz)
 
                 if length == 0.0:
-                    # Degenerate triangle (zero-area face in source data),
-                    # fall back to a zero normal rather than dividing by 0.
                     unx, uny, unz = 0.0, 0.0, 0.0
                 else:
                     unx, uny, unz = nx / length, ny / length, nz / length
@@ -407,18 +472,10 @@ typedef struct
 
         #
         # Vertex normals (modelVertNormals) - one per SPLIT vertex, taken
-        # directly from the OBJ's own vn data (no averaging needed, since
-        # every split slot already corresponds to exactly one vn). Index-
-        # matches modelVerts 1:1, in the split-vertex index space.
-        # Already remapped into renderer space (see get_split_vertex
-        # above) - all three axes, not just Y.
+        # directly from the OBJ's own vn data.
         #
         if split_vert_positions:
 
-            # Backfill any None entries (corners with no vn data) using
-            # that vertex's first associated triangle's flat face normal,
-            # found by scanning face_index_lists. Rare path - only hit on
-            # OBJs missing vn data on some corners.
             if None in split_vert_normals:
                 fallback_by_index = {}
                 for tri_idx, (i0, i1, i2) in enumerate(face_index_lists):
@@ -445,7 +502,6 @@ typedef struct
             for normal in split_vert_normals:
 
                 if normal is None:
-                    # Still none - vertex genuinely unreferenced by any face.
                     output.append("    { 0, 0, 0 }, // unreferenced vertex\n")
                     continue
 
@@ -469,16 +525,7 @@ typedef struct
 
         #
         # UVs (modelUVs) - one per SPLIT vertex, byte-scaled (0-255) PS1
-        # GPU texture coordinates. Consumed by main.c's draw_model()
-        # textured path via setUV3(). Index-matches modelVerts/
-        # modelVertNormals 1:1, same split-vertex index space.
-        #
-        # NOTE: no UV_INFO/UV-pair struct exists in PSn00bSDK v0.23's
-        # psxgpu.h - POLY_FT3/POLY_GT3 just take raw `uint8_t u0,v0` etc.
-        # fields directly (see setUV3() in psxgpu.h). So this is emitted as
-        # a flat unsigned char[][2] instead of a struct array - each row is
-        # already in exactly the {u, v} pair shape setUV3() wants, just
-        # without inventing a type the SDK doesn't have.
+        # GPU texture coordinates.
         #
         if split_vert_positions:
 
@@ -489,18 +536,12 @@ typedef struct
             for uv in split_vert_uvs:
 
                 if uv is None:
-                    # No vt for this corner - emit a placeholder rather
-                    # than guessing (no sensible default UV exists, unlike
-                    # the vn fallback above).
                     output.append("    { 0, 0 }, // missing vt data\n")
                     missing_uv_count += 1
                     continue
 
                 u, v = uv
 
-                # Clamp before scaling - some exporters produce slightly
-                # out-of-0..1 UVs (e.g. from tiling/wrap setups); clamping
-                # keeps the byte cast in 0-255 range instead of wrapping.
                 u = 0.0 if u < 0.0 else (1.0 if u > 1.0 else u)
                 v = 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
 
@@ -519,9 +560,6 @@ typedef struct
 
         #
         # Bounding box (min/max corners, fixed-point, same space as modelVerts)
-        # Uses split_vert_positions for consistency with modelVerts - bbox/
-        # bsphere values are identical either way since splitting only
-        # duplicates positions, it never changes the position set's extent.
         #
         if split_vert_positions:
 
@@ -549,9 +587,6 @@ typedef struct
             )
             output.append("};\n\n")
 
-            #
-            # Bounding sphere
-            #
             center_x = (min_x + max_x) / 2.0
             center_y = (min_y + max_y) / 2.0
             center_z = (min_z + max_z) / 2.0
@@ -579,11 +614,6 @@ typedef struct
 
         #
         # Useful counts for rendering.
-        # NOTE: modelVertCount reflects the SPLIT vertex count, which will
-        # be >= the OBJ's raw 'v' count (equal only if no seams or UV
-        # island boundaries exist). MAX_MODEL_VERTS in main.c must be sized
-        # for this larger number - check the "Split vertex count" line
-        # printed below against it whenever a model is swapped in.
         #
         vertex_count = len(split_vert_positions)
 
@@ -603,3 +633,4 @@ typedef struct
 
         print(f"Generated: {file_output}")
         print(f"  Split vertex count: {vertex_count} (vs raw OBJ 'v' count: {len(verts_float)})")
+        print(f"  Materials: {len(material_index_to_name)}")
