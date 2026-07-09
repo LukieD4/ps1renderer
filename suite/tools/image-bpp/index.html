@@ -1,0 +1,145 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>BPP Image Tool — bit / depth . tools</title>
+  <link rel="stylesheet" href="../../css/site.css" />
+  <link rel="stylesheet" href="css/tool.css" />
+</head>
+<body data-nav-key="bpp">
+  <div id="site-navbar"></div>
+
+  <div class="workbench">
+    <!-- ============================= LEFT RAIL ============================= -->
+    <aside class="rail">
+
+      <div class="rail__section">
+        <p class="rail__label">Source image</p>
+        <label class="dropzone" id="dropzone" for="file-input">
+          <div class="dropzone__icon">&#8593;</div>
+          <div class="dropzone__text">Drop an image, or click to browse</div>
+          <div class="dropzone__hint">PNG preferred &middot; JPG/WEBP/BMP also work</div>
+          <input type="file" id="file-input" accept="image/*" />
+        </label>
+        <div class="file-chip" id="file-chip" hidden>
+          <span class="file-chip__name" id="file-chip-name"></span>
+          <span class="file-chip__dims" id="file-chip-dims"></span>
+        </div>
+      </div>
+
+      <div class="rail__section">
+        <p class="rail__label">Color depth</p>
+        <div class="segmented" id="bpp-selector">
+          <div class="segmented__option" data-bpp="4">
+            4bpp<span class="segmented__option-sub">16 colors</span>
+          </div>
+          <div class="segmented__option is-active" data-bpp="8">
+            8bpp<span class="segmented__option-sub">256 colors</span>
+          </div>
+        </div>
+      </div>
+
+      <div class="rail__section">
+        <p class="rail__label">Adjust</p>
+
+        <div class="slider-row">
+          <div class="slider-row__head">
+            <span>Hue</span>
+            <span class="slider-row__value" id="hue-value">0&deg;</span>
+          </div>
+          <input type="range" id="hue" min="-180" max="180" value="0" step="1" />
+        </div>
+
+        <div class="slider-row">
+          <div class="slider-row__head">
+            <span>Saturation</span>
+            <span class="slider-row__value" id="saturation-value">0</span>
+          </div>
+          <input type="range" id="saturation" min="-100" max="100" value="0" step="1" />
+        </div>
+
+        <div class="slider-row">
+          <div class="slider-row__head">
+            <span>Brightness</span>
+            <span class="slider-row__value" id="brightness-value">0</span>
+          </div>
+          <input type="range" id="brightness" min="-100" max="100" value="0" step="1" />
+        </div>
+
+        <div class="slider-row">
+          <div class="slider-row__head">
+            <span>Contrast</span>
+            <span class="slider-row__value" id="contrast-value">0</span>
+          </div>
+          <input type="range" id="contrast" min="-100" max="100" value="0" step="1" />
+        </div>
+
+        <span class="reset-link" id="reset-adjustments">Reset adjustments</span>
+      </div>
+
+      <div class="rail__section">
+        <p class="rail__label">Dithering</p>
+        <div class="dither-options" id="dither-options">
+          <div class="dither-option is-active" data-mode="none">
+            <span class="dither-option__dot"></span> None
+          </div>
+          <div class="dither-option" data-mode="ordered">
+            <span class="dither-option__dot"></span> Ordered (Bayer)
+          </div>
+          <div class="dither-option" data-mode="floyd-steinberg">
+            <span class="dither-option__dot"></span> Floyd&ndash;Steinberg
+          </div>
+        </div>
+        <div class="slider-row" style="margin-top: 12px;">
+          <div class="slider-row__head">
+            <span>Strength</span>
+            <span class="slider-row__value" id="dither-strength-value">100%</span>
+          </div>
+          <input type="range" id="dither-strength" min="0" max="100" value="100" step="1" />
+        </div>
+      </div>
+
+      <div class="rail__section">
+        <p class="rail__label">Palette</p>
+        <div class="palette-strip" id="palette-strip"></div>
+        <p class="palette-hint">Click a swatch to edit its color. Click the lock icon to keep it fixed when the palette regenerates.</p>
+        <button class="btn-secondary" id="regenerate-palette">Regenerate from image</button>
+      </div>
+
+    </aside>
+
+    <!-- ============================= RIGHT: STAGE ============================= -->
+    <main class="stage" id="stage">
+      <div class="stage__empty" id="stage-empty">
+        <div class="stage__empty-icon">&#9635;</div>
+        Drop an image on the left to get started
+      </div>
+      <canvas id="output-canvas" hidden></canvas>
+      <div class="stage__readout" id="stage-readout" hidden></div>
+    </main>
+  </div>
+
+  <!-- ============================= TRANSPORT BAR ============================= -->
+  <div class="transport">
+    <div class="transport__group">
+      <button class="btn" id="btn-load-project">Load project</button>
+      <input type="file" id="load-project-input" class="hidden-input" accept=".bppproject,.json" />
+      <button class="btn btn--primary" id="btn-save-project" disabled>Save project</button>
+      <button class="btn btn--export" id="btn-export-png" disabled>Export PNG</button>
+    </div>
+    <div class="transport__status" id="transport-status">No image loaded</div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script src="../../js/navbar.js"></script>
+  <script src="js/palette.js"></script>
+  <script src="js/quantizer.js"></script>
+  <script src="js/adjust.js"></script>
+  <script src="js/dither.js"></script>
+  <script src="js/renderer.js"></script>
+  <script src="js/project.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

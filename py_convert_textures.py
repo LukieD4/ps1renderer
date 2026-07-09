@@ -1,51 +1,63 @@
 # root/py_convert_textures.py
 
-import os
 import struct
-import subprocess
 from pathlib import Path
 
 # Run after py_convert_assets.py!
 
-# img2tim.exe lives under whatever path the PSN00BPS1_TOOLS env var points
-# to - set this once on your machine and this script finds it from there
-# rather than hardcoding a path that'll break on another machine/CI box.
-TOOLS_DIR = os.environ.get("PSN00BPS1_TOOLS")
-if not TOOLS_DIR:
-    raise SystemExit(
-        "PSN00BPS1_TOOLS environment variable is not set. "
-        "Point it at the directory containing img2tim.exe."
-    )
-
-IMG2TIM_EXE = Path(TOOLS_DIR) / "img2tim.exe"
-if not IMG2TIM_EXE.exists():
-    raise SystemExit(f"img2tim.exe not found at: {IMG2TIM_EXE}")
+# ------------------------------------------------------------------
+# Every texture is now a single hand-authored .tim, built externally by
+# the PaletteGen web tool (tim_writer.js). A texture with palette
+# variants is STILL ONE FILE - "House0.tim" - containing multiple
+# stacked CLUT rows (clut_height > 1) all pointing at ONE shared image
+# block. There is no more "House0.pal1.tim" sibling-file convention;
+# that was superseded once tim_writer.js could stack palettes inside a
+# single TIM instead of duplicating pixel data across separate files.
+#
+# Row order in the file is exactly PaletteGen's sidebar order (row 0 =
+# first palette in the list, etc.) - this script does not reorder rows,
+# it only reads however many rows the file already has.
+#
+# Row SELECTION is not this script's job and is not encoded in the
+# material name - one blob entry covers every row a file has
+# (clut_height is carried through as paletteCount for range-checking).
+# main.c currently picks a row via a single runtime global
+# (active_palette, cycled with pad 2 SQUARE/CIRCLE) applied to every
+# textured triangle; a future scene loader is expected to make this
+# per-object instead - see active_palette's comment in main.c.
+#
+# This script's job:
+#   1. discover .tim files in assets/*/textures/
+#   2. read clut_height from each to know how many palette rows it has
+#   3. auto-assign non-overlapping VRAM placement: ONE image rect per
+#      file (shared by all its rows) + a CLUT strip tall enough to hold
+#      all of that file's rows, stacked consecutively
+#   4. patch the four placement fields in-place (image_x/y, clut_x/y -
+#      clut_y is the Y of ROW 0; row k lives at clut_y+k, unchanged by
+#      this script, just read and relied upon)
+#   5. concatenate everything into one blob + generated offset/length
+#      table, with one blob entry PER FILE (not per row)
+# ------------------------------------------------------------------
 
 ROOT_DIR = Path(__file__).resolve().parent
 ASSETS_DIR = ROOT_DIR / "assets"
 GENERATED_DIR = ROOT_DIR / "generated"
-SCRATCH_TIM_DIR = GENERATED_DIR / "_tim_scratch"
 
 BLOB_BIN_PATH = GENERATED_DIR / "textures.bin"
 BLOB_S_PATH = GENERATED_DIR / "tex_blob.S"
 BLOB_HEADER_C_PATH = GENERATED_DIR / "tex_blob_table.c"
-
-TEXTURE_BPP = 4
+# TEX_BLOB_ENTRY's definition lives ONLY here now - both tex_blob_table.c
+# (the data) and main.c (the consumer) #include this instead of each
+# carrying their own copy of the struct. That's what let paletteCount
+# silently drift out of main.c before: two independent typedefs of the
+# same name, same struct tag, different field count, no compiler error
+# across translation units to catch it.
+BLOB_HEADER_H_PATH = GENERATED_DIR / "tex_blob_table.h"
 
 # ------------------------------------------------------------------
-# VRAM budget / reserved zones
+# VRAM budget / reserved zones (unchanged reasoning from earlier
+# versions - hand-maintained constants).
 # ------------------------------------------------------------------
-# PS1 VRAM is 1024x512 texels (16-bit units), origin top-left. The two
-# 320x240 display buffers (init()'s SetDefDispEnv calls) sit at x=0,
-# y=0/240 - reserving the full x:0-639 band anyway (matching the original
-# hand-placed entries) leaves generous headroom rather than packing right
-# up against the actual display buffers.
-#
-# Texture packing region: x in [TEX_REGION_X, VRAM_WIDTH), y in
-# [TEX_REGION_Y, TEX_REGION_Y + TEX_REGION_HEIGHT).
-# CLUT packing region: a separate strip below the texture region - CLUTs
-# (16x1 texels each for 4bpp) are tiny and shouldn't fragment the texture
-# packer's rows.
 VRAM_WIDTH = 1024
 VRAM_HEIGHT = 512
 
@@ -55,101 +67,179 @@ TEX_REGION_HEIGHT = 400   # leaves y:400-511 for the CLUT strip below
 
 CLUT_REGION_X = 0
 CLUT_REGION_Y = 480
-CLUT_REGION_HEIGHT = VRAM_HEIGHT - CLUT_REGION_Y  # 32 rows - plenty for 16x1 CLUTs stacked
+CLUT_REGION_HEIGHT = VRAM_HEIGHT - CLUT_REGION_Y  # 32 rows
 
 
-def read_png_dimensions(path):
+# ------------------------------------------------------------------
+# TIM header parsing/patching
+# ------------------------------------------------------------------
+# Byte layout per the PaletteGen NEW export format doc (matches the
+# earlier independently-sourced spec exactly, and matches tim_writer.js's
+# own verified output byte-for-byte):
+#
+#   offset 0:  u32 magic (0x10)
+#   offset 4:  u32 flags
+#   offset 8:  u32 clut_block_length
+#   offset 12: u16 clut_x            <- PATCH
+#   offset 14: u16 clut_y            <- PATCH (Y of ROW 0; row k = clut_y+k)
+#   offset 16: u16 clut_width (units, always 16 for one 4bpp palette row)
+#   offset 18: u16 clut_height       (READ ONLY - number of palette rows;
+#                                     this script does not change how many
+#                                     rows exist, only where they land)
+#   offset 20: clut pixel data (clut_width * clut_height * 2 bytes)
+#   offset 20+clutdata: u32 image_block_length
+#   +4:  u16 image_x                 <- PATCH
+#   +6:  u16 image_y                 <- PATCH
+#   +8:  u16 image_width (units)
+#   +10: u16 image_height (pixels)
+#   +12: image pixel data
+#
+# All fields little-endian.
+
+TIM_MAGIC = 0x00000010
+
+
+def read_tim_header(data):
     """
-    Reads width/height straight from the PNG IHDR chunk. PNG signature is
-    8 bytes; IHDR chunk always immediately follows as: 4-byte length,
-    4-byte type ('IHDR'), then 4-byte width + 4-byte height (big-endian),
-    per the PNG spec - this ordering is guaranteed, so no need for a full
-    PNG parser or an external dependency (Pillow, etc.) just to get
-    dimensions.
+    Parses just enough of a .tim's header to know its CLUT/image
+    dimensions and row count - needed for VRAM packing - without
+    touching pixel data. Raises ValueError on anything that doesn't
+    look like a real TIM.
     """
-    with open(path, "rb") as f:
-        header = f.read(24)
+    if len(data) < 8:
+        raise ValueError("File too short to be a valid TIM")
 
-    if len(header) < 24 or header[:8] != b"\x89PNG\r\n\x1a\n":
-        raise ValueError(f"{path} does not look like a valid PNG (bad signature)")
+    magic = struct.unpack_from("<I", data, 0)[0]
+    if magic != TIM_MAGIC:
+        raise ValueError(f"Bad TIM magic: 0x{magic:08x} (expected 0x{TIM_MAGIC:08x})")
 
-    chunk_type = header[12:16]
-    if chunk_type != b"IHDR":
-        raise ValueError(f"{path} - expected IHDR as first chunk, got {chunk_type}")
+    flags = struct.unpack_from("<I", data, 4)[0]
+    has_clut = bool(flags & 0x8)
 
-    width, height = struct.unpack(">II", header[16:24])
-    return width, height
+    if not has_clut:
+        raise ValueError(
+            "TIM has no CLUT block (flags indicate CLUT-less image) - "
+            "this pipeline only supports 4bpp indexed TIMs with an "
+            "embedded CLUT, matching tim_writer.js's own output."
+        )
+
+    clut_block_length = struct.unpack_from("<I", data, 8)[0]
+    clut_width_units, clut_height = struct.unpack_from("<HH", data, 16)
+
+    if clut_width_units != 16:
+        raise ValueError(
+            f"Unexpected clut_width_units={clut_width_units} (expected "
+            f"16 for a single 4bpp palette row) - this pipeline assumes "
+            f"one palette row is always exactly 16 colors wide."
+        )
+
+    if clut_height < 1 or clut_height > 16:
+        raise ValueError(
+            f"clut_height={clut_height} is out of the expected 1-16 "
+            f"range for a 4bpp TIM (max 16 palettes before running past "
+            f"VRAM height limits at pack time)."
+        )
+
+    image_block_offset = 8 + clut_block_length
+    if image_block_offset + 12 > len(data):
+        raise ValueError("TIM file truncated - image block header out of range")
+
+    image_width_units, image_height = struct.unpack_from("<HH", data, image_block_offset + 8)
+
+    return {
+        "clut_block_length": clut_block_length,
+        "clut_width_units": clut_width_units,
+        "clut_height": clut_height,
+        "image_block_offset": image_block_offset,
+        "image_width_units": image_width_units,
+        "image_height": image_height,
+    }
 
 
-def discover_textures():
+def patch_tim_placement(data, image_x, image_y, clut_x, clut_y):
     """
-    Walks assets/*/textures/*.png and treats each file's stem as its
-    material name (must match the corresponding usemtl in that object's
-    .obj/.mtl exactly - per convention, no exceptions). Replaces the old
-    hand-maintained TEXTURES list entirely: dropping a PNG into any
-    assets/<object>/textures/ folder is now sufficient, no script edit
-    required.
+    Overwrites the four VRAM placement fields in a .tim's header IN
+    PLACE (returns new bytes - caller writes this into the blob, never
+    mutating the original file on disk).
 
-    Returns a list of dicts: material, source (absolute path), width,
-    height - VRAM placement is decided later by pack_textures(), not here.
+    clut_x must be a multiple of 16 (PS1 hardware requirement) and
+    clut_y + clut_height (read from the file itself) must not exceed
+    VRAM height - both re-validated here since the coordinates being
+    written now come from THIS script's packer, not whatever tim_writer.js
+    originally baked in as a placeholder.
     """
+    if clut_x % 16 != 0:
+        raise ValueError(f"clut_x ({clut_x}) must be a multiple of 16")
+
+    header = read_tim_header(data)
+
+    if clut_y + header["clut_height"] > VRAM_HEIGHT:
+        raise ValueError(
+            f"clut_y ({clut_y}) + clut_height ({header['clut_height']}) "
+            f"exceeds VRAM height ({VRAM_HEIGHT})"
+        )
+
+    patched = bytearray(data)
+
+    # CLUT x/y at fixed offsets 12/14 - this is the Y of ROW 0 only;
+    # rows 1..N-1 are implicitly at clut_y+1, clut_y+2, etc. inside the
+    # file's own existing CLUT data, which this patch does not touch.
+    struct.pack_into("<HH", patched, 12, clut_x, clut_y)
+
+    # Image x/y at image_block_offset + 4 / +6
+    img_off = header["image_block_offset"]
+    struct.pack_into("<HH", patched, img_off + 4, image_x, image_y)
+
+    return bytes(patched), header
+
+
+# ------------------------------------------------------------------
+# Discovery: one .tim per base texture, possibly containing multiple
+# palette rows internally. No more sibling-file (.pal1.tim) convention.
+# ------------------------------------------------------------------
+def discover_tims():
     discovered = []
-    seen_materials = {}
+    seen_names = {}
 
     for textures_dir in sorted(ASSETS_DIR.glob("*/textures")):
-        for png_path in sorted(textures_dir.glob("*.png")):
-            material = png_path.stem
+        for tim_path in sorted(textures_dir.glob("*.tim")):
+            base_name = tim_path.stem  # e.g. "House0" - the whole file is one texture
 
-            if material in seen_materials:
+            if base_name in seen_names:
                 raise SystemExit(
-                    f"Duplicate material name '{material}' found at both "
-                    f"{seen_materials[material]} and {png_path} - material "
-                    f"names must be unique across the whole project since "
-                    f"the runtime texture table is looked up by name alone."
+                    f"Duplicate texture name '{base_name}' found at both "
+                    f"{seen_names[base_name]} and {tim_path} - texture "
+                    f"names must be unique across the whole project."
                 )
-            seen_materials[material] = png_path
+            seen_names[base_name] = tim_path
 
-            width, height = read_png_dimensions(png_path)
+            data = tim_path.read_bytes()
+            try:
+                header = read_tim_header(data)
+            except ValueError as e:
+                raise SystemExit(f"{tim_path}: {e}")
 
             discovered.append({
-                "material": material,
-                "source": png_path,
-                "width": width,
-                "height": height,
+                "base_name": base_name,
+                "source": tim_path,
+                "data": data,
+                "clut_height": header["clut_height"],
+                "image_width_units": header["image_width_units"],
+                "image_height": header["image_height"],
             })
 
     return discovered
 
 
-def pack_textures(discovered):
-    """
-    Shelf packer: sort tallest-first, pack left-to-right filling a row
-    ("shelf") until the next texture wouldn't fit in the remaining width,
-    then start a new shelf below the tallest item placed so far in the
-    current shelf. This isn't space-optimal (a true bin-packer would do
-    better on very mixed sizes) but it's simple, deterministic, and
-    correct - reasonable for the dozens-of-textures scale a PS1 game
-    realistically has, given VRAM itself caps total texture memory hard.
-
-    4bpp VRAM width note: a texture's on-screen pixel width occupies
-    width/4 VRAM texels (16-bit units, 4 pixels/word for 4bpp) - this
-    packer works in VRAM-texel units throughout to avoid re-deriving that
-    conversion in multiple places.
-
-    Raises SystemExit if textures don't fit in the reserved region - this
-    is deliberately a hard failure rather than silently overlapping into
-    the frame buffer or another texture (the exact bug that bit you with
-    the hand-placed Grass0/House0 entries).
-    """
-    items = []
-    for entry in discovered:
-        vram_w = (entry["width"] + 3) // 4   # ceil, in case width isn't a multiple of 4
-        vram_h = entry["height"]
-        items.append({**entry, "vram_w": vram_w, "vram_h": vram_h})
-
-    # Tallest-first packs more efficiently with a shelf packer (avoids
-    # short-then-tall-then-short fragmentation within a shelf).
-    items.sort(key=lambda e: e["vram_h"], reverse=True)
+# ------------------------------------------------------------------
+# VRAM packing
+# ------------------------------------------------------------------
+# Simpler than the sibling-file era: ONE image rect per file (shared by
+# every palette row inside it), and a CLUT reservation of exactly
+# clut_height consecutive rows - no more packing one image rect PER
+# PALETTE, since palettes no longer duplicate pixel data.
+def pack_tims(discovered):
+    items = sorted(discovered, key=lambda e: e["image_height"], reverse=True)
 
     max_tex_x = VRAM_WIDTH
     max_tex_y = TEX_REGION_Y + TEX_REGION_HEIGHT
@@ -158,127 +248,99 @@ def pack_textures(discovered):
     cursor_y = TEX_REGION_Y
     shelf_height = 0
 
-    clut_cursor_x = CLUT_REGION_X
+    # CLUT strip packed as consecutive ROWS (not columns) per file, since
+    # a multi-palette file needs clut_height contiguous Y rows all at
+    # the same clut_x - packing left-to-right in X the way single-row
+    # CLUTs did before doesn't apply once a file can be several rows
+    # tall. Instead: stack each file's row-block underneath the previous
+    # one, always at CLUT_REGION_X (column 0 of the strip) - simpler,
+    # and CLUT data is tiny (16 texels wide) so wasting the rest of the
+    # strip's width per file is not a real budget concern.
     clut_cursor_y = CLUT_REGION_Y
 
     for item in items:
-        if item["vram_w"] > (VRAM_WIDTH - TEX_REGION_X):
+        img_w = item["image_width_units"]
+        img_h = item["image_height"]
+
+        if img_w > (VRAM_WIDTH - TEX_REGION_X):
             raise SystemExit(
-                f"Texture '{item['material']}' ({item['width']}x{item['height']}) "
-                f"is wider than the entire packing region "
-                f"({VRAM_WIDTH - TEX_REGION_X} texels) - cannot place."
+                f"'{item['base_name']}' image is wider ({img_w} units) "
+                f"than the entire packing region "
+                f"({VRAM_WIDTH - TEX_REGION_X} units) - cannot place."
             )
 
-        # Start a new shelf if this item doesn't fit in the remaining
-        # width of the current row.
-        if cursor_x + item["vram_w"] > max_tex_x:
+        if cursor_x + img_w > max_tex_x:
             cursor_x = TEX_REGION_X
             cursor_y += shelf_height
             shelf_height = 0
 
-        if cursor_y + item["vram_h"] > max_tex_y:
+        if cursor_y + img_h > max_tex_y:
             raise SystemExit(
-                f"Ran out of VRAM packing space placing texture "
-                f"'{item['material']}' ({item['width']}x{item['height']}) - "
-                f"reserved texture region is {VRAM_WIDTH - TEX_REGION_X}x"
-                f"{TEX_REGION_HEIGHT} texels. Reduce texture sizes/count, or "
-                f"widen TEX_REGION_HEIGHT (and shrink CLUT_REGION_HEIGHT / "
-                f"move things around) in py_convert_textures.py."
+                f"Ran out of VRAM packing space placing '{item['base_name']}' "
+                f"({img_w}x{img_h} units) - reserved region is "
+                f"{VRAM_WIDTH - TEX_REGION_X}x{TEX_REGION_HEIGHT}. Reduce "
+                f"texture sizes/count, or adjust TEX_REGION_HEIGHT."
             )
 
         item["vram_x"] = cursor_x
         item["vram_y"] = cursor_y
 
-        cursor_x += item["vram_w"]
-        shelf_height = max(shelf_height, item["vram_h"])
+        cursor_x += img_w
+        shelf_height = max(shelf_height, img_h)
 
-        # CLUT packing: independent strip, 16x1 texels per 4bpp texture
-        # (16-color palette = 16 texels wide, 1 tall). Packed left-to-
-        # right, wrapping to a new row when the strip's width is used up -
-        # CLUT_REGION_HEIGHT rows gives plenty of headroom (32 rows x
-        # (1024/16)=64 CLUTs per row = 2048 possible CLUTs, far beyond any
-        # realistic texture count).
-        CLUT_W = 16
-        if clut_cursor_x + CLUT_W > VRAM_WIDTH:
-            clut_cursor_x = CLUT_REGION_X
-            clut_cursor_y += 1
-
-        if clut_cursor_y >= CLUT_REGION_Y + CLUT_REGION_HEIGHT:
+        # CLUT placement: reserve clut_height consecutive rows starting
+        # at clut_cursor_y, always at CLUT_REGION_X.
+        rows_needed = item["clut_height"]
+        if clut_cursor_y + rows_needed > CLUT_REGION_Y + CLUT_REGION_HEIGHT:
             raise SystemExit(
-                f"Ran out of VRAM CLUT packing space placing texture "
-                f"'{item['material']}' - CLUT strip exhausted. Widen "
-                f"CLUT_REGION_HEIGHT in py_convert_textures.py."
+                f"Ran out of VRAM CLUT packing space placing "
+                f"'{item['base_name']}' (needs {rows_needed} palette "
+                f"row(s)) - CLUT strip exhausted. Widen CLUT_REGION_HEIGHT "
+                f"in py_convert_textures.py."
             )
 
-        item["clut_x"] = clut_cursor_x
+        item["clut_x"] = CLUT_REGION_X
         item["clut_y"] = clut_cursor_y
-        clut_cursor_x += CLUT_W
+        clut_cursor_y += rows_needed
 
     return items
 
 
-def convert_texture(entry):
-    """Runs img2tim, producing a standalone .tim in the scratch dir."""
-    src_path = entry["source"]
-    dst_path = SCRATCH_TIM_DIR / f"{entry['material']}.tim"
-
-    cmd = [
-        str(IMG2TIM_EXE),
-        "-bpp", str(TEXTURE_BPP),
-        "-org", str(entry["vram_x"]), str(entry["vram_y"]),
-        "-plt", str(entry["clut_x"]), str(entry["clut_y"]),
-        "-o", str(dst_path),
-        str(src_path),
-    ]
-
-    print(f"\n{entry['material']}: {src_path.relative_to(ASSETS_DIR)} "
-          f"({entry['width']}x{entry['height']}) -> {dst_path.name}")
-    print(f"  img: VRAM ({entry['vram_x']}, {entry['vram_y']})  "
-          f"clut: VRAM ({entry['clut_x']}, {entry['clut_y']})  bpp: {TEXTURE_BPP}")
-
-    result = subprocess.run(cmd, capture_output=True, text=True)
-
-    if result.stdout.strip():
-        print(f"  {result.stdout.strip()}")
-    if result.stderr.strip():
-        print(f"  STDERR: {result.stderr.strip()}")
-
-    if result.returncode != 0:
-        print(f"  FAILED (exit code {result.returncode})")
-        return None
-
-    if not dst_path.exists():
-        print(f"  FAILED - img2tim exited cleanly but {dst_path.name} was not created")
-        return None
-
-    print(f"  OK - {dst_path}")
-    return dst_path
-
-
-def build_blob(converted):
-    """
-    Concatenates every successfully-converted .tim into one blob, and
-    emits textures.bin / tex_blob.S / tex_blob_table.c - unchanged from
-    the previous version of this script.
-    """
+# ------------------------------------------------------------------
+# Patch + concatenate into the blob
+# ------------------------------------------------------------------
+def build_blob(packed):
     GENERATED_DIR.mkdir(parents=True, exist_ok=True)
 
-    offsets = []  # (material_name, offset, length)
+    offsets = []  # (base_name, offset, length, clut_height) - one entry PER FILE
 
     with open(BLOB_BIN_PATH, "wb") as blob_out:
         running_offset = 0
-        for entry, tim_path in converted:
-            data = tim_path.read_bytes()
-            blob_out.write(data)
-            offsets.append((entry["material"], running_offset, len(data)))
-            running_offset += len(data)
+        for item in packed:
+            patched_data, _header = patch_tim_placement(
+                item["data"],
+                image_x=item["vram_x"], image_y=item["vram_y"],
+                clut_x=item["clut_x"], clut_y=item["clut_y"],
+            )
+            blob_out.write(patched_data)
+            offsets.append((
+                item["base_name"], running_offset, len(patched_data), item["clut_height"]
+            ))
+            running_offset += len(patched_data)
+
+            palette_note = (
+                f"{item['clut_height']} palette row(s)"
+                if item["clut_height"] > 1 else "1 palette (no variants)"
+            )
+            print(f"{item['base_name']}: {item['source'].relative_to(ASSETS_DIR)} "
+                  f"-> img@({item['vram_x']},{item['vram_y']}) "
+                  f"clut@({item['clut_x']},{item['clut_y']}) [{palette_note}]")
 
     blob_s_source = (
         "/* Auto-generated. Do not edit manually.\n"
         " * Concatenated TIM blob for all textures - this file's shape\n"
         " * never changes as textures are added/removed; only textures.bin\n"
-        " * (rebuilt by py_convert_textures.py) and tex_blob_table.c\n"
-        " * (the offset table) change per-build. */\n"
+        " * and tex_blob_table.c change per-build. */\n"
         "\n"
         "    .section .rodata\n"
         "    .align 4\n"
@@ -292,55 +354,61 @@ def build_blob(converted):
     )
     BLOB_S_PATH.write_text(blob_s_source, newline="\n")
 
+    # Shared header: struct definition + extern declarations, #include'd by
+    # BOTH tex_blob_table.c (below) and main.c. paletteCount travels
+    # alongside offset/length so main.c can validate a requested palette
+    # row is actually in range, rather than silently reading past a
+    # texture's real CLUT data into whatever bytes happen to follow it in
+    # the blob.
+    header_lines = []
+    header_lines.append("/* Auto-generated by py_convert_textures.py. Do not edit manually.\n")
+    header_lines.append(" * Included by tex_blob_table.c (defines the table) and main.c (reads\n")
+    header_lines.append(" * it) - keep this the ONLY place TEX_BLOB_ENTRY is defined. */\n\n")
+    header_lines.append("#ifndef TEX_BLOB_TABLE_H\n")
+    header_lines.append("#define TEX_BLOB_TABLE_H\n\n")
+    header_lines.append("extern const unsigned char tex_blob_start[];\n")
+    header_lines.append("extern const unsigned char tex_blob_end[];\n\n")
+    header_lines.append("typedef struct\n{\n")
+    header_lines.append("    const char *material;\n")
+    header_lines.append("    unsigned int offset;\n")
+    header_lines.append("    unsigned int length;\n")
+    header_lines.append("    unsigned int paletteCount;\n")
+    header_lines.append("} TEX_BLOB_ENTRY;\n\n")
+    header_lines.append("extern const unsigned int texBlobEntryCount;\n")
+    header_lines.append("extern const TEX_BLOB_ENTRY texBlobMaterialTable[];\n\n")
+    header_lines.append("#endif\n")
+    BLOB_HEADER_H_PATH.write_text("".join(header_lines), newline="\n")
+
+    # tex_blob_table.c now just holds the actual data, typed against the
+    # shared header instead of redefining the struct itself.
     lines = []
     lines.append("/* Auto-generated by py_convert_textures.py. Do not edit manually. */\n\n")
-    lines.append("extern const unsigned char tex_blob_start[];\n")
-    lines.append("extern const unsigned char tex_blob_end[];\n\n")
-    lines.append("typedef struct\n{\n")
-    lines.append("    const char *material;\n")
-    lines.append("    unsigned int offset;\n")
-    lines.append("    unsigned int length;\n")
-    lines.append("} TEX_BLOB_ENTRY;\n\n")
+    lines.append('#include "tex_blob_table.h"\n\n')
     lines.append(f"const unsigned int texBlobEntryCount = {len(offsets)};\n")
     lines.append("const TEX_BLOB_ENTRY texBlobMaterialTable[] = {\n")
-    for name, offset, length in offsets:
+    for name, offset, length, clut_height in offsets:
         escaped = name.replace("\\", "\\\\").replace('"', '\\"')
-        lines.append(f'    {{ "{escaped}", {offset}, {length} }},\n')
+        lines.append(f'    {{ "{escaped}", {offset}, {length}, {clut_height} }},\n')
     lines.append("};\n")
     BLOB_HEADER_C_PATH.write_text("".join(lines), newline="\n")
 
     print(f"\nBlob written: {BLOB_BIN_PATH} ({running_offset} bytes total)")
     print(f"Generated: {BLOB_S_PATH}")
+    print(f"Generated: {BLOB_HEADER_H_PATH}")
     print(f"Generated: {BLOB_HEADER_C_PATH}")
 
 
 if __name__ == "__main__":
-    SCRATCH_TIM_DIR.mkdir(parents=True, exist_ok=True)
+    discovered = discover_tims()
 
-    discovered = discover_textures()
     print(f"Discovered {len(discovered)} texture(s):")
     for entry in discovered:
-        print(f"  {entry['material']} <- {entry['source'].relative_to(ASSETS_DIR)} "
-              f"({entry['width']}x{entry['height']})")
+        print(f"  {entry['base_name']} <- {entry['source'].relative_to(ASSETS_DIR)} "
+              f"({entry['image_width_units']*4}x{entry['image_height']} px, "
+              f"{entry['clut_height']} palette row(s))")
 
-    packed = pack_textures(discovered)
-
-    converted = []
-    failed = 0
-
-    for entry in packed:
-        tim_path = convert_texture(entry)
-        if tim_path is not None:
-            converted.append((entry, tim_path))
-        else:
-            failed += 1
-
-    if converted:
-        build_blob(converted)
-
-    for _, tim_path in converted:
-        tim_path.unlink()
-    if SCRATCH_TIM_DIR.exists() and not any(SCRATCH_TIM_DIR.iterdir()):
-        SCRATCH_TIM_DIR.rmdir()
-
-    print(f"\n{len(converted)} converted, {failed} failed (of {len(discovered)} total)")
+    if not discovered:
+        print("Nothing to do.")
+    else:
+        packed = pack_tims(discovered)
+        build_blob(packed)

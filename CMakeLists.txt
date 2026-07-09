@@ -49,34 +49,41 @@ add_custom_target(convert_assets
 # Same reasoning as above - depend on source PNGs + the script, not a
 # glob of generated output that may not exist yet.
 #
-# py_convert_textures.py now emits THREE fixed-path artifacts regardless
-# of how many textures are configured in its TEXTURES list:
+# py_convert_textures.py now emits FOUR fixed-path artifacts regardless
+# of how many textures are discovered under assets/*/textures/:
 #   - generated/textures.bin      the concatenated TIM blob
 #   - generated/tex_blob.S        fixed .incbin of textures.bin (never
 #                                  changes shape as textures are added)
-#   - generated/tex_blob_table.c  generated offset/length table, keyed
-#                                  by material name, read by main.c at
-#                                  startup
+#   - generated/tex_blob_table.c  offset/length/paletteCount table, keyed
+#                                  by material name, read by main.c
+#   - generated/tex_blob_table.h  the TEX_BLOB_ENTRY struct + externs,
+#                                  shared by tex_blob_table.c AND main.c
+#                                  (which #includes it directly) - must be
+#                                  listed as an OUTPUT below too, or a
+#                                  clean checkout has no dependency edge
+#                                  telling CMake it must exist before
+#                                  main.c compiles.
 #
-# Because these three paths are fixed (unlike the old single-texture
+# Because these paths are fixed (unlike the old single-texture
 # FACE_TIM_PATH scheme where the path itself depended on which model was
 # active), we can list them directly as OUTPUT here - no per-texture
 # CMake changes are needed when TEXTURES grows.
-set(TEX_BLOB_BIN   "${CMAKE_SOURCE_DIR}/generated/textures.bin")
-set(TEX_BLOB_S     "${CMAKE_SOURCE_DIR}/generated/tex_blob.S")
-set(TEX_BLOB_TABLE "${CMAKE_SOURCE_DIR}/generated/tex_blob_table.c")
+set(TEX_BLOB_BIN     "${CMAKE_SOURCE_DIR}/generated/textures.bin")
+set(TEX_BLOB_S       "${CMAKE_SOURCE_DIR}/generated/tex_blob.S")
+set(TEX_BLOB_TABLE   "${CMAKE_SOURCE_DIR}/generated/tex_blob_table.c")
+set(TEX_BLOB_TABLE_H "${CMAKE_SOURCE_DIR}/generated/tex_blob_table.h")
 
 file(GLOB_RECURSE SOURCE_PNG_FILES "${CMAKE_SOURCE_DIR}/assets/*/textures/*.png")
 
 add_custom_command(
-    OUTPUT "${TEX_BLOB_BIN}" "${TEX_BLOB_S}" "${TEX_BLOB_TABLE}"
+    OUTPUT "${TEX_BLOB_BIN}" "${TEX_BLOB_S}" "${TEX_BLOB_TABLE}" "${TEX_BLOB_TABLE_H}"
     COMMAND "${Python3_EXECUTABLE}" -u "${CMAKE_SOURCE_DIR}/py_convert_textures.py"
     DEPENDS ${SOURCE_PNG_FILES} "${CMAKE_SOURCE_DIR}/py_convert_textures.py"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
     COMMENT "Converting PNG textures into a concatenated TIM blob"
 )
 add_custom_target(convert_textures
-    DEPENDS "${TEX_BLOB_BIN}" "${TEX_BLOB_S}" "${TEX_BLOB_TABLE}"
+    DEPENDS "${TEX_BLOB_BIN}" "${TEX_BLOB_S}" "${TEX_BLOB_TABLE}" "${TEX_BLOB_TABLE_H}"
 )
 
 # ------------------------------------------------------------

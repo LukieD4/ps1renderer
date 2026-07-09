@@ -1,0 +1,670 @@
+/* ==========================================================================
+   PaletteGen
+   Minimal workbench layout
+   ========================================================================== */
+
+.workbench {
+    display: grid;
+    grid-template-columns: 280px 1fr;
+    gap: 20px;
+
+    padding: 20px;
+
+    min-height: calc(100vh - var(--nav-height) - 52px);
+}
+
+/* ==========================================================================
+   Sidebar
+   ========================================================================== */
+
+.sidebar {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+}
+
+/* ==========================================================================
+   Panels
+   ========================================================================== */
+
+.panel {
+    background: var(--panel);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: 16px;
+}
+
+.panel h2 {
+    margin: 0 0 14px;
+
+    font-size: 13px;
+
+    font-family: var(--font-display);
+
+    font-weight: 500;
+
+    color: var(--text-dim);
+
+    letter-spacing: .04em;
+
+    text-transform: uppercase;
+}
+
+.panel-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    gap: 12px;
+
+    margin-bottom: 14px;
+}
+
+.panel-header h2 {
+    margin: 0;
+}
+
+.preview-hint {
+    margin: -6px 0 12px;
+    font-size: 12px;
+    color: var(--text-faint);
+}
+
+/* ==========================================================================
+   Main
+   ========================================================================== */
+
+.main {
+    display: flex;
+    flex-direction: column;
+    gap: 18px;
+}
+
+/* ==========================================================================
+   Dropzone
+   ========================================================================== */
+
+.dropzone {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    align-items: center;
+
+    height: 170px;
+
+    border: 2px dashed var(--border);
+
+    border-radius: var(--radius-md);
+
+    cursor: pointer;
+
+    transition: .15s;
+}
+
+.dropzone:hover,
+.dropzone.is-dragover {
+    border-color: var(--accent);
+}
+
+.dropzone input {
+    display: none;
+}
+
+.dropzone-title {
+    font-size: 14px;
+
+    color: var(--text);
+}
+
+.dropzone-subtitle {
+    margin-top: 6px;
+
+    font-size: 12px;
+
+    color: var(--text-faint);
+}
+
+/* ==========================================================================
+   Image Info
+   ========================================================================== */
+
+.image-info {
+    margin-top: 12px;
+
+    display: flex;
+    flex-direction: column;
+
+    gap: 4px;
+
+    font-size: 12px;
+
+    color: var(--text-dim);
+}
+
+/* ==========================================================================
+   Palette List
+   ========================================================================== */
+
+.palette-list {
+    display: flex;
+    flex-direction: column;
+
+    gap: 8px;
+
+    margin-bottom: 12px;
+}
+
+.palette-item {
+    padding: 10px 12px;
+
+    border: 1px solid var(--border);
+
+    border-radius: var(--radius-sm);
+
+    background: var(--panel-raised);
+
+    cursor: pointer;
+
+    transition: .15s;
+}
+
+.palette-item:hover {
+    border-color: var(--accent);
+}
+
+.palette-item.active {
+    border-color: var(--accent);
+
+    color: var(--accent);
+}
+
+.palette-item__label {
+    display: block;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.palette-item.is-renaming {
+    padding: 6px 8px;
+    cursor: default;
+}
+
+.palette-item__rename-input {
+    width: 100%;
+    padding: 4px 6px;
+    font-size: inherit;
+    font-family: inherit;
+    color: var(--text);
+    background: var(--panel);
+    border: 1px solid var(--accent);
+    border-radius: 3px;
+    outline: none;
+}
+
+/* ==========================================================================
+   Buttons
+   ========================================================================== */
+
+button {
+    width: 100%;
+
+    padding: 10px;
+
+    border: 1px solid var(--border);
+
+    border-radius: var(--radius-sm);
+
+    background: var(--panel-raised);
+
+    color: var(--text);
+
+    cursor: pointer;
+
+    transition: .15s;
+}
+
+button:hover:not(:disabled) {
+    border-color: var(--accent);
+}
+
+button:disabled {
+    opacity: .45;
+
+    cursor: default;
+}
+
+/* ==========================================================================
+   Preview
+   ========================================================================== */
+
+.placeholder {
+    color: var(--text-faint);
+
+    font-size: 13px;
+}
+
+/* ==========================================================================
+   Expanded Dual Previews & Vector Navigation
+   ========================================================================== */
+
+.preview-panel {
+    display: flex;
+    flex-direction: column;
+    gap: 12px;
+}
+
+.preview-workspace {
+    position: relative;
+    height: 480px;
+    min-height: 480px;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    border-radius: var(--radius-md);
+    background: var(--panel-raised);
+    border: 1px solid var(--border-soft);
+    overflow: hidden;
+}
+
+.preview-split {
+    display: grid;
+    grid-template-columns: 1fr 1fr;
+    gap: 14px;
+    width: 100%;
+    height: 100%;
+    padding: 14px;
+}
+
+.viewport-box {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+    height: 100%;
+}
+
+.viewport-title {
+    font-family: var(--font-display);
+    font-size: 11px;
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+}
+
+.viewport {
+    position: relative;
+    flex: 1;
+    overflow: hidden;
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    background:
+        linear-gradient(45deg, #1b1f28 25%, transparent 25%),
+        linear-gradient(-45deg, #1b1f28 25%, transparent 25%),
+        linear-gradient(45deg, transparent 75%, #1b1f28 75%),
+        linear-gradient(-45deg, transparent 75%, #1b1f28 75%);
+    background-size: 16px 16px;
+    background-position: 0 0, 0 8px, 8px -8px, -8px 0;
+    cursor: grab;
+    display: flex;
+    justify-content: center;
+    align-items: center;
+}
+
+.viewport:active {
+    cursor: grabbing;
+}
+
+/* Both viewports support click-to-pick, so both get a clear "pickable"
+   affordance rather than a hidden toggle mode. A crosshair-style cursor
+   with a visible dot makes it obvious you're sampling, not just panning. */
+.viewport--pickable canvas,
+.viewport-box:first-child .viewport canvas {
+    cursor: crosshair;
+}
+
+.viewport canvas {
+    image-rendering: pixelated;
+    transform-origin: center center;
+    will-change: transform;
+}
+
+.zoom-controls {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 10px;
+    margin-top: 4px;
+    font-family: var(--font-display);
+    font-size: 12px;
+}
+
+.zoom-controls button {
+    width: auto;
+    min-width: 34px;
+    padding: 4px 10px;
+    font-size: 12px;
+}
+
+#zoom-label {
+    min-width: 55px;
+    text-align: center;
+    color: var(--text-dim);
+}
+
+/* Bulk-edit checkbox */
+.checkbox-label {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 12px;
+    color: var(--text-dim);
+    cursor: pointer;
+    white-space: nowrap;
+}
+
+/* Swatch Lock Overlay Element Decorators */
+.swatch-wrapper {
+    position: relative;
+    aspect-ratio: 1;
+}
+
+.swatch__lock-indicator {
+    position: absolute;
+    top: -2px;
+    right: -2px;
+    font-size: 9px;
+    background: #1b1f28;
+    border: 1px solid var(--border);
+    border-radius: 50%;
+    width: 14px;
+    height: 14px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    cursor: pointer;
+    opacity: 0.6;
+    z-index: 2;
+}
+
+.swatch__lock-indicator:hover {
+    opacity: 1;
+}
+
+.swatch-wrapper.is-locked .swatch__lock-indicator {
+    opacity: 1;
+    color: var(--accent);
+    border-color: var(--accent);
+}
+
+/* Hidden native colour input overlaying each editable swatch */
+.swatch__color-input {
+    position: absolute;
+    inset: 0;
+    width: 100%;
+    height: 100%;
+    opacity: 0;
+    pointer-events: none; /* the .swatch div handles the click and forwards it */
+    border: none;
+    padding: 0;
+}
+
+/* ==========================================================================
+   Active Palette Layout & Quick Bulk Edits (horizontal, under swatches)
+   ========================================================================== */
+
+.quick-edit-panel {
+    background: var(--panel-raised);
+    border: 1px solid var(--border-soft);
+    border-radius: var(--radius-md);
+    padding: 14px;
+    margin-top: 16px;
+}
+
+.quick-edit-panel--horizontal {
+    display: flex;
+    flex-direction: column;
+    gap: 14px;
+}
+
+.quick-edit-panel__header {
+    display: flex;
+    align-items: center;
+    gap: 18px;
+    flex-wrap: wrap;
+}
+
+.quick-edit-panel__header h3 {
+    margin: 0;
+    font-size: 11px;
+    font-family: var(--font-display);
+    color: var(--text-faint);
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+    flex: 1 0 auto;
+}
+
+.quick-edit-panel__header #quick-reset {
+    width: auto;
+    min-width: 120px;
+    padding: 6px 14px;
+    font-size: 12px;
+}
+
+.quick-edit-panel__sliders {
+    display: grid;
+    grid-template-columns: repeat(4, 1fr);
+    gap: 16px;
+}
+
+@media (max-width: 900px) {
+    .quick-edit-panel__sliders {
+        grid-template-columns: repeat(2, 1fr);
+    }
+}
+
+@media (max-width: 520px) {
+    .quick-edit-panel__sliders {
+        grid-template-columns: 1fr;
+    }
+}
+
+.control-group {
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.control-label {
+    display: flex;
+    justify-content: space-between;
+    font-size: 12px;
+    color: var(--text-dim);
+}
+
+.control-label span:last-child {
+    font-family: var(--font-display);
+    color: var(--accent);
+    font-size: 11px;
+}
+
+.quick-edit-panel input[type="range"] {
+    width: 100%;
+    accent-color: var(--accent);
+    background: var(--border);
+    height: 4px;
+    border-radius: 2px;
+    cursor: pointer;
+    appearance: none;
+    outline: none;
+}
+
+.quick-edit-panel input[type="range"]::-webkit-slider-thumb {
+    appearance: none;
+    width: 12px;
+    height: 12px;
+    border-radius: 50%;
+    background: var(--accent);
+    cursor: pointer;
+}
+
+/* ==========================================================================
+   Swatches
+   ========================================================================== */
+
+.swatch-grid {
+    display: grid;
+
+    grid-template-columns: repeat(auto-fill,minmax(30px,1fr));
+
+    gap: 6px;
+}
+
+.swatch {
+    aspect-ratio: 1;
+
+    border-radius: 3px;
+
+    border: 1px solid var(--border);
+
+    cursor: pointer;
+
+    transition: .1s;
+}
+
+.swatch:hover {
+    transform: scale(1.08);
+
+    border-color: white;
+}
+
+.swatch.is-selected {
+    outline: 2px solid var(--accent);
+    outline-offset: 1px;
+}
+
+.swatch.readonly {
+    cursor: default;
+}
+
+.swatch.readonly:hover {
+    transform: none;
+}
+
+/* ==========================================================================
+   Read Only Badge
+   ========================================================================== */
+
+.readonly {
+    font-size: 11px;
+
+    color: var(--text-faint);
+}
+
+/* ==========================================================================
+   Footer
+   ========================================================================== */
+
+.transport {
+    height: 52px;
+
+    display: flex;
+
+    gap: 10px;
+
+    align-items: center;
+
+    padding: 0 20px;
+
+    background: var(--panel);
+
+    border-top: 1px solid var(--border);
+}
+
+.transport--top {
+    grid-column: 1 / -1;
+
+    border-top: none;
+    border-bottom: 1px solid var(--border);
+
+    border-radius: var(--radius-md);
+    margin-bottom: 0;
+}
+
+.transport button {
+    width: auto;
+
+    min-width: 120px;
+}
+
+/* ==========================================================================
+   Palette List Actions
+   ========================================================================== */
+
+.palette-actions {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 8px;
+}
+
+.palette-actions button {
+    flex: 1 1 auto;
+    min-width: 90px;
+}
+
+.palette-count {
+    margin-top: 8px;
+    font-size: 11px;
+    color: var(--text-faint);
+    text-align: right;
+}
+
+/* ==========================================================================
+   Drag-to-reorder
+   ========================================================================== */
+
+.palette-item {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.palette-item__handle {
+    flex: 0 0 auto;
+    cursor: grab;
+    color: var(--text-faint);
+    font-size: 12px;
+    line-height: 1;
+    user-select: none;
+}
+
+.palette-item__label {
+    flex: 1 1 auto;
+}
+
+.palette-item.is-dragging {
+    opacity: .5;
+}
+
+.palette-item.is-drop-target {
+    border-color: var(--accent);
+    box-shadow: inset 0 2px 0 var(--accent);
+}
+
+/* ==========================================================================
+   Helpers
+   ========================================================================== */
+
+.hidden {
+    display: none !important;
+}
+
+/* ==========================================================================
+   Responsive
+   ========================================================================== */
+
+@media (max-width:900px){
+
+    .workbench{
+        grid-template-columns:1fr;
+    }
+
+}

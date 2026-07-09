@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>PaletteGen — bit / depth . tools</title>
+
+    <link rel="stylesheet" href="../../css/site.css">
+    <link rel="stylesheet" href="css/tool.css">
+</head>
+
+<body data-nav-key="palette">
+
+<div id="site-navbar"></div>
+
+<div class="workbench">
+
+    <!-- ========================================================= -->
+    <!-- TRANSPORT (load / save / export) -->
+    <!-- ========================================================= -->
+
+    <footer class="transport transport--top">
+
+        <button id="load-project">
+            Load
+        </button>
+
+        <button id="save-project"
+                disabled>
+
+            Save
+
+        </button>
+
+        <button id="export-tim"
+                disabled
+                title="Export every palette as one .tim with stacked CLUTs sharing one image block">
+
+            Export TIM
+
+        </button>
+
+        <input
+            id="project-input"
+            type="file"
+            accept=".PaletteGen"
+            hidden>
+
+    </footer>
+
+    <!-- ========================================================= -->
+    <!-- LEFT PANEL -->
+    <!-- ========================================================= -->
+
+    <aside class="sidebar">
+
+        <section class="panel">
+
+            <h2>Source Image</h2>
+
+            <label id="dropzone" class="dropzone">
+
+                <input
+                    type="file"
+                    id="image-input"
+                    accept="image/png,image/*">
+
+                <span class="dropzone-title">
+                    Drop PNG here
+                </span>
+
+                <span class="dropzone-subtitle">
+                    or click to browse
+                </span>
+
+            </label>
+
+            <div
+                id="image-info"
+                class="image-info hidden">
+
+                <span id="image-name"></span>
+                <span id="image-size"></span>
+
+            </div>
+
+        </section>
+
+        <section class="panel">
+
+            <h2>Palettes</h2>
+
+            <div id="palette-list"
+                 class="palette-list">
+
+            </div>
+
+            <div class="palette-actions">
+                <button id="new-palette">
+                    + New Palette
+                </button>
+
+                <button id="clone-palette" disabled>
+                    Clone Active
+                </button>
+
+                <button id="delete-palette" disabled>
+                    Delete Active
+                </button>
+            </div>
+
+            <div id="palette-count" class="palette-count"></div>
+
+        </section>
+
+    </aside>
+
+    <!-- ========================================================= -->
+    <!-- CENTRE -->
+    <!-- ========================================================= -->
+
+    <main class="main">
+
+        <section class="panel preview-panel">
+            <h2>Preview Workspace</h2>
+            <p class="preview-hint">Click a pixel in either preview to select and edit its palette colour. Drag to pan, scroll to zoom.</p>
+
+            <div class="preview-workspace">
+                <div id="preview-empty" class="placeholder">
+                    No image loaded
+                </div>
+
+                <div id="preview-split" class="preview-split hidden">
+                    <div class="viewport-box">
+                        <div class="viewport-title">Original Asset</div>
+                        <div class="viewport" id="viewport-orig">
+                            <canvas id="canvas-orig"></canvas>
+                        </div>
+                    </div>
+                    <div class="viewport-box">
+                        <div class="viewport-title">Active Remap</div>
+                        <div class="viewport viewport--pickable" id="viewport-remap">
+                            <canvas id="canvas-remap"></canvas>
+                        </div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="zoom-controls hidden" id="zoom-controls">
+                <button id="zoom-out-btn" title="Zoom Out">-</button>
+                <span id="zoom-label">100%</span>
+                <button id="zoom-in-btn" title="Zoom In">+</button>
+                <button id="zoom-reset-btn">Reset View</button>
+            </div>
+        </section>
+
+        <section class="panel">
+            <div class="panel-header">
+                <h2>Original Palette</h2>
+                <span class="readonly">Read Only</span>
+            </div>
+            <div id="original-swatches" class="swatch-grid"></div>
+        </section>
+
+        <section class="panel">
+            <div class="panel-header">
+                <h2 id="active-title">Active Palette</h2>
+                <span class="readonly">Click a swatch to edit • Right-click to lock</span>
+            </div>
+
+            <div id="active-swatches" class="swatch-grid"></div>
+
+            <div id="quick-edit-controls" class="quick-edit-panel quick-edit-panel--horizontal">
+                <div class="quick-edit-panel__header">
+                    <h3>Quick Edit (Bulk)</h3>
+                    <label class="checkbox-label">
+                        <input type="checkbox" id="cfg-prevent-transparency" checked>
+                        <span>Auto-Prevent Transparency</span>
+                    </label>
+                    <button id="quick-reset" disabled>Reset Sliders</button>
+                </div>
+
+                <div class="quick-edit-panel__sliders">
+                    <div class="control-group">
+                        <div class="control-label">
+                            <span>Hue Shift</span>
+                            <span id="quick-hue-val">0°</span>
+                        </div>
+                        <input type="range" id="quick-hue" min="-180" max="180" value="0" disabled>
+                    </div>
+
+                    <div class="control-group">
+                        <div class="control-label">
+                            <span>Saturation</span>
+                            <span id="quick-sat-val">0%</span>
+                        </div>
+                        <input type="range" id="quick-sat" min="-100" max="100" value="0" disabled>
+                    </div>
+
+                    <div class="control-group">
+                        <div class="control-label">
+                            <span>Brightness</span>
+                            <span id="quick-bright-val">0%</span>
+                        </div>
+                        <input type="range" id="quick-bright" min="-100" max="100" value="0" disabled>
+                    </div>
+
+                    <div class="control-group">
+                        <div class="control-label">
+                            <span>Contrast</span>
+                            <span id="quick-contrast-val">0%</span>
+                        </div>
+                        <input type="range" id="quick-contrast" min="-100" max="100" value="0" disabled>
+                    </div>
+                </div>
+            </div>
+        </section>
+
+    </main>
+
+</div>
+
+<script src="../../js/navbar.js"></script>
+
+<script src="js/palette.js"></script>
+<script src="js/image.js"></script>
+<script src="js/renderer.js"></script>
+<script src="js/project.js"></script>
+<script src="js/tim_writer.js"></script>
+<script src="js/app.js"></script>
+
+</body>
+</html>

@@ -1,0 +1,146 @@
+================================================================================
+NEW PaletteGen - .tim EXPORT FORMAT (multi-palette, shared pixel data)
+================================================================================
+
+This web tool writes a SINGLE standalone 4bpp PS1 .tim file containing:
+
+  - ONE image block  (pixel data, written once)
+  - MULTIPLE CLUT rows stacked in one CLUT block (one row per palette
+    you've built in the tool)
+
+All CLUT rows describe recolors of the SAME image block. Nothing about
+the pixel data changes between rows - only which 16-color lookup table
+is bound at draw time changes. This is the native PS1 palette-swap
+convention: store pixels once, swap the CLUT pointer to change the
+whole image's colors.
+
+
+--------------------------------------------------------------------------
+ FILE LAYOUT (byte offsets assume clut_height = N palettes)
+--------------------------------------------------------------------------
+
+Offset   Size   Field                Notes
+------   ----   -----                -----
+0x00     4      magic                always 0x00000010
+0x04     4      flags                bpp code (4bpp) in bits 0-1,
+                                      CLUT-present bit (0x8) set
+
+  -- CLUT BLOCK --
+0x08     4      clut_block_length    includes this 12-byte sub-header
+0x0C     2      clut_x               VRAM X, multiple of 16 (this tool: 0)
+0x0E     2      clut_y               VRAM Y of ROW 0 (this tool: 480)
+0x10     2      clut_width           16 (one palette row = 16 colors,
+                                      in 16-bit units)
+0x12     2      clut_height          N = number of palettes you exported
+0x14     32*N   clut color data      N rows x 16 colors x 2 bytes each,
+                                      row-major (palette 0's 16 colors,
+                                      then palette 1's, etc.)
+
+  -- IMAGE BLOCK (starts right after the CLUT block) --
+...      4      image_block_length   includes this 12-byte sub-header
+...      2      image_x              VRAM X (this tool: 0)
+...      2      image_y              VRAM Y (this tool: 0)
+...      2      image_width          in 16-bit units = pixel_width / 4
+...      2      image_height         actual pixel height (not divided)
+...      *      packed pixel data    4 bits per pixel, 2 pixels per byte,
+                                      FIRST pixel in the HIGH nibble
+
+All multi-byte fields are little-endian.
+
+
+--------------------------------------------------------------------------
+ CLUT ROW ORDER
+--------------------------------------------------------------------------
+
+Row order is exactly your palette list order in the sidebar, top to
+bottom. No reordering, no "active palette goes last/first" special
+case - what you see in the Palettes list is what you get:
+
+    [ VRAM Palette 1, Palette 2, Palette 3, ... ]
+      row 0             row 1      row 2
+
+Row k of the file, once loaded into VRAM, occupies:
+
+    VRAM Y = clut_y + k     (clut_y is fixed at the file's CLUT block
+                              header; only the row offset changes)
+
+Which row a given viewer or engine treats as its "default" or primary
+display row is that tool's own convention - this exporter does not try
+to guess or accommodate it by rearranging rows.
+
+
+--------------------------------------------------------------------------
+ ONE COLOR ENTRY (16-bit packed, PS1 native format)
+--------------------------------------------------------------------------
+
+    bit:   15  14 13 12 11 10 | 9 8 7 6 5 | 4 3 2 1 0
+    field: STP |   BLUE (5)   |  GREEN(5) |  RED (5)
+
+  - STP = semi-transparency / "sprite visible" flag.
+  - Each 8-bit channel (0-255) is downsampled to 5-bit (0-31) by
+    floor(value / 8).
+  - Safeguard: if a color downsamples to pure black (0,0,0) AND the
+    palette's "Auto-Prevent Transparency" option is on, STP is forced
+    to 1 so the hardware renders it as a visible black pixel instead of
+    treating index color 0x0000 as transparent by hardware convention.
+
+
+--------------------------------------------------------------------------
+ WHAT GOES INTO EACH CLUT ROW
+--------------------------------------------------------------------------
+
+Each row is your palette's colors AFTER all edits are baked down to
+plain RGB - sliders and locks are a live, non-destructive editing layer
+in the tool's UI, but a real PS1 CLUT is just static numbers, so:
+
+  - Hue / Saturation / Brightness / Contrast sliders are resolved and
+    flattened into the final RGB per swatch.
+  - Any swatch you LOCKED keeps its original manually-set color and is
+    skipped by the slider math entirely (locks only shield a swatch
+    from the bulk sliders, never from direct color-picker edits).
+  - If a palette has fewer than 16 colors, remaining rows are padded
+    with black (0,0,0), safeguarded the same way as above.
+
+
+--------------------------------------------------------------------------
+ PIXEL DATA
+--------------------------------------------------------------------------
+
+  - Written ONCE, shared by every CLUT row - no duplication per palette.
+  - Each pixel is an index (0-15) into whichever CLUT row is bound at
+    draw time, NOT a direct color.
+  - Indices come from matching each source pixel's RGB against the
+    ORIGINAL (untouched, read-only) extracted palette - the same
+    color-to-index map the live preview and CLUT export both use, so
+    picking, exporting, and previewing all agree on what index N means.
+  - A pixel that doesn't match any known color (rare - usually an
+    anti-aliased edge) is written as index 0 and flagged in the export
+    confirmation dialog as an "unmatched pixel" count.
+  - Fully transparent source pixels are also written as index 0 (PS1
+    hardware transparency is a per-polygon draw setting, not something
+    derived from source alpha).
+
+
+--------------------------------------------------------------------------
+ LIMITS
+--------------------------------------------------------------------------
+
+  - 4bpp only -> max 16 colors per palette, max 16 palettes stacked
+    before clut_y + clut_height would run past VRAM's 512-line height.
+  - clut_x must be a multiple of 16 (PS1 hardware requirement).
+  - Source image must already be <=16 unique colors - this tool does
+    not quantize/reduce colors during TIM export, only packs them.
+
+
+--------------------------------------------------------------------------
+ QUICK EXAMPLE  (3 palettes: "VRAM Palette 1", "Fire", "Ice", in that
+ order in the sidebar - it doesn't matter which one is active)
+--------------------------------------------------------------------------
+
+    CLUT row 0  <- "VRAM Palette 1"   (VRAM Y = clut_y + 0)
+    CLUT row 1  <- "Fire"             (VRAM Y = clut_y + 1)
+    CLUT row 2  <- "Ice"              (VRAM Y = clut_y + 2)
+
+    Image block <- pixel indices, shared by all 3 rows above
+
+================================================================================

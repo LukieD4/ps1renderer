@@ -1,0 +1,139 @@
+/* ==========================================================================
+   site.css — shared design tokens + navbar
+   Used by every page on the site. Tool-specific styles live in their own
+   stylesheet alongside the tool.
+   ========================================================================== */
+
+:root {
+  /* Color */
+  --bg: #0d0f14;
+  --panel: #151922;
+  --panel-raised: #1b202b;
+  --border: #2a2f3a;
+  --border-soft: #232834;
+  --text: #e8eaed;
+  --text-dim: #8b93a3;
+  --text-faint: #565f70;
+  --accent: #5eead4;       /* phosphor teal — primary interactive glow */
+  --accent-dim: #2f6b62;
+  --accent-warn: #f59e0b;  /* amber — active/destructive/export */
+  --accent-warn-dim: #7a5310;
+  --danger: #f26363;
+
+  /* Type */
+  --font-display: "JetBrains Mono", "SF Mono", Consolas, monospace;
+  --font-body: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+
+  /* Layout */
+  --radius-sm: 3px;
+  --radius-md: 6px;
+  --nav-height: 56px;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html, body {
+  margin: 0;
+  padding: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: var(--font-body);
+}
+
+body {
+  min-height: 100vh;
+}
+
+a {
+  color: inherit;
+}
+
+::selection {
+  background: var(--accent-dim);
+  color: var(--text);
+}
+
+/* Focus visibility — kept everywhere, not just on the tool page */
+:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+
+/* ---- Site navbar --------------------------------------------------- */
+
+.site-nav {
+  height: var(--nav-height);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 0 20px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.site-nav__brand {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  text-decoration: none;
+  font-family: var(--font-display);
+  font-size: 14px;
+  font-weight: 500;
+  letter-spacing: 0.02em;
+  color: var(--text);
+}
+
+.site-nav__brand-mark {
+  color: var(--accent);
+  font-size: 15px;
+  line-height: 1;
+}
+
+.site-nav__brand-dim {
+  color: var(--text-faint);
+}
+
+.site-nav__links {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+
+.site-nav__link {
+  font-family: var(--font-body);
+  font-size: 13.5px;
+  font-weight: 500;
+  text-decoration: none;
+  color: var(--text-dim);
+  padding: 8px 12px;
+  border-radius: var(--radius-sm);
+  transition: color 0.12s ease, background 0.12s ease;
+}
+
+.site-nav__link:hover {
+  color: var(--text);
+  background: var(--panel-raised);
+}
+
+.site-nav__link.is-active {
+  color: var(--accent);
+  background: rgba(94, 234, 212, 0.08);
+}
+
+@media (max-width: 640px) {
+  .site-nav__brand-text {
+    display: none;
+  }
+  .site-nav__links {
+    gap: 0;
+  }
+  .site-nav__link {
+    padding: 8px 8px;
+    font-size: 12.5px;
+  }
+}

@@ -1,0 +1,68 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>bit / depth . tools</title>
+  <link rel="stylesheet" href="css/site.css" />
+  <style>
+    .home {
+      max-width: 720px;
+      margin: 0 auto;
+      padding: 80px 24px;
+    }
+    .home h1 {
+      font-family: var(--font-display);
+      font-size: 28px;
+      margin: 0 0 12px;
+    }
+    .home p {
+      color: var(--text-dim);
+      line-height: 1.6;
+    }
+    .home-card {
+      display: block;
+      margin-top: 32px;
+      padding: 20px;
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: var(--radius-md);
+      text-decoration: none;
+      transition: border-color 0.15s ease;
+    }
+    .home-card:hover {
+      border-color: var(--accent-dim);
+    }
+    .home-card__title {
+      font-family: var(--font-display);
+      color: var(--accent);
+      font-size: 15px;
+    }
+    .home-card__desc {
+      color: var(--text-dim);
+      font-size: 13.5px;
+      margin-top: 6px;
+    }
+  </style>
+</head>
+<body data-nav-key="home">
+  <div id="site-navbar"></div>
+
+  <main class="home">
+    <h1>bit / depth . tools</h1>
+    <p>Small offline tools for pushing pixels around. Everything runs locally in your browser — nothing is uploaded anywhere.</p>
+
+    <a class="home-card" href="tools/image-bpp/index.html">
+      <div class="home-card__title">BPP Image Tool</div>
+      <div class="home-card__desc">Reduce an image to a restricted color depth (4/8bpp), adjust hue/saturation/contrast, dither, edit the palette by hand, and export or save your project.</div>
+    </a>
+
+    <a class="home-card" href="tools/palette-maker/index.html">
+      <div class="home-card__title">Palette Maker</div>
+      <div class="home-card__desc">Create and edit custom color palettes for your projects.</div>
+    </a>
+  </main>
+
+  <script src="js/navbar.js"></script>
+</body>
+</html>
