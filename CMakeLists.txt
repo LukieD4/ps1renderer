@@ -87,14 +87,42 @@ add_custom_target(convert_textures
 )
 
 # ------------------------------------------------------------
+# 1c. scene.json -> C scene data
+# ------------------------------------------------------------
+# Same stamp-file reasoning as convert_assets above (py_convert_scenes.py's
+# outputs - scene_common.h, scene_registry.c, per-scene scene_<name>.c,
+# scenes_all.h - aren't known at CMake configure time on a clean
+# checkout). Scene objects only reference model names as plain strings,
+# resolved at RUNTIME by main.c (see find_model_index_by_name()), so this
+# doesn't strictly need to run after convert_assets to produce correct
+# output - kept as a separate stage anyway (not folded into convert_assets)
+# so a scene-only edit doesn't force re-parsing every .obj in assets/.
+file(GLOB_RECURSE SOURCE_SCENE_FILES "${CMAKE_SOURCE_DIR}/scenes/*/scene.json")
+
+set(SCENES_STAMP "${CMAKE_BINARY_DIR}/scenes_converted.stamp")
+
+add_custom_command(
+    OUTPUT "${SCENES_STAMP}"
+    COMMAND "${Python3_EXECUTABLE}" -u "${CMAKE_SOURCE_DIR}/py_convert_scenes.py"
+    COMMAND "${CMAKE_COMMAND}" -E touch "${SCENES_STAMP}"
+    DEPENDS ${SOURCE_SCENE_FILES} "${CMAKE_SOURCE_DIR}/py_convert_scenes.py"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    COMMENT "Converting scene.json files into C scene data"
+)
+add_custom_target(convert_scenes
+    DEPENDS "${SCENES_STAMP}"
+)
+
+# ------------------------------------------------------------
 # 2b. Combined "convert everything" target
 # ------------------------------------------------------------
-# Single entry point that runs both conversion passes in the correct
+# Single entry point that runs every conversion pass in the correct
 # order (assets before textures, per py_convert_textures.py's own
-# "Run after py_convert_assets.py!" comment) - lets you type one target
-# name instead of remembering which of the two to run, or in which order.
+# "Run after py_convert_assets.py!" comment; scenes can run independently
+# of both but is included here too) - lets you type one target name
+# instead of remembering which of the three to run, or in which order.
 add_custom_target(convert_everything
-    DEPENDS convert_assets convert_textures
+    DEPENDS convert_assets convert_textures convert_scenes
 )
 
 # ------------------------------------------------------------

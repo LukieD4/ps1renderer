@@ -1,11 +1,92 @@
-// THIS IS A DEMO, will work on at some point.
 {
   "camera": {
-    "pos": [0, 0, -4096],
-    "rot": [0, 0, 0]
+    "pos": [
+      3721,
+      -451,
+      -1455
+    ],
+    "rot": [
+      0,
+      -90,
+      0
+    ]
   },
   "objects": [
-    { "model": "house", "palette":0, "pos": [0, 0, 0],    "rot": [0, 0, 0] },
-    { "model": "garage", "palette":0, "pos": [2000, 0, 0], "rot": [0, 1024, 0] }
+    {
+      "model": "house",
+      "palette": 0,
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "model": "3shapes",
+      "palette": 0,
+      "pos": [
+        1798,
+        -3393,
+        0
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "model": "honda",
+      "palette": 0,
+      "pos": [
+        1371,
+        -410,
+        -2633
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "model": "house",
+      "palette": 1,
+      "pos": [
+        -6340,
+        0,
+        0
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
+    }
   ]
 }

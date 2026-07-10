@@ -1,6 +1,7 @@
 # root/py_convert_assets.py
+# (resync marker)
 
-import os, shutil
+import os, re, shutil
 import math
 from pathlib import Path
 
@@ -10,8 +11,6 @@ from pathlib import Path
 # converted .c files come out in generated/.
 ORIGIN_OBJECT_DIR = Path(__file__).resolve().parent / "assets"
 CONVERT_OBJECT_DIR = Path(__file__).resolve().parent / "generated"
-
-FILES_TO_BE_PROCESSED = os.walk(ORIGIN_OBJECT_DIR)
 
 FIXED_POINT_MATH_UPSCALE = 1024  # converts from decimal to int, something which the ps1 can digest.
 
@@ -26,9 +25,26 @@ UV_BYTE_SCALE = 255  # 256x256 image
 # 256 distinct materials per model is the hard ceiling either way.
 MAX_MATERIALS_PER_MODEL = 256
 
+# Multiple simultaneous models (scenes) means every generated .c file now
+# gets #include'd together into ONE main.c translation unit (via
+# generated/models_all.h), instead of one at a time by hand-editing a
+# single "#include generated/house.c" line. That means every model's
+# top-level symbols (modelTris, modelVerts, etc.) MUST be unique per
+# model - this prefix is what makes that safe. Sanitized so a folder
+# name that isn't already a valid C identifier fragment (starts with a
+# digit, has spaces/dashes, etc.) still produces something legal.
+def sanitize_identifier(name):
+    ident = re.sub(r"[^0-9A-Za-z_]", "_", name)
+    if not ident or ident[0].isdigit():
+        ident = "_" + ident
+    return ident
+
 
 # Delete old dir contents so stale .c files don't linger after a model is
-# renamed/removed from generated/.
+# renamed/removed from generated/. Runs first, before py_convert_textures.py
+# or py_convert_scenes.py add their own (differently-named) outputs to the
+# same directory - both of those scripts are careful not to wipe generated/
+# themselves, only this one does, since this one always runs first.
 if CONVERT_OBJECT_DIR.exists():
     for item in CONVERT_OBJECT_DIR.iterdir():
         if item.is_dir():
@@ -38,16 +54,49 @@ if CONVERT_OBJECT_DIR.exists():
 else:
     CONVERT_OBJECT_DIR.mkdir(parents=True, exist_ok=True)
 
+CONVERT_OBJECT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+# ------------------------------------------------------------------
+# Discovery: ONE .obj per model folder, following the established
+# per-object convention (assets/<name>/<name>.obj[/.mtl][/textures]) -
+# see the README's "Asset pipeline restructure" entry. This is a
+# deliberately NARROWER walk than the old os.walk(ORIGIN_OBJECT_DIR)
+# (which recursed into every subfolder, including dev/ working-file
+# dirs - that's how assets/house/dev/_house.obj used to leak out as a
+# phantom "generated/_house.c" model). Baking every discovered model
+# into the ELF unconditionally (the "bake all models always" choice for
+# the scene system) makes an accurate discovery list matter now more
+# than it used to - a stray dev/ .obj would become a real, wasted
+# runtime model registry entry, not just an unused generated file.
+# ------------------------------------------------------------------
+discovered_models = []  # list of (folder_name, obj_path)
+
+for folder in sorted(ORIGIN_OBJECT_DIR.iterdir()):
+    if not folder.is_dir():
+        continue
+
+    obj_path = folder / f"{folder.name}.obj"
+    if not obj_path.exists():
+        print(f"NOTE: {folder.name}/ has no {folder.name}.obj (per-object naming "
+              f"convention) - skipped. Anything else in this folder (dev/ files, "
+              f"stray .obj with a different name, etc.) is intentionally ignored.")
+        continue
+
+    discovered_models.append((folder.name, obj_path))
+
+
+# Collected across the loop below, used to emit model_registry.c /
+# models_all.h once every model has been converted.
+model_registry_entries = []  # list of dicts: name, ident, has_data
+
 
 #
 # Phase 1: parse each .obj into a dict of raw line data
 #
-for root, dirs, filenames in FILES_TO_BE_PROCESSED:
-    for filename in filenames:
-        if filename.endswith(".py"): continue  # skips
-        if not filename.endswith(".obj"): continue  # skips materials and anything else
-
-        file = Path(root) / filename
+for model_name, file in discovered_models:
+        filename = file.name
+        ident = sanitize_identifier(model_name)
 
         data = {}
 
@@ -148,7 +197,7 @@ for root, dirs, filenames in FILES_TO_BE_PROCESSED:
         #
         # Debug output
         #
-        print(f"\nParsed {filename}\n")
+        print(f"\nParsed {filename} (model '{model_name}' -> prefix '{ident}_')\n")
         for key, values in data.items():
             print(f"{key}: {len(values)} entries")
         if object_names: print(f"o: {len(object_names)} entries")
@@ -160,48 +209,35 @@ for root, dirs, filenames in FILES_TO_BE_PROCESSED:
         #
         # Phase 2: emit a .c file from the parsed data
         #
+        file_output = CONVERT_OBJECT_DIR / f"{model_name}.c"
 
-        CONVERT_OBJECT_DIR.mkdir(parents=True, exist_ok=True)
-
-        file_output = CONVERT_OBJECT_DIR / f"{file.stem}.c"
-
-        # Do not redefine SVECTOR, <psxgte.h> already has it.
+        # MODEL_TRI is now defined ONCE in generated/model_common.h (emitted
+        # below, after this loop) instead of being re-emitted verbatim into
+        # every single generated/<model>.c file. That inline re-definition
+        # was harmless back when only one generated .c was ever #include'd
+        # into main.c at a time, but multiple models now share one
+        # translation unit (see generated/models_all.h) - redefining the
+        # same typedef N times in one TU is exactly the kind of drift this
+        # project has already been bitten by once (see tex_blob_table.h's
+        # own comment about the same lesson on the texture side).
         #
-        # uv0/uv1/uv2 are consumed by main.c's draw_model() textured path
+        # uv0/uv1/uv2 are consumed by main.c's draw_object() textured path
         # (POLY_FT3 + setUV3()), reading the same split-vertex index space
         # as v0/v1/v2.
         #
-        # material is now populated per-triangle (see get_material_index
-        # above) instead of always being 0 - it indexes into this model's
-        # own modelMaterialNames[] table below, which the texture-table
-        # lookup in main.c resolves against the texture blob's own name
-        # table at load time (see py_convert_textures.py / tex_blob.c).
-        VERTEX_INDICES = """
-typedef struct
-{
-    unsigned short v0;
-    unsigned short v1;
-    unsigned short v2;
-
-    unsigned short n0;
-    unsigned short n1;
-    unsigned short n2;
-
-    unsigned short uv0;
-    unsigned short uv1;
-    unsigned short uv2;
-
-    unsigned char material;
-
-} MODEL_TRI;
-"""
+        # material is populated per-triangle (see get_material_index above)
+        # instead of always being 0 - it indexes into THIS model's own
+        # <ident>_modelMaterialNames[] table below, which main.c's texture
+        # table lookup resolves against the texture blob's own name table at
+        # load time (see py_convert_textures.py / tex_blob.c). This
+        # indirection is what lets material index 0 mean different textures
+        # in different models safely.
 
         output = []
 
-        output.append("/* Auto-generated from OBJ.\n* Do not edit manually.*/\n")
-        output.append("\n")
-        output.append(VERTEX_INDICES)
-        output.append("\n")
+        output.append(f"/* Auto-generated from {file.relative_to(Path(__file__).resolve().parent).as_posix()}.\n")
+        output.append("* Do not edit manually.*/\n\n")
+        output.append('#include "model_common.h"\n\n')
 
         #
         # Raw OBJ data, parsed but NOT yet split. verts_float/vert_normals_float
@@ -306,7 +342,7 @@ typedef struct
 
         if "f" in data:
 
-            output.append("MODEL_TRI modelTris[] = {\n")
+            output.append(f"MODEL_TRI {ident}_modelTris[] = {{\n")
 
             for face_line_index, face in enumerate(data["f"]):
 
@@ -393,17 +429,15 @@ typedef struct
                   f"modelUVs for those corners will be emitted as {{0, 0}} placeholders.")
 
         #
-        # Material name table - modelMaterialNames[] - one C string per
-        # distinct material index, in the same order as get_material_index
-        # assigned them (first-seen order in the .obj). main.c's texture
-        # table lookup matches these names against the texture blob's own
-        # name table (see py_convert_textures.py) to resolve tri->material
-        # to an actual TPAGE/CLUT at runtime - this indirection is what
-        # lets material index 0 in house.c and material index 0 in some
-        # other model.c refer to completely different textures safely.
+        # Material name table - <ident>_modelMaterialNames[] - one C string
+        # per distinct material index, in the same order as
+        # get_material_index assigned them (first-seen order in the .obj).
+        # main.c's texture table lookup matches these names against the
+        # texture blob's own name table (see py_convert_textures.py) to
+        # resolve tri->material to an actual TPAGE/CLUT at runtime.
         #
-        output.append(f"const unsigned int modelMaterialCount = {len(material_index_to_name)};\n")
-        output.append("const char *modelMaterialNames[] = {\n")
+        output.append(f"const unsigned int {ident}_modelMaterialCount = {len(material_index_to_name)};\n")
+        output.append(f"const char *{ident}_modelMaterialNames[] = {{\n")
         for name in material_index_to_name:
             escaped = name.replace("\\", "\\\\").replace('"', '\\"')
             output.append(f'    "{escaped}",\n')
@@ -417,7 +451,7 @@ typedef struct
         #
         if split_vert_positions:
 
-            output.append("SVECTOR modelVerts[] = {\n" + "// be sure to #include <psxgte.h> in main.c\n")
+            output.append(f"SVECTOR {ident}_modelVerts[] = {{\n" + "// be sure to #include <psxgte.h> in main.c\n")
 
             for (xf, yf, zf) in split_vert_positions:
 
@@ -438,7 +472,7 @@ typedef struct
         #
         if face_index_lists and split_vert_positions:
 
-            output.append("SVECTOR modelFaceNormals[] = {\n")
+            output.append(f"SVECTOR {ident}_modelFaceNormals[] = {{\n")
 
             for (i0, i1, i2) in face_index_lists:
 
@@ -497,7 +531,7 @@ typedef struct
                 print(f"  WARNING: {filename} - filled {len(fallback_by_index)} "
                       f"vertex normal(s) missing vn data with flat-normal fallback.")
 
-            output.append("SVECTOR modelVertNormals[] = {\n")
+            output.append(f"SVECTOR {ident}_modelVertNormals[] = {{\n")
 
             for normal in split_vert_normals:
 
@@ -529,7 +563,7 @@ typedef struct
         #
         if split_vert_positions:
 
-            output.append("unsigned char modelUVs[][2] = {\n")
+            output.append(f"unsigned char {ident}_modelUVs[][2] = {{\n")
 
             missing_uv_count = 0
 
@@ -571,7 +605,7 @@ typedef struct
             max_y = max(v[1] for v in split_vert_positions)
             max_z = max(v[2] for v in split_vert_positions)
 
-            output.append("SVECTOR modelBBoxMin = {\n")
+            output.append(f"SVECTOR {ident}_modelBBoxMin = {{\n")
             output.append(
                 f"    {int(min_x * FIXED_POINT_MATH_UPSCALE)}, "
                 f"{int(min_y * FIXED_POINT_MATH_UPSCALE)}, "
@@ -579,7 +613,7 @@ typedef struct
             )
             output.append("};\n\n")
 
-            output.append("SVECTOR modelBBoxMax = {\n")
+            output.append(f"SVECTOR {ident}_modelBBoxMax = {{\n")
             output.append(
                 f"    {int(max_x * FIXED_POINT_MATH_UPSCALE)}, "
                 f"{int(max_y * FIXED_POINT_MATH_UPSCALE)}, "
@@ -600,7 +634,7 @@ typedef struct
                 if dist > radius:
                     radius = dist
 
-            output.append("SVECTOR modelBSphereCenter = {\n")
+            output.append(f"SVECTOR {ident}_modelBSphereCenter = {{\n")
             output.append(
                 f"    {int(center_x * FIXED_POINT_MATH_UPSCALE)}, "
                 f"{int(center_y * FIXED_POINT_MATH_UPSCALE)}, "
@@ -609,7 +643,7 @@ typedef struct
             output.append("};\n\n")
 
             output.append(
-                f"const int modelBSphereRadius = {int(radius * FIXED_POINT_MATH_UPSCALE)};\n\n"
+                f"const int {ident}_modelBSphereRadius = {int(radius * FIXED_POINT_MATH_UPSCALE)};\n\n"
             )
 
         #
@@ -618,11 +652,11 @@ typedef struct
         vertex_count = len(split_vert_positions)
 
         output.append(
-            f"const unsigned int modelVertCount = {vertex_count};\n"
+            f"const unsigned int {ident}_modelVertCount = {vertex_count};\n"
         )
 
         output.append(
-            f"const unsigned int modelTriCount = {triangle_count};\n"
+            f"const unsigned int {ident}_modelTriCount = {triangle_count};\n"
         )
 
         #
@@ -634,3 +668,118 @@ typedef struct
         print(f"Generated: {file_output}")
         print(f"  Split vertex count: {vertex_count} (vs raw OBJ 'v' count: {len(verts_float)})")
         print(f"  Materials: {len(material_index_to_name)}")
+
+        # A model with zero triangles (empty/degenerate .obj) has no
+        # modelVerts/modelTris/etc. arrays emitted above (all guarded by
+        # `if split_vert_positions:` / `if "f" in data:`) - registering it
+        # anyway would reference symbols that don't exist and fail the
+        # build. Skip it from the registry (with a loud warning) instead.
+        if triangle_count == 0 or not split_vert_positions:
+            print(f"  WARNING: '{model_name}' produced 0 triangles - excluded "
+                  f"from model_registry.c (scene objects referencing it will "
+                  f"be treated as an unresolved model at runtime).")
+            continue
+
+        model_registry_entries.append({"name": model_name, "ident": ident})
+
+
+# ------------------------------------------------------------------
+# Shared header - MODEL_TRI + MODEL_DEF struct definitions, ONE place
+# only. #include'd by every generated/<model>.c file (added above),
+# generated/model_registry.c, and main.c. Field types intentionally
+# match each per-model array's actual declared type exactly (no const
+# added at the pointer level) so assigning them into a MODEL_DEF literal
+# below never trips a qualifier-mismatch warning on the MIPS toolchain.
+# ------------------------------------------------------------------
+header_lines = []
+header_lines.append("/* Auto-generated by py_convert_assets.py. Do not edit manually.\n")
+header_lines.append(" * Included by every generated/<model>.c file, generated/model_registry.c,\n")
+header_lines.append(" * and main.c - keep this the ONLY place MODEL_TRI/MODEL_DEF are defined,\n")
+header_lines.append(" * the same lesson tex_blob_table.h already applied on the texture side. */\n\n")
+header_lines.append("#ifndef MODEL_COMMON_H\n#define MODEL_COMMON_H\n\n")
+header_lines.append("typedef struct\n{\n")
+header_lines.append("    unsigned short v0;\n")
+header_lines.append("    unsigned short v1;\n")
+header_lines.append("    unsigned short v2;\n\n")
+header_lines.append("    unsigned short n0;\n")
+header_lines.append("    unsigned short n1;\n")
+header_lines.append("    unsigned short n2;\n\n")
+header_lines.append("    unsigned short uv0;\n")
+header_lines.append("    unsigned short uv1;\n")
+header_lines.append("    unsigned short uv2;\n\n")
+header_lines.append("    unsigned char material;\n\n")
+header_lines.append("} MODEL_TRI;\n\n")
+header_lines.append("// One entry per discovered assets/<name>/<name>.obj. Every pointer field\n")
+header_lines.append("// points at that SPECIFIC model's own prefixed arrays (<name>_modelVerts,\n")
+header_lines.append("// <name>_modelTris, etc.) - main.c resolves a scene object's \"model\" name\n")
+header_lines.append("// string against modelRegistry[] once at scene load (see load_scene() /\n")
+header_lines.append("// find_model_index_by_name()), then only ever touches these pointers/\n")
+header_lines.append("// counts from there on - never the bare per-model globals directly. This\n")
+header_lines.append("// is what makes main.c's render path model-agnostic instead of hardcoding\n")
+header_lines.append("// one #include'd model.\n")
+header_lines.append("typedef struct\n{\n")
+header_lines.append("    const char *name;\n\n")
+header_lines.append("    SVECTOR *verts;\n")
+header_lines.append("    unsigned int vertCount;\n\n")
+header_lines.append("    MODEL_TRI *tris;\n")
+header_lines.append("    unsigned int triCount;\n\n")
+header_lines.append("    SVECTOR *faceNormals;\n")
+header_lines.append("    SVECTOR *vertNormals;\n")
+header_lines.append("    unsigned char (*uvs)[2];\n\n")
+header_lines.append("    const char **materialNames;\n")
+header_lines.append("    unsigned int materialCount;\n\n")
+header_lines.append("    SVECTOR *bboxMin;\n")
+header_lines.append("    SVECTOR *bboxMax;\n")
+header_lines.append("    SVECTOR *bsphereCenter;\n")
+header_lines.append("    int bsphereRadius;\n")
+header_lines.append("} MODEL_DEF;\n\n")
+header_lines.append("extern const unsigned int modelRegistryCount;\n")
+header_lines.append("extern const MODEL_DEF modelRegistry[];\n\n")
+header_lines.append("#endif\n")
+
+(CONVERT_OBJECT_DIR / "model_common.h").write_text("".join(header_lines), newline="\n")
+print(f"\nGenerated: {CONVERT_OBJECT_DIR / 'model_common.h'}")
+
+
+# ------------------------------------------------------------------
+# Registry - one entry per successfully-converted model.
+# ------------------------------------------------------------------
+registry_lines = []
+registry_lines.append("/* Auto-generated by py_convert_assets.py. Do not edit manually. */\n\n")
+registry_lines.append('#include "model_common.h"\n\n')
+registry_lines.append(f"const unsigned int modelRegistryCount = {len(model_registry_entries)};\n")
+registry_lines.append("const MODEL_DEF modelRegistry[] = {\n")
+for entry in model_registry_entries:
+    ident = entry["ident"]
+    escaped_name = entry["name"].replace("\\", "\\\\").replace('"', '\\"')
+    registry_lines.append(
+        f'    {{ "{escaped_name}", '
+        f"{ident}_modelVerts, {ident}_modelVertCount, "
+        f"{ident}_modelTris, {ident}_modelTriCount, "
+        f"{ident}_modelFaceNormals, {ident}_modelVertNormals, {ident}_modelUVs, "
+        f"{ident}_modelMaterialNames, {ident}_modelMaterialCount, "
+        f"&{ident}_modelBBoxMin, &{ident}_modelBBoxMax, "
+        f"&{ident}_modelBSphereCenter, {ident}_modelBSphereRadius }},\n"
+    )
+registry_lines.append("};\n")
+
+(CONVERT_OBJECT_DIR / "model_registry.c").write_text("".join(registry_lines), newline="\n")
+print(f"Generated: {CONVERT_OBJECT_DIR / 'model_registry.c'} ({len(model_registry_entries)} model(s))")
+
+
+# ------------------------------------------------------------------
+# Manifest - #include'd ONCE from main.c. Replaces the old hand-edited
+# "#include generated/house.c" + commented-out alternates - add/remove a
+# model under assets/ and this regenerates automatically, no main.c edit
+# needed.
+# ------------------------------------------------------------------
+manifest_lines = []
+manifest_lines.append("/* Auto-generated by py_convert_assets.py. Do not edit manually.\n")
+manifest_lines.append(" * #include this ONCE from main.c - lists every discovered model. */\n\n")
+manifest_lines.append('#include "model_common.h"\n')
+for entry in model_registry_entries:
+    manifest_lines.append(f'#include "{entry["name"]}.c"\n')
+manifest_lines.append('#include "model_registry.c"\n')
+
+(CONVERT_OBJECT_DIR / "models_all.h").write_text("".join(manifest_lines), newline="\n")
+print(f"Generated: {CONVERT_OBJECT_DIR / 'models_all.h'}")

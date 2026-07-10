@@ -1,0 +1,87 @@
+{
+    "original": [
+        "#ff1500",
+        "#fd1601",
+        "#3a32c5",
+        "#023afd",
+        "#003aff",
+        "#44cd00",
+        "#12fe00",
+        "#11ff00",
+        "#ba1f45",
+        "#b95901",
+        "#11e71d"
+    ],
+    "palettes": [
+        {
+            "name": "Palette 1",
+            "colours": [
+                "#ff1500",
+                "#fd1601",
+                "#3a32c5",
+                "#023afd",
+                "#003aff",
+                "#44cd00",
+                "#12fe00",
+                "#11ff00",
+                "#ba1f45",
+                "#b95901",
+                "#11e71d"
+            ],
+            "locks": [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+            ],
+            "hue": 0,
+            "saturation": 0,
+            "brightness": 0,
+            "contrast": 0,
+            "preventTransparency": true
+        },
+        {
+            "name": "Palette 2",
+            "colours": [
+                "#ff1500",
+                "#fd1601",
+                "#3a32c5",
+                "#023afd",
+                "#003aff",
+                "#44cd00",
+                "#12fe00",
+                "#11ff00",
+                "#ba1f45",
+                "#b95901",
+                "#11e71d"
+            ],
+            "locks": [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+            ],
+            "hue": 180,
+            "saturation": 0,
+            "brightness": 0,
+            "contrast": 0,
+            "preventTransparency": true
+        }
+    ],
+    "active": 1,
+    "sourceFileName": "UniqueThree.png"
+}

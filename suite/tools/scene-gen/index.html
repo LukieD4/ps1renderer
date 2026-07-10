@@ -1,0 +1,176 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>scene-gen | PS1 Toolchain</title>
+
+<!-- Shared site styles (lives outside this tool's folder, part of the suite shell) -->
+<link rel="stylesheet" href="../../css/site.css">
+<link rel="stylesheet" href="css/tool.css">
+
+<!-- Three.js r0.160.0 import map. viewer.js imports from these bare specifiers. -->
+<script type="importmap">
+{
+  "imports": {
+    "three": "https://unpkg.com/three@0.160.0/build/three.module.js",
+    "three/addons/": "https://unpkg.com/three@0.160.0/examples/jsm/"
+  }
+}
+</script>
+</head>
+<body>
+  <div id="site-navbar"></div>
+
+  <div class="workbench">
+    <aside class="sidebar">
+
+      <section class="panel" id="panel-assets">
+        <h2 class="panel-title">Assets</h2>
+        <!-- Exactly one of these two is shown, decided at startup by
+             app.js based on hasNativeDirectoryPicker() (dnd_assets.js):
+             Chrome/Edge get the native folder-picker button, Firefox
+             (and any other browser without showDirectoryPicker) gets a
+             drag-and-drop zone instead. See dnd_assets.js's header
+             comment for why Firefox can't just use the native API. -->
+        <button id="btn-open-assets" class="btn btn-block hidden">Open Assets Folder</button>
+        <label id="dropzone-assets" class="dropzone hidden">
+          <span class="dropzone-title">Drop your assets folder here</span>
+          <span class="dropzone-subtitle">Firefox doesn't support the folder picker - drag the root assets/ folder from your file manager instead</span>
+        </label>
+        <ul id="model-list" class="item-list"></ul>
+      </section>
+
+      <section class="panel" id="panel-instances">
+        <h2 class="panel-title">Instances</h2>
+        <button id="btn-add-instance" class="btn btn-block" disabled>Add Instance</button>
+        <ul id="instance-list" class="item-list"></ul>
+
+        <div id="instance-fields" class="hidden">
+          <h3 class="panel-subtitle">Transform</h3>
+          <div class="field-grid3">
+            <label>Pos X<input type="number" step="0.1" id="f-pos-x"></label>
+            <label>Pos Y<input type="number" step="0.1" id="f-pos-y"></label>
+            <label>Pos Z<input type="number" step="0.1" id="f-pos-z"></label>
+          </div>
+          <div class="field-grid3">
+            <label>Rot X<input type="number" step="1" id="f-rot-x"></label>
+            <label>Rot Y<input type="number" step="1" id="f-rot-y"></label>
+            <label>Rot Z<input type="number" step="1" id="f-rot-z"></label>
+          </div>
+          <div class="field-grid3">
+            <label>Scale X<input type="number" step="0.1" id="f-scale-x"></label>
+            <label>Scale Y<input type="number" step="0.1" id="f-scale-y"></label>
+            <label>Scale Z<input type="number" step="0.1" id="f-scale-z"></label>
+          </div>
+          <label class="field-full">Palette Row
+            <input type="number" step="1" min="0" id="f-palette">
+          </label>
+        </div>
+      </section>
+
+      <section class="panel" id="panel-vram">
+        <h2 class="panel-title">VRAM</h2>
+        <!-- Mirrors py_convert_textures.py's packer (see js/vram.js):
+             image region 384x400 units @ (640,0), CLUT strip 32 rows
+             @ y480. Counts every unique texture across loaded models. -->
+        <div class="vram-row">
+          <span class="vram-label">Textures</span>
+          <span class="vram-value" id="vram-image-label">-</span>
+        </div>
+        <div class="vram-bar"><div class="vram-bar-fill" id="vram-image-bar"></div></div>
+        <div class="vram-row">
+          <span class="vram-label">CLUT rows</span>
+          <span class="vram-value" id="vram-clut-label">-</span>
+        </div>
+        <div class="vram-bar"><div class="vram-bar-fill" id="vram-clut-bar"></div></div>
+        <div class="vram-row">
+          <span class="vram-label">Total</span>
+          <span class="vram-value" id="vram-total-label">-</span>
+        </div>
+        <p class="hint-text" id="vram-warnings"></p>
+
+        <!-- Hardcoded PS1 runtime limits, mirrored from main.c's #defines
+             (MAX_MODELS / MAX_SCENE_OBJECTS / MAX_TEXTURES / MAX_MODEL_TRIS).
+             If main.c's values change, update MAINC_LIMITS in app.js. -->
+        <h3 class="panel-subtitle">MAIN.C Limits</h3>
+        <div class="vram-row">
+          <span class="vram-label">Models</span>
+          <span class="vram-value" id="mainc-models-label">-</span>
+        </div>
+        <div class="vram-row">
+          <span class="vram-label">Scene objects</span>
+          <span class="vram-value" id="mainc-objects-label">-</span>
+        </div>
+        <div class="vram-row">
+          <span class="vram-label">Textures</span>
+          <span class="vram-value" id="mainc-textures-label">-</span>
+        </div>
+        <p class="hint-text" id="mainc-warnings"></p>
+      </section>
+
+      <section class="panel" id="panel-camera">
+        <h2 class="panel-title">Camera</h2>
+        <div class="field-grid3">
+          <label>Pos X<input type="number" step="0.1" id="cam-pos-x"></label>
+          <label>Pos Y<input type="number" step="0.1" id="cam-pos-y"></label>
+          <label>Pos Z<input type="number" step="0.1" id="cam-pos-z"></label>
+        </div>
+        <div class="field-grid3">
+          <label>Rot X<input type="number" step="1" id="cam-rot-x"></label>
+          <label>Rot Y<input type="number" step="1" id="cam-rot-y"></label>
+          <label>Rot Z<input type="number" step="1" id="cam-rot-z"></label>
+        </div>
+      </section>
+
+    </aside>
+
+    <main class="main">
+      <canvas id="viewport-canvas"></canvas>
+      <canvas id="viewport-gizmo-canvas"></canvas>
+      <div id="freecam-indicator" class="freecam-indicator hidden"></div>
+    </main>
+
+    <aside class="sidebar sidebar--right">
+
+      <section class="panel" id="panel-transform-mode">
+        <h2 class="panel-title">Transform Mode</h2>
+        <div class="mode-buttons">
+          <button id="mode-translate" class="btn is-active" data-mode="translate">Translate</button>
+          <button id="mode-rotate" class="btn" data-mode="rotate">Rotate</button>
+          <button id="mode-scale" class="btn" data-mode="scale">Scale</button>
+        </div>
+        <p class="hint-text">Shortcuts: W = Translate, E = Rotate, R = Scale</p>
+      </section>
+
+      <section class="panel" id="panel-viewport-camera">
+        <h2 class="panel-title">Viewport View</h2>
+        <!-- These control the EDITING orbit camera only (how you're looking
+             at the scene right now) - NOT the exported PS1 camera gizmo in
+             the "Camera" panel on the left, which is a placed scene object. -->
+        <div class="mode-buttons">
+          <button id="view-front" class="btn" title="Front (Numpad 1)">Front</button>
+          <button id="view-top" class="btn" title="Top (Numpad 7)">Top</button>
+          <button id="view-side" class="btn" title="Side (Numpad 3)">Side</button>
+        </div>
+        <button id="view-reset" class="btn btn-block">Reset View</button>
+        <button id="view-grid" class="btn btn-block">Toggle Grid (G)</button>
+        <p class="hint-text">Drag the axis gizmo (top-right of viewport) to snap the view, like Blender's.</p>
+        <p class="hint-text">Press F to toggle Freecam (WASD + mouse-look). While in Freecam, press Space to toggle Walk mode (gravity + ground snapping). Esc exits Freecam.</p>
+        <p class="hint-text">Shortcuts: . = frame selected, G = toggle grid, Ctrl+S = save project.</p>
+      </section>
+
+    </aside>
+  </div>
+
+  <footer class="transport">
+    <button id="btn-load-project" class="btn">Load Project</button>
+    <button id="btn-save-project" class="btn">Save Project</button>
+    <button id="btn-export-scene" class="btn btn-accent" disabled>Export scene.json</button>
+    <input type="file" id="file-load-project" accept=".SceneGen" class="hidden">
+  </footer>
+
+  <script src="../../js/navbar.js"></script>
+  <script type="module" src="js/app.js"></script>
+</body>
+</html>
