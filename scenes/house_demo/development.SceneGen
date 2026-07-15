@@ -1,5 +1,5 @@
 {
-  "version": 1,
+  "version": 3,
   "camera": {
     "pos": {
       "x": 3.633902135325165,
@@ -17,13 +17,23 @@
     "3shapes",
     "honda"
   ],
+  "folders": [
+    {
+      "id": 6,
+      "name": "Houses",
+      "parentId": null,
+      "collapsed": true
+    }
+  ],
   "instances": [
     {
       "id": 1,
       "model": "house",
-      "palette": 0,
+      "palette": 1,
+      "name": "red",
+      "parentId": 6,
       "pos": {
-        "x": 0,
+        "x": 0.001,
         "y": 0,
         "z": 0
       },
@@ -42,6 +52,8 @@
       "id": 2,
       "model": "3shapes",
       "palette": 0,
+      "name": null,
+      "parentId": null,
       "pos": {
         "x": 1.7554508702839562,
         "y": 3.3139033531043562,
@@ -62,10 +74,12 @@
       "id": 3,
       "model": "honda",
       "palette": 0,
+      "name": null,
+      "parentId": null,
       "pos": {
-        "x": 1.339,
-        "y": 0.4,
-        "z": 2.571
+        "x": 1.181,
+        "y": 0.341,
+        "z": 2.331
       },
       "rot": {
         "x": 0,
@@ -81,7 +95,9 @@
     {
       "id": 4,
       "model": "house",
-      "palette": 1,
+      "palette": 0,
+      "name": "blue",
+      "parentId": 6,
       "pos": {
         "x": -6.1918163228230725,
         "y": 0,
@@ -97,7 +113,135 @@
         "y": 1,
         "z": 1
       }
+    },
+    {
+      "id": 5,
+      "model": "house",
+      "palette": 2,
+      "name": "green",
+      "parentId": 6,
+      "pos": {
+        "x": 6.193,
+        "y": 0,
+        "z": 0
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      }
     }
   ],
-  "nextId": 5
+  "entities": [
+    {
+      "id": 7,
+      "kind": "billboard",
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": -1.901,
+        "y": 0,
+        "z": 7.925
+      },
+      "rot": {
+        "x": 0,
+        "y": -32.628,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "trackCamera": true,
+        "pivotAngle": 0,
+        "seeThroughWalls": false
+      }
+    },
+    {
+      "id": 8,
+      "kind": "trigger",
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": 0.095,
+        "y": 0.826,
+        "z": 5.871
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "event": "",
+        "once": true
+      }
+    },
+    {
+      "id": 9,
+      "kind": "spawn",
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": -2.549,
+        "y": -0.217,
+        "z": 5.043
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "spawnId": 0
+      }
+    },
+    {
+      "id": 12,
+      "kind": "summon",
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": -4.819,
+        "y": 0,
+        "z": 8.257
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "spawnId": 3,
+        "isFriendly": false,
+        "patrolRadius": 3,
+        "health": 100,
+        "canSeeThroughWalls": false
+      }
+    }
+  ],
+  "nextId": 14,
+  "nextSpawnId": 5
 }

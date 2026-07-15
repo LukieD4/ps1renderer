@@ -1,0 +1,399 @@
+================================================================================
+PS1 AUDIO ENCODER - FORMAT & ENCODING SEMANTICS
+================================================================================
+
+Reference document for a WAV -> PS1 audio conversion tool. Everything here is
+implementation-ready: byte layouts, bit fields, filter coefficient tables, and
+the encode decision algorithm. Sources are the psx-spx / nocash hardware docs,
+the PsyQ SDK file-format docs, and the psxavenc/libpsxav reference encoder
+(zlib license).
+
+The PS1 has ONE audio math core (4-bit ADPCM) wrapped in TWO hardware paths:
+
+  SPU-ADPCM  - 5 filters, loop support, lives in the 512 KB SPU sound RAM.
+               Used for VAG samples and VAB instrument banks.
+  XA-ADPCM   - 4 filters, NO loop support, decoded by the CD controller
+               straight off the disc. Used for long streamed audio.
+
+The tool is built as TWO pipelines that make opposite RAM-vs-CD trade-offs:
+
+  MUSIC BANKS     WAV -> SPU-ADPCM samples -> VAB (header + body) + SEQ score.
+                  A few pitched, looped samples cover whole instrument ranges,
+                  so files stay tiny. Lives in SPU RAM.
+  DIALOGUE BANKS  Long lines  -> XA-ADPCM CD sectors (0 RAM cost).
+                  Short barks -> one-shot SPU-ADPCM VAGs in RAM.
+
+All SPU/VAB/waveform data resident at once must fit ~512,000 bytes of SPU RAM.
+
+
+--------------------------------------------------------------------------
+ 1. SPU-ADPCM CORE BLOCK  (the foundation for VAG and VAB)
+--------------------------------------------------------------------------
+
+A sample is a chain of 16-byte blocks. Each block encodes EXACTLY 28 audio
+samples. 16 compressed bytes replace 28 x 2 = 56 PCM bytes -> 3.5 : 1.
+
+Offset   Size   Field              Notes
+------   ----   -----              -----
+0x00     1      shift/filter       low nibble  = shift (range), 0-12
+                                   high nibble = filter index, 0-4
+0x01     1      flag byte          loop / end / repeat bits (see below)
+0x02     14     28 packed samples  two 4-bit samples per byte,
+                                   EARLIER sample in the LOW nibble
+
+  HEADER BYTE (0x00)
+    bits 0-3  shift : how far the 4-bit residual is scaled. Valid 0..12.
+                      Shift 13-15 is a hardware special case -> silence;
+                      never emit it.
+    bits 4-7  filter: selects one prediction filter (table below).
+
+  FLAG BYTE (0x01) - bit meanings
+    bit 0 (0x01)  Loop End    : set ENDX, jump to the voice repeat address.
+    bit 1 (0x02)  Loop Repeat : only meaningful with bit0 set. 0 = force
+                                release + mute; 1 = sustain and repeat.
+    bit 2 (0x04)  Loop Start  : copy current address into repeat-address reg.
+    bits 3-7      unused, write 0.
+
+  Common composite values the tool writes:
+    0x00  normal block, continue
+    0x01  end + release/mute   (one-shot terminator that silences)
+    0x03  loop end, jump back and sustain   (classic end-of-loop marker)
+    0x04  loop start marker
+    0x07  loop start + end + repeat   (self-looping / silent dummy block)
+
+
+--------------------------------------------------------------------------
+ 2. THE FIVE PREDICTION FILTERS  (1/64 fixed point, exact)
+--------------------------------------------------------------------------
+
+Identical across psx-spx, FFmpeg (adpcm_psx) and psxavenc. SPU uses all 5;
+XA uses only filters 0-3.
+
+    Filter   k1 (positive)   k2 (negative)
+    ------   -------------   -------------
+      0            0               0
+      1           60               0
+      2          115             -52
+      3           98             -55
+      4          122             -60
+
+    pos_table = { 0, 60, 115, 98, 122 }
+    neg_table = { 0,  0, -52, -55, -60 }
+
+
+--------------------------------------------------------------------------
+ 3. DECODE MATH  (needed so the ENCODER can score its own error exactly)
+--------------------------------------------------------------------------
+
+State s1, s2 = previous two decoded samples. They are CONTINUOUS across
+block boundaries - never reset per block.
+
+  For each 4-bit nibble n in the block (28 total):
+      d      = sign_extend_4bit(n)              // range -8 .. +7
+      sample = d << (12 - shift)                // scale into 16-bit space
+      pred   = (k1 * s1 + k2 * s2 + 32) >> 6    // /64 fixed point, +32 rounds
+      out    = clamp16(sample + pred)           // clamp to -32768 .. +32767
+      s2 = s1;  s1 = out
+
+  The >>6 is the divide-by-64 that turns the integer table into fractions.
+  The +32 (= 1<<5) is the rounding term. Always clamp to signed 16-bit.
+
+
+--------------------------------------------------------------------------
+ 4. ENCODE ALGORITHM  (per block; this is the heart of the tool)
+--------------------------------------------------------------------------
+
+Brute-force search that SIMULATES the decoder using its own quantized output
+as feedback. This is exactly what psxavenc/libpsxav does and it is what keeps
+prediction from drifting.
+
+  Thread ONE running state (prev1, prev2) through the ENTIRE sample so
+  prediction is continuous, matching the decoder.
+
+  For each block of 28 input samples:
+
+    1. For each candidate filter (0-4 SPU, 0-3 XA):
+         compute residuals sample - ((k1*prev1 + k2*prev2 + 32) >> 6)
+         over all 28 samples; track min/max residual.
+
+    2. Derive the minimum shift so residuals fit the nibble range without
+       excessive clipping:
+         right_shift starts at 0; while
+           (s_max >> right_shift) >  (0x7FFF >> 12)  OR
+           (s_min >> right_shift) < (-0x8000 >> 12)
+         increment right_shift. Then min_shift = 12 - right_shift.
+
+    3. Test shifts in [min_shift-1 .. min_shift+1], clamped to 0..12.
+       (The true optimum can sit +/-1 off the computed minimum.)
+
+    4. For each (filter, shift) candidate, "attempt to encode":
+         - quantize each residual to a nibble with rounding
+           ( + (1 << (12-1)) ), clamp to the 4-bit range,
+         - RECONSTRUCT exactly as hardware would (<<12, >>shift, add
+           prediction, clamp to signed 16),
+         - accumulate squared error mse += error*error,
+         - update prev1/prev2 with the RECONSTRUCTED sample, not the
+           original (this makes the error model exact).
+
+    5. Pick the (filter, shift) with the lowest mse. Re-run it committing
+       the state. Write header byte = (shift & 0x0F) | (filter << 4).
+
+    6. Carry (prev1, prev2) into the next block.
+
+  NOTE: the reference encoder has a quantization-error/dither field but leaves
+  it disabled ("dithering is hard to predict"). Do not enable naive dither -
+  it interacts badly with the +/-1 shift heuristic.
+
+
+--------------------------------------------------------------------------
+ 5. VAG FILE  (single SPU-ADPCM sample, standalone)
+--------------------------------------------------------------------------
+
+48-byte header (BIG-ENDIAN fields) + raw SPU-ADPCM block data.
+
+Offset   Size   Field                Notes
+------   ----   -----                -----
+0x00     4      id                   "VAGp"  (56 41 47 70)
+0x04     4      version              big-endian, e.g. 0x00000020
+0x08     4      reserved             0
+0x0C     4      dataSize             waveform byte size, big-endian
+0x10     4      samplingFrequency    Hz, big-endian (e.g. 44100)
+0x14     12     reserved
+0x20     16     name                 ASCII
+0x30     *      waveform             SPU-ADPCM blocks (section 1)
+
+  CONVENTIONS THE TOOL MUST HONOR
+    - 16-byte silent lead-in: begin the waveform with one all-zero block
+      to init the decoder and kill the startup click.
+    - Sample rate <-> pitch register:
+          pitch = (samplingFrequency << 12) / 44100
+      44100 Hz -> 0x1000 (4096, native), 22050 -> 0x800, 11025 -> 0x400.
+    - Loop points land only on 16-byte block (28-sample) boundaries. SDK
+      requires loop params to be multiples of 28 samples.
+    - One-shot (non-looping) samples MUST end with a dummy terminator block:
+      flag 0x07, all data nibbles 0, so the voice repeats silence instead
+      of running off into random RAM.
+
+  Header fields are big-endian while the console and WAV are little-endian;
+  byte-swap on write. Mono is standard. "Stereo VAG" = two interleaved mono
+  streams, interleave a multiple of 16 bytes (non-standard).
+
+
+--------------------------------------------------------------------------
+ 6. VAB BANK  (music instrument bank: .VAB, or split .VH header + .VB body)
+--------------------------------------------------------------------------
+
+Hierarchy:  Program -> Tones -> Waveforms (VAGs).
+Internal tables are LITTLE-ENDIAN (unlike the VAG header).
+
+  VH HEADER (attributes)
+    - Magic "VABp", version, VAB id, total waveform size, reserved,
+      program count (<=128), tone count, VAG count, reserved.
+    - Program attribute table : 16 bytes x 128 programs = 2048 bytes.
+        A program ~= one MIDI instrument. Fields: tone count, volume,
+        priority, mode, pan, attributes.
+    - Tone attribute table    : 32 bytes x up to 16 tones per program
+        (<=2048 tones total). Per tone: priority, mode, volume, pan,
+        CENTER NOTE, fine pitch, LOW/HIGH note limits (key range),
+        vibrato w/period, portamento w/period, pitch-bend min/max,
+        ADSR (2 x 16-bit envelope words), parent program, REFERENCE VAG #.
+    - VAG pointer table       : 512 bytes (256 x 16-bit sizes) into the VB
+        body. Max 254 VAGs per VAB.
+
+  VB BODY (waveforms)
+    - Raw SPU-ADPCM blocks back to back, SAME nibble format as a VAG file
+      but WITHOUT the 48-byte VAG header.
+
+  HOW A FEW SAMPLES COVER A RANGE
+    - Each tone has a center note (pitch at which the sample plays native)
+      and a low/high key range. A note in range sets the voice pitch:
+          pitch = base * 2^((note - center_note) / 12)
+      Loop points let sustained instruments ring from a short loop.
+    - GOTCHA: center-note assumes a 44100 Hz sample. If the VAG is 22050 Hz,
+      add 12 to the center note to compensate for the octave shift.
+
+  Total ADPCM data in a VAB is capped at 0x7E000 bytes (516,096) to fit RAM.
+
+
+--------------------------------------------------------------------------
+ 7. SEQ / SEP  (sequenced music score)
+--------------------------------------------------------------------------
+
+Standard MIDI File format 0 with small differences. A SEP is a multi-track
+container of SEQ-like sequences. The score is just note/timing/controller
+data; the actual sounds come from a referenced VAB. This is why SEQ+VAB
+music is only a few KB.
+
+  - Header magic "pQES", version, resolution (PPQN), tempo, time signature,
+    then MIDI-style delta-time + event stream.
+  - Tempo event FF 51 stores 3 tempo bytes WITHOUT SMF's length byte;
+    running status is used aggressively.
+  - Loop points via NRPN: NRPN MSB value 20 = Loop Start, 30 = Loop End.
+    One channel only, no nesting.
+  - Bank select (CC0) picks a VAB id; program change picks the program
+    (instrument) within it. CC32 is ignored by libsnd.
+
+
+--------------------------------------------------------------------------
+ 8. XA-ADPCM  (CD-streamed audio; dialogue and long music)
+--------------------------------------------------------------------------
+
+Decompressed by the CD-ROM controller and fed straight to the SPU mixer.
+Uses NO SPU RAM and NO SPU voice. Same 4-bit ADPCM math, different container,
+4 filters, NO looping.
+
+  SECTOR  (Green Book Mode 2 / Form 2)
+    2352 bytes = 12 sync + 4 header + 8 subheader + 2324 user + 4 EDC.
+    2324 usable -> 18 "sound groups" x 128 bytes (18*128 = 2304; last 20
+    bytes are padding).
+
+  SOUND GROUP (128 bytes) = 16 param bytes + 112 sample bytes.
+    Double-sample-set layout: the 16 param bytes hold each unit's
+    shift/filter header duplicated (the copy lets a bad header be repaired);
+    the 112 data bytes interleave two nibble sets per byte. XA packs 2 x 28
+    nibbles per unit -> one sector yields 4032 mono samples (2016/ch stereo).
+
+  QUALITY MODES (coding_info byte)
+    Sample rate : 37800 Hz  or  18900 Hz
+    Bits        : 4-bit      or  8-bit
+    Channels    : mono       or  stereo
+
+  INTERLEAVE (fraction of sectors belonging to one XA stream)
+    37800 stereo -> 1/8      18900 stereo -> 1/16
+    37800 mono   -> 1/16     18900 mono   -> 1/32
+
+  XA output has placeholder EDC/ECC and MUST be interleaved and finalized
+  by a disc-authoring tool (e.g. mkpsxiso). A raw XA blob cannot just be
+  dropped onto a disc image. XA cannot loop and offers only two sample
+  rates - unsuitable for anything that must loop seamlessly or pitch-shift.
+
+
+--------------------------------------------------------------------------
+ 9. MUSIC BANKS vs DIALOGUE BANKS  (the practical decision)
+--------------------------------------------------------------------------
+
+                 MUSIC BANKS              DIALOGUE BANKS
+                 ------------------       ----------------------------------
+  Format         VAB (VH+VB) + SEQ/SEP    long: XA stream / short: one-shot VAG
+  Lives in       SPU RAM (512 KB)         XA: off-disc (0 RAM) / VAG: SPU RAM
+  Looping        yes (pitched + looped)   XA: no / VAG: one-shot
+  Cost           RAM + a voice per note   XA: CD bandwidth / VAG: RAM + voice
+  Control        full realtime            XA: volume+pan only / VAG: full
+  File size      tiny (shared samples)    large (full-length encoded audio)
+
+  SPU RAM MAP (512 KB total)
+    00000-003FF  CD audio L (1 KB)         capture buffers occupy the first
+    00400-007FF  CD audio R (1 KB)         4 KB; reverb work area sits at the
+    00800-00BFF  voice 1 capture (1 KB)    top; ADPCM samples fill the middle.
+    00C00-00FFF  voice 3 capture (1 KB)    Usable waveform budget ~512,000
+    01000-.....  ADPCM samples             bytes (0x7E000 per VAB).
+    .....-7FFFF  reverb work area
+
+  DECISION THRESHOLDS
+    - Sound > ~5-10 s, or background music/voice        -> stream as XA.
+    - Must loop, pitch-shift, or fire instantly/interactive -> keep as
+                                                              SPU-ADPCM in RAM.
+    - RAM budget exceeded  -> first drop sample rate (44100->22050), then
+                              move longest one-shots to XA, then cut content.
+    - CD bandwidth saturated (too many XA streams, or XA vs streamed video)
+                           -> move some audio back into RAM as VAG.
+
+
+--------------------------------------------------------------------------
+ 10. QUALITY vs SIZE LEVERS  (what the tool exposes)
+--------------------------------------------------------------------------
+
+  1. SAMPLE-RATE DOWNSAMPLING - the primary lever. RAM and file size scale
+     linearly with rate. 44100 -> 22050 halves the data. Expose target rate
+     directly (44100 / 32000 / 22050 / 16000 / 11025). XA is limited to
+     37800 or 18900.
+  2. HIGH-QUALITY RESAMPLING - downsample with a windowed-sinc (Kaiser /
+     Blackman) low-pass at the new Nyquist BEFORE ADPCM. ADPCM prediction
+     badly amplifies aliased high-frequency energy; this is the single most
+     important pre-processing step.
+  3. ANTI-ALIAS / PRE-EMPHASIS LOW-PASS - a gentle low-pass just below
+     Nyquist cuts the content ADPCM quantizes worst (granular / slope-
+     overload noise). Lossy but usually improves perceived quality at low
+     rates.
+  4. OPTIMAL FILTER/SHIFT SEARCH (section 4) - always brute-force all
+     filters x shift candidates with decoder-accurate feedback. A fixed-
+     filter encoder produces the "double transient" drift artifacts.
+  5. OPTIONAL LOOKAHEAD / NOISE-SHAPING (advanced, slow) - multi-sample
+     lookahead and dynamic noise shaping (a la adpcm-xq) can cut noise
+     several dB. Worth it for pre-baked assets.
+  6. LOOP HANDLING - snap loop points to 28-sample boundaries; make the
+     loop region length a multiple of 28 for seamless music loops.
+
+  PARAMETERS TO EXPOSE
+    - Output: spu / vag / vagi / vab / xa / xacd.
+    - Target sample rate; channels (mono/stereo, interleave size).
+    - Resampler quality (linear vs windowed-sinc; taps/window).
+    - Pre-emphasis / low-pass cutoff.
+    - Loop point (sample index) + loop on/off; auto-read WAV smpl/cue chunks.
+    - XA: bit depth (4/8), rate (37800/18900), mono/stereo.
+    - Encoder effort: fast (shift +/-1) vs exhaustive lookahead + shaping.
+
+
+--------------------------------------------------------------------------
+ 11. LIMITS & CAVEATS
+--------------------------------------------------------------------------
+
+  - ENDIANNESS: VAG header fields are BIG-endian; console, WAV and VAB
+    internal tables are LITTLE-endian. Byte-swap the VAG header carefully.
+  - Loop granularity is coarse: 28 samples (one block). Sample-accurate
+    loops are impossible; design loop regions on block boundaries.
+  - Shift 13-15 is silence; never emit it.
+  - XA needs disc-authoring finalization (EDC/ECC + interleave); cannot be
+    dropped onto an image as-is. XA has no looping and only two rates.
+  - A one-shot SPU sample without its dummy terminator block will run off
+    into random SPU RAM and screech - always append flag-0x07 terminator.
+  - Total resident SPU/VAB waveform data must stay <= ~512,000 bytes
+    (0x7E000 per VAB).
+  - VAB versions vary between games (v5, v7, 0x20 seen); a robust bank
+    reader must tolerate version/offset differences.
+  - Reference-encoder dither is intentionally disabled; do not enable naive
+    dither.
+
+
+--------------------------------------------------------------------------
+ 12. REFERENCE IMPLEMENTATIONS  (basis / verification oracles)
+--------------------------------------------------------------------------
+
+  psxavenc / libpsxav  (zlib) - PRIMARY BASIS. adpcm.c has the exact SPU and
+                                XA block encoders (find_min_shift,
+                                attempt_to_encode, encode, psx_audio_spu_encode).
+  FFmpeg adpcm.c       - adpcm_psx (SPU) + adpcm_xa decode/encode; the
+                         authoritative coefficient table. Use to round-trip
+                         verify.
+  vgmstream            - reads virtually every PS1/PS2 container; decode oracle.
+  jPSXdec              - reference for XA / STR Mode 2 Form 2 sector parsing.
+  wav2vag (psxsdk)     - simple, readable WAV -> VAG encoder.
+  Docs                 - psx-spx (problemkaputt.de / consoledev mirror): SPU,
+                         "CDROM XA Audio ADPCM Compression", VAB/VH/VB, SEQ/SEP;
+                         PsyQ SDK "File Formats" + Sound Artist Tool.
+
+  DO NOT use MFAudio as a correctness oracle - it emits slightly malformed
+  VAG blocks (clicks / bit-depth artifacts).
+
+
+--------------------------------------------------------------------------
+ 13. QUICK EXAMPLE  (one-shot dialogue bark, WAV -> VAG)
+--------------------------------------------------------------------------
+
+  Input : bark.wav, 44100 Hz mono 16-bit, 12,000 samples.
+  Target: 22050 Hz one-shot VAG for SPU RAM.
+
+    1. Low-pass at ~10 kHz, resample 44100 -> 22050 (windowed-sinc)
+       -> ~6000 samples.
+    2. Pad to a multiple of 28 -> 6020 samples = 215 blocks.
+    3. Prepend one all-zero lead-in block (silence, flag 0x00).
+    4. Encode each block (section 4): pick best filter+shift, carry state.
+    5. Append the dummy terminator block: flag 0x07, all-zero nibbles.
+    6. Write 48-byte VAG header (BIG-endian): id "VAGp", version 0x20,
+       dataSize = block bytes, samplingFrequency = 22050, name "BARK".
+    7. Playback pitch register = (22050 << 12) / 44100 = 0x800.
+
+    Round-trip through FFmpeg adpcm_psx / vgmstream to confirm bit-exact
+    decode before shipping.
+
+================================================================================

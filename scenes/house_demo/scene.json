@@ -14,9 +14,9 @@
   "objects": [
     {
       "model": "house",
-      "palette": 0,
+      "palette": 1,
       "pos": [
-        0,
+        1,
         0,
         0
       ],
@@ -71,9 +71,28 @@
     },
     {
       "model": "house",
-      "palette": 1,
+      "palette": 0,
       "pos": [
         -6340,
+        0,
+        0
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "model": "house",
+      "palette": 2,
+      "pos": [
+        6342,
         0,
         0
       ],

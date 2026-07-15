@@ -25,7 +25,7 @@
 import { pickAssetsFolder, scanModels } from './fs_assets.js';
 import { hasNativeDirectoryPicker, initDropZone } from './dnd_assets.js';
 import { resolveMaterials } from './mtl_resolver.js';
-import { SceneState } from './scene_state.js';
+import { SceneState, ENTITY_KINDS } from './scene_state.js';
 import { buildSceneJson, downloadSceneJson } from './scene_export.js';
 import { buildProjectJson, downloadProjectFile, loadProjectFile } from './scene_project.js';
 import { pushHistory, undo, redo, canUndo, canRedo, clearHistory } from './history.js';
@@ -48,9 +48,17 @@ const btnOpenAssets = document.getElementById('btn-open-assets');
 const dropZoneAssets = document.getElementById('dropzone-assets');
 const modelListEl = document.getElementById('model-list');
 
-const btnAddInstance = document.getElementById('btn-add-instance');
+const btnNewFolder = document.getElementById('btn-new-folder');
+const btnInsertEntity = document.getElementById('btn-insert-entity');
+const insertEntityMenuEl = document.getElementById('insert-entity-menu');
 const instanceListEl = document.getElementById('instance-list');
 const instanceFieldsEl = document.getElementById('instance-fields');
+const propsNoSelectionEl = document.getElementById('props-no-selection');
+const propsTargetLabelEl = document.getElementById('props-target-label');
+const appearanceSectionEl = document.getElementById('appearance-section');
+const entityPropsSectionEl = document.getElementById('entity-props-section');
+const entityPropsTitleEl = document.getElementById('entity-props-title');
+const entityPropsBodyEl = document.getElementById('entity-props-body');
 
 const fPosX = document.getElementById('f-pos-x');
 const fPosY = document.getElementById('f-pos-y');
@@ -83,7 +91,7 @@ const fileLoadProject = document.getElementById('file-load-project');
 
 // ---- app state ----
 const state = new SceneState();
-let activeModelName = null; // the model that "Add Instance" will place
+let activeModelName = null; // the Assets-list model currently highlighted (loaded/previewed)
 let currentTransformMode = 'translate';
 
 // Unsaved-changes tracking (QOL): flipped true by markDirty() alongside
@@ -140,7 +148,10 @@ function round3(value) {
  * needed for those callers.
  */
 function resyncViewportFromState() {
-  const desiredIds = new Set(state.instances.map((inst) => inst.id));
+  const desiredIds = new Set([
+    ...state.instances.map((inst) => inst.id),
+    ...state.entities.map((ent) => ent.id),
+  ]);
 
   for (const trackedId of viewer.getTrackedInstanceIds()) {
     if (!desiredIds.has(trackedId)) {
@@ -174,9 +185,24 @@ function resyncViewportFromState() {
     viewer.updateInstancePaletteRow(inst.id, inst.palette);
   }
 
+  // Same add-if-missing/update-if-present diff for editor entities -
+  // they render unconditionally (no model dependency to wait on).
+  const trackedAfterInstances = new Set(viewer.getTrackedInstanceIds());
+  for (const ent of state.entities) {
+    if (trackedAfterInstances.has(ent.id)) {
+      viewer.setInstanceTransform(ent.id, { pos: ent.pos, rot: ent.rot, scale: ent.scale });
+      viewer.updateEntityProps(ent.id, ent.props);
+    } else {
+      viewer.addEntityHelper(ent.id, ent.kind, ent, ent.props);
+    }
+  }
+
   viewer.setCameraTransform(state.camera);
 
-  if (state.selectedInstanceId !== null && state.getInstance(state.selectedInstanceId)) {
+  if (
+    state.selectedInstanceId !== null &&
+    (state.getInstance(state.selectedInstanceId) || state.getEntity(state.selectedInstanceId))
+  ) {
     viewer.selectInstance(state.selectedInstanceId);
   } else {
     viewer.selectInstance(null);
@@ -343,6 +369,12 @@ async function selectModel(modelEntry) {
   updateUI();
 }
 
+// Name of the asset being dragged from the Assets list toward the
+// viewport, or null. Deliberately separate from the instance tree's
+// dragPayload - the two drag flows (organize existing rows vs. spawn a
+// new instance) must never confuse each other's drop targets.
+let assetDragName = null;
+
 function renderModelList(discoveredModels) {
   modelListEl.innerHTML = '';
   for (const entry of discoveredModels) {
@@ -361,26 +393,258 @@ function renderModelList(discoveredModels) {
     }
     li.appendChild(nameSpan);
 
-    li.addEventListener('click', () => selectModel(entry));
+    li.addEventListener('click', () => {
+      // Already the active, loaded model: skip the re-render. Same
+      // rebuild-vs-dblclick reasoning as the instance tree rows - the
+      // second click of a double-click must land on THIS li, not a
+      // freshly rebuilt copy of it.
+      if (entry.name === activeModelName && state.models.has(entry.name)) return;
+      selectModel(entry);
+    });
+
+    // Double-click: spawn an instance at the center of the current view
+    // (at a safe distance - see viewer.placeInstanceAtViewCenter).
+    li.addEventListener('dblclick', () => {
+      spawnInstanceFromAsset(entry.name, (id) => viewer.placeInstanceAtViewCenter(id));
+    });
+
+    // Drag toward the viewport: the drop handler on the canvas places
+    // the new instance at the cursor's surface point.
+    li.draggable = true;
+    li.addEventListener('dragstart', (evt) => {
+      assetDragName = entry.name;
+      evt.dataTransfer.effectAllowed = 'copy';
+      evt.dataTransfer.setData('text/plain', `asset:${entry.name}`); // Firefox needs non-empty data
+    });
+    li.addEventListener('dragend', () => {
+      assetDragName = null;
+      viewportMainEl.classList.remove('is-drop-target');
+    });
+
     modelListEl.appendChild(li);
   }
 }
+
+/**
+ * Shared spawn path for both asset-placement gestures (drag-drop onto
+ * the viewport, double-click in the Assets list) - replaces the old
+ * "Add Instance" button. Loads the model on demand if it isn't yet
+ * (so either gesture works straight off a fresh folder scan), creates
+ * the instance inside the selected folder (if any), lets the supplied
+ * `place` callback position it in the viewport, then copies the placed
+ * transform back into state and selects the new instance.
+ */
+async function spawnInstanceFromAsset(modelName, place) {
+  const discovered = window.__sceneGenDiscoveredModels || [];
+  const entry = discovered.find((d) => d.name === modelName);
+  if (!entry) return;
+
+  if (!(await loadModelData(entry))) return;
+  if (!state.models.has(modelName)) return;
+
+  pushHistory(state);
+  markDirty();
+
+  const parentFolder = state.selectedFolderId !== null ? state.getFolder(state.selectedFolderId) : null;
+  if (parentFolder) parentFolder.collapsed = false;
+  const instance = state.addInstance(modelName, {}, parentFolder ? parentFolder.id : null);
+
+  const modelData = state.models.get(modelName);
+  viewer.addInstance(instance.id, modelName, instance, modelData.materialsMap);
+
+  const placedTransform = place(instance.id);
+  if (placedTransform) {
+    instance.pos = round3Axes(placedTransform.pos);
+  }
+
+  state.selectedInstanceId = instance.id;
+  state.selectedFolderId = null;
+  viewer.selectInstance(instance.id);
+  updateUI();
+}
+
+// Viewport drop target: dragging an asset over the 3D view highlights it,
+// releasing spawns the instance at the cursor's surface point (same
+// placement rules as the translate gizmo's center-square surface drag).
+const viewportMainEl = document.querySelector('.main');
+
+viewportMainEl.addEventListener('dragover', (evt) => {
+  if (!assetDragName) return; // instance-tree drags etc. are not viewport drops
+  evt.preventDefault();
+  evt.dataTransfer.dropEffect = 'copy';
+  viewportMainEl.classList.add('is-drop-target');
+});
+viewportMainEl.addEventListener('dragleave', () => {
+  viewportMainEl.classList.remove('is-drop-target');
+});
+viewportMainEl.addEventListener('drop', (evt) => {
+  if (!assetDragName) return;
+  evt.preventDefault();
+  viewportMainEl.classList.remove('is-drop-target');
+
+  const modelName = assetDragName;
+  assetDragName = null;
+  // Client coords captured NOW - the spawn path awaits model loading, and
+  // the event object's fields aren't reliable after an await.
+  const { clientX, clientY } = evt;
+  spawnInstanceFromAsset(modelName, (id) => {
+    const t = viewer.placeInstanceAtScreenPoint(id, clientX, clientY);
+    // Cursor aimed at sky/void (possible when dropping high above the
+    // horizon): fall back to the view-center placement rather than
+    // leaving the new instance at the world origin.
+    return t || viewer.placeInstanceAtViewCenter(id);
+  });
+});
 
 // ==========================================================================
 // Instances panel
 // ==========================================================================
 
-btnAddInstance.addEventListener('click', () => {
-  if (!activeModelName) return;
+/** Display label for an instance row/properties header: the custom
+ * rename if one was set, otherwise the classic "model #id" default. */
+function instanceDisplayName(inst) {
+  return inst.name || `${inst.model} #${inst.id}`;
+}
+
+/** Same for editor entities: rename override, else "Kind #id". */
+function entityDisplayName(ent) {
+  const def = ENTITY_KINDS[ent.kind];
+  return ent.name || `${def ? def.label : ent.kind} #${ent.id}`;
+}
+
+btnNewFolder.addEventListener('click', () => {
   pushHistory(state);
   markDirty();
-  const instance = state.addInstance(activeModelName);
-  const modelData = state.models.get(activeModelName);
-  viewer.addInstance(instance.id, activeModelName, instance, modelData.materialsMap);
-  state.selectedInstanceId = instance.id;
-  viewer.selectInstance(instance.id);
+  // Nest inside the selected folder if there is one, else at root.
+  const parentFolder = state.selectedFolderId !== null ? state.getFolder(state.selectedFolderId) : null;
+  if (parentFolder) parentFolder.collapsed = false;
+  const folder = state.addFolder(parentFolder ? parentFolder.id : null);
+  state.selectedFolderId = folder.id;
+  state.selectedInstanceId = null;
+  viewer.selectInstance(null);
   updateUI();
 });
+
+// ==========================================================================
+// Insert-object menu (editor entities: Trigger / Spawn / Summon / ...)
+// ==========================================================================
+
+// Build the menu once from the ENTITY_KINDS registry - one row per kind
+// with its tree-dot color and hint line, so adding a future kind to the
+// registry automatically surfaces it here.
+for (const [kind, def] of Object.entries(ENTITY_KINDS)) {
+  const item = document.createElement('button');
+  item.className = 'insert-menu-item';
+
+  const dot = document.createElement('span');
+  dot.className = 'entity-dot';
+  dot.style.color = def.color;
+  dot.textContent = '●';
+  item.appendChild(dot);
+
+  const textWrap = document.createElement('span');
+  textWrap.className = 'insert-menu-text';
+  const title = document.createElement('span');
+  title.className = 'insert-menu-label';
+  title.textContent = def.label;
+  const hint = document.createElement('span');
+  hint.className = 'insert-menu-hint';
+  hint.textContent = def.hint;
+  textWrap.appendChild(title);
+  textWrap.appendChild(hint);
+  item.appendChild(textWrap);
+
+  item.addEventListener('click', () => {
+    closeInsertMenu();
+    insertEntity(kind);
+  });
+  insertEntityMenuEl.appendChild(item);
+}
+
+function closeInsertMenu() {
+  insertEntityMenuEl.classList.add('hidden');
+  btnInsertEntity.classList.remove('is-active');
+}
+
+btnInsertEntity.addEventListener('click', (evt) => {
+  evt.stopPropagation(); // keep the document-level close handler from instantly re-hiding it
+  const opening = insertEntityMenuEl.classList.contains('hidden');
+  insertEntityMenuEl.classList.toggle('hidden', !opening);
+  btnInsertEntity.classList.toggle('is-active', opening);
+});
+
+document.addEventListener('click', (evt) => {
+  if (insertEntityMenuEl.classList.contains('hidden')) return;
+  if (insertEntityMenuEl.contains(evt.target)) return;
+  closeInsertMenu();
+});
+
+/**
+ * Create an editor entity of `kind`: same flow as spawning a model
+ * instance - into the selected folder, placed at the center of the
+ * current view at a safe distance (the entity helper participates in
+ * the shared placement code), selected, undoable.
+ */
+function insertEntity(kind) {
+  pushHistory(state);
+  markDirty();
+
+  const parentFolder = state.selectedFolderId !== null ? state.getFolder(state.selectedFolderId) : null;
+  if (parentFolder) parentFolder.collapsed = false;
+  const entity = state.addEntity(kind, parentFolder ? parentFolder.id : null);
+  if (!entity) return;
+
+  viewer.addEntityHelper(entity.id, kind, entity, entity.props);
+  const placedTransform = viewer.placeInstanceAtViewCenter(entity.id);
+  if (placedTransform) {
+    entity.pos = round3Axes(placedTransform.pos);
+  }
+
+  state.selectedInstanceId = entity.id;
+  state.selectedFolderId = null;
+  viewer.selectInstance(entity.id);
+  updateUI();
+}
+
+/**
+ * Delete an editor entity (Del key while one is selected) - confirmed
+ * like instance deletion, and undoable.
+ */
+async function deleteEntity(id) {
+  const entity = state.getEntity(id);
+  if (!entity) return;
+
+  const ok = await showConfirm({
+    title: 'Delete object',
+    message: `Delete "${entityDisplayName(entity)}"?`,
+    confirmText: 'Delete',
+    cancelText: 'Cancel',
+  });
+  if (!ok) return;
+  if (!state.getEntity(id)) return; // vanished while dialog was open
+
+  pushHistory(state);
+  markDirty();
+  state.removeEntity(id);
+  viewer.removeInstance(id);
+  updateUI();
+}
+
+/** Ctrl+D for entities: clone (fresh unique spawn ID where applicable),
+ * select the copy. */
+function duplicateEntity(id) {
+  const original = state.getEntity(id);
+  if (!original) return;
+
+  pushHistory(state);
+  markDirty();
+  const clone = state.duplicateEntity(id);
+  viewer.addEntityHelper(clone.id, clone.kind, clone, clone.props);
+  state.selectedInstanceId = clone.id;
+  state.selectedFolderId = null;
+  viewer.selectInstance(clone.id);
+  updateUI();
+}
 
 /**
  * Duplicate a single instance by id: pushes undo history, clones it in
@@ -400,6 +664,7 @@ function duplicateInstance(id) {
   viewer.addInstance(clone.id, clone.model, clone, modelData.materialsMap);
   viewer.updateInstancePaletteRow(clone.id, clone.palette);
   state.selectedInstanceId = clone.id;
+  state.selectedFolderId = null;
   viewer.selectInstance(clone.id);
   updateUI();
 }
@@ -422,7 +687,7 @@ async function deleteInstance(id) {
 
   const ok = await showConfirm({
     title: 'Delete instance',
-    message: `Delete instance #${instance.id} (${instance.model})?`,
+    message: `Delete "${instanceDisplayName(instance)}"?`,
     confirmText: 'Delete',
     cancelText: 'Cancel',
   });
@@ -436,46 +701,386 @@ async function deleteInstance(id) {
   updateUI();
 }
 
+/**
+ * Delete a folder and its ENTIRE contents (subfolders + instances),
+ * after a confirm dialog that spells out how many instances that is.
+ * Triggered by the Delete key while a folder row is selected - like
+ * instances, there is no per-row delete button anymore.
+ */
+async function deleteFolder(id) {
+  const folder = state.getFolder(id);
+  if (!folder) return;
+
+  const count = state.getFolderContentsCount(id);
+  const ok = await showConfirm({
+    title: 'Delete folder',
+    message: count > 0
+      ? `Delete folder "${folder.name}" and the ${count} object${count === 1 ? '' : 's'} inside it?`
+      : `Delete folder "${folder.name}"?`,
+    confirmText: 'Delete',
+    cancelText: 'Cancel',
+  });
+  if (!ok) return;
+  if (!state.getFolder(id)) return; // vanished while dialog was open
+
+  pushHistory(state);
+  markDirty();
+  const removedInstanceIds = state.removeFolder(id);
+  for (const removedId of removedInstanceIds) {
+    viewer.removeInstance(removedId);
+  }
+  updateUI();
+}
+
+// --------------------------------------------------------------------
+// Instance tree rendering (folders + instances)
+// --------------------------------------------------------------------
+//
+// The old flat list (with per-row Dup/Del buttons) is now a tree:
+// folder rows carry a collapse chevron and hide their whole subtree
+// when collapsed; instance rows indent under their folder. Dup/Del
+// buttons are gone - Ctrl+D and Delete operate on the selected row
+// instead, which keeps rows to just a name and reads far cleaner.
+
+// { kind: 'instance' | 'folder', id } while a row drag is in flight;
+// null otherwise. Module-scoped (rather than dataTransfer-only) because
+// dragover handlers need to inspect the payload to decide drop validity,
+// and dataTransfer.getData() is unreadable during dragover by spec.
+let dragPayload = null;
+
+function clearDropHighlights() {
+  for (const el of instanceListEl.querySelectorAll('.drop-target')) {
+    el.classList.remove('drop-target');
+  }
+}
+
+function currentParentOf(payload) {
+  if (payload.kind === 'instance') {
+    // 'instance' payloads cover model instances AND editor entities -
+    // both live in the same tree with the same parenting rules.
+    const node = state.getInstance(payload.id) || state.getEntity(payload.id);
+    return node ? node.parentId : null;
+  }
+  const folder = state.getFolder(payload.id);
+  return folder ? folder.parentId : null;
+}
+
+/** Would dropping the in-flight payload into `parentId` (null = root) be
+ * a legal, non-no-op move? Blocks folder-into-own-subtree cycles. */
+function canDropInto(parentId) {
+  if (!dragPayload) return false;
+  if (dragPayload.kind === 'folder' && parentId !== null) {
+    if (state.isFolderInside(parentId, dragPayload.id)) return false; // includes parentId === dragged folder itself
+  }
+  return currentParentOf(dragPayload) !== parentId;
+}
+
+function dropInto(parentId) {
+  if (!canDropInto(parentId)) {
+    dragPayload = null;
+    clearDropHighlights();
+    return;
+  }
+  const payload = dragPayload;
+  dragPayload = null;
+
+  pushHistory(state);
+  markDirty();
+  if (payload.kind === 'instance') {
+    const node = state.getInstance(payload.id) || state.getEntity(payload.id);
+    if (node) node.parentId = parentId;
+  } else {
+    state.getFolder(payload.id).parentId = parentId;
+  }
+  // Expand the receiving folder so the moved row is immediately visible -
+  // dropping into a collapsed folder that swallows the row invisibly
+  // reads as the drop having failed.
+  if (parentId !== null) state.getFolder(parentId).collapsed = false;
+  updateUI();
+}
+
+function makeRowDraggable(li, kind, id) {
+  li.draggable = true;
+  li.addEventListener('dragstart', (evt) => {
+    dragPayload = { kind, id };
+    evt.dataTransfer.effectAllowed = 'move';
+    // Firefox refuses to start a drag with an empty dataTransfer; the
+    // string itself is never read back (see dragPayload's comment).
+    evt.dataTransfer.setData('text/plain', `${kind}:${id}`);
+  });
+  li.addEventListener('dragend', () => {
+    dragPayload = null;
+    clearDropHighlights();
+  });
+}
+
+/**
+ * Swap a row's name span for an inline text input (double-click rename).
+ * `commit` receives the trimmed value on Enter/blur and applies it (or
+ * declines a no-op); Escape cancels. Either way the tree re-renders,
+ * which also restores the span - no manual DOM cleanup needed.
+ */
+function startRename(nameSpan, initialValue, commit) {
+  const input = document.createElement('input');
+  input.type = 'text';
+  input.className = 'rename-input';
+  input.value = initialValue;
+  // Suspend row dragging for the duration of the rename: click-dragging
+  // to select text inside the input would otherwise start an HTML5 drag
+  // of the whole row (the li is draggable). The rebuild after finish()
+  // restores a fresh draggable row.
+  const row = nameSpan.closest('li');
+  if (row) row.draggable = false;
+  nameSpan.replaceWith(input);
+  input.focus();
+  input.select();
+
+  let done = false; // guards the blur that fires when updateUI() removes the input mid-finish
+  const finish = (apply) => {
+    if (done) return;
+    done = true;
+    if (apply) commit(input.value.trim());
+    updateUI();
+  };
+
+  input.addEventListener('keydown', (evt) => {
+    // The window-level shortcut handler ignores INPUT focus already, but
+    // stopping propagation here also keeps Delete/Backspace/Ctrl+D from
+    // even reaching it while a rename is being typed.
+    evt.stopPropagation();
+    if (evt.key === 'Enter') finish(true);
+    else if (evt.key === 'Escape') finish(false);
+  });
+  input.addEventListener('blur', () => finish(true));
+  input.addEventListener('click', (evt) => evt.stopPropagation());
+  input.addEventListener('dblclick', (evt) => evt.stopPropagation());
+}
+
+const TREE_INDENT_PX = 16; // per-depth left padding
+const TREE_ROW_BASE_PX = 8; // matches .item-list li's own horizontal padding
+
+function buildFolderRow(folder, depth) {
+  const li = document.createElement('li');
+  li.className = 'tree-folder' + (folder.id === state.selectedFolderId ? ' is-selected' : '');
+  li.style.paddingLeft = `${TREE_ROW_BASE_PX + depth * TREE_INDENT_PX}px`;
+
+  const chevron = document.createElement('button');
+  chevron.className = 'tree-chevron';
+  chevron.textContent = folder.collapsed ? '▸' : '▾'; // ▸ / ▾
+  chevron.title = folder.collapsed ? 'Expand' : 'Collapse';
+  chevron.addEventListener('click', (evt) => {
+    evt.stopPropagation(); // collapse toggle must not also select the folder
+    folder.collapsed = !folder.collapsed; // view preference - deliberately NOT pushed to undo history
+    updateUI();
+  });
+  li.appendChild(chevron);
+
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'item-name tree-folder-name';
+  nameSpan.textContent = folder.name;
+  li.appendChild(nameSpan);
+
+  // Recursive contents count (instances + entities) so a collapsed
+  // folder still communicates how much it's hiding.
+  const count = state.getFolderContentsCount(folder.id);
+  const countSpan = document.createElement('span');
+  countSpan.className = 'tree-count';
+  countSpan.textContent = String(count);
+  li.appendChild(countSpan);
+
+  li.addEventListener('click', () => {
+    // Skip the rebuild when already selected - beyond being wasted work,
+    // a rebuild between the two clicks of a double-click would replace
+    // this li and could swallow the dblclick rename trigger.
+    if (state.selectedFolderId === folder.id) return;
+    state.selectedFolderId = folder.id;
+    state.selectedInstanceId = null;
+    viewer.selectInstance(null);
+    updateUI();
+  });
+
+  li.addEventListener('dblclick', (evt) => {
+    if (evt.target === chevron) return;
+    startRename(nameSpan, folder.name, (value) => {
+      if (value.length === 0 || value === folder.name) return;
+      pushHistory(state);
+      markDirty();
+      folder.name = value;
+    });
+  });
+
+  makeRowDraggable(li, 'folder', folder.id);
+
+  // Folder rows are drop targets: dropping a row here re-parents it into
+  // this folder.
+  li.addEventListener('dragover', (evt) => {
+    if (!canDropInto(folder.id)) return;
+    evt.preventDefault();
+    evt.stopPropagation();
+    evt.dataTransfer.dropEffect = 'move';
+    li.classList.add('drop-target');
+  });
+  li.addEventListener('dragleave', () => li.classList.remove('drop-target'));
+  li.addEventListener('drop', (evt) => {
+    evt.preventDefault();
+    evt.stopPropagation(); // don't let the page-level root-drop handler also fire
+    li.classList.remove('drop-target');
+    dropInto(folder.id);
+  });
+
+  return li;
+}
+
+function buildInstanceRow(inst, depth) {
+  const li = document.createElement('li');
+  li.className = 'tree-instance' + (inst.id === state.selectedInstanceId ? ' is-selected' : '');
+  // Extra indent past the folder rows' chevron column so instance names
+  // line up with their parent folder's NAME rather than its chevron.
+  li.style.paddingLeft = `${TREE_ROW_BASE_PX + depth * TREE_INDENT_PX + 18}px`;
+
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'item-name';
+  nameSpan.textContent = instanceDisplayName(inst);
+  nameSpan.title = `${inst.model} #${inst.id}`; // real identity stays discoverable under a rename
+  li.appendChild(nameSpan);
+
+  li.addEventListener('click', () => {
+    if (state.selectedInstanceId === inst.id) return; // see buildFolderRow's comment
+    state.selectedInstanceId = inst.id;
+    state.selectedFolderId = null;
+    viewer.selectInstance(inst.id);
+    updateUI();
+  });
+
+  li.addEventListener('dblclick', () => {
+    // Prefill with the current DISPLAY name so renaming feels like
+    // editing what's on screen; committing it unchanged (or clearing it)
+    // stores null, i.e. "no custom name", rather than freezing the
+    // default label as a real name.
+    startRename(nameSpan, instanceDisplayName(inst), (value) => {
+      const newName = value.length === 0 || value === `${inst.model} #${inst.id}` ? null : value;
+      if (newName === inst.name) return;
+      pushHistory(state);
+      markDirty();
+      inst.name = newName;
+    });
+  });
+
+  makeRowDraggable(li, 'instance', inst.id);
+
+  // Dropping onto an instance row means "put it next to this one" -
+  // adopt the row's parent. Makes deep-folder drops easier than hitting
+  // the folder row itself.
+  li.addEventListener('dragover', (evt) => {
+    if (dragPayload && dragPayload.kind === 'instance' && dragPayload.id === inst.id) return;
+    if (!canDropInto(inst.parentId)) return;
+    evt.preventDefault();
+    evt.stopPropagation();
+    evt.dataTransfer.dropEffect = 'move';
+  });
+  li.addEventListener('drop', (evt) => {
+    evt.preventDefault();
+    evt.stopPropagation();
+    dropInto(inst.parentId);
+  });
+
+  return li;
+}
+
+/**
+ * Row for an editor entity (trigger/spawn/...): like an instance row
+ * but with the kind's colored dot in front of the name, so the special
+ * objects read apart from model instances at a glance.
+ */
+function buildEntityRow(ent, depth) {
+  const def = ENTITY_KINDS[ent.kind];
+  const li = document.createElement('li');
+  li.className = 'tree-instance tree-entity' + (ent.id === state.selectedInstanceId ? ' is-selected' : '');
+  li.style.paddingLeft = `${TREE_ROW_BASE_PX + depth * TREE_INDENT_PX + 18}px`;
+
+  const dot = document.createElement('span');
+  dot.className = 'entity-dot';
+  dot.style.color = def ? def.color : 'inherit';
+  dot.textContent = '●';
+  li.appendChild(dot);
+
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'item-name';
+  nameSpan.textContent = entityDisplayName(ent);
+  nameSpan.title = `${def ? def.label : ent.kind} #${ent.id}`;
+  li.appendChild(nameSpan);
+
+  li.addEventListener('click', () => {
+    if (state.selectedInstanceId === ent.id) return; // see buildFolderRow's comment
+    state.selectedInstanceId = ent.id;
+    state.selectedFolderId = null;
+    viewer.selectInstance(ent.id);
+    updateUI();
+  });
+
+  li.addEventListener('dblclick', () => {
+    startRename(nameSpan, entityDisplayName(ent), (value) => {
+      const defaultLabel = `${def ? def.label : ent.kind} #${ent.id}`;
+      const newName = value.length === 0 || value === defaultLabel ? null : value;
+      if (newName === ent.name) return;
+      pushHistory(state);
+      markDirty();
+      ent.name = newName;
+    });
+  });
+
+  makeRowDraggable(li, 'instance', ent.id); // shares the instance payload kind - same tree rules
+
+  li.addEventListener('dragover', (evt) => {
+    if (dragPayload && dragPayload.kind === 'instance' && dragPayload.id === ent.id) return;
+    if (!canDropInto(ent.parentId)) return;
+    evt.preventDefault();
+    evt.stopPropagation();
+    evt.dataTransfer.dropEffect = 'move';
+  });
+  li.addEventListener('drop', (evt) => {
+    evt.preventDefault();
+    evt.stopPropagation();
+    dropInto(ent.parentId);
+  });
+
+  return li;
+}
+
 function renderInstanceList() {
   instanceListEl.innerHTML = '';
 
-  for (const instance of state.instances) {
-    const li = document.createElement('li');
-    li.className = instance.id === state.selectedInstanceId ? 'is-selected' : '';
-
-    const nameSpan = document.createElement('span');
-    nameSpan.className = 'item-name';
-    nameSpan.textContent = `${instance.model} #${instance.id}`;
-    nameSpan.addEventListener('click', () => {
-      state.selectedInstanceId = instance.id;
-      viewer.selectInstance(instance.id);
-      updateUI();
-    });
-    li.appendChild(nameSpan);
-
-    const actions = document.createElement('span');
-    actions.className = 'item-actions';
-
-    const dupBtn = document.createElement('button');
-    dupBtn.textContent = 'Dup';
-    dupBtn.addEventListener('click', (evt) => {
-      evt.stopPropagation();
-      duplicateInstance(instance.id);
-    });
-    actions.appendChild(dupBtn);
-
-    const delBtn = document.createElement('button');
-    delBtn.textContent = 'Del';
-    delBtn.addEventListener('click', (evt) => {
-      evt.stopPropagation();
-      deleteInstance(instance.id);
-    });
-    actions.appendChild(delBtn);
-
-    li.appendChild(actions);
-    instanceListEl.appendChild(li);
-  }
+  // Depth-first walk from the root: each level lists its folders first
+  // (matching how file explorers sort), then its instances, then its
+  // editor entities. Collapsed folders simply don't recurse - that IS
+  // the descendant hiding.
+  const renderLevel = (parentId, depth) => {
+    for (const folder of state.folders.filter((f) => f.parentId === parentId)) {
+      instanceListEl.appendChild(buildFolderRow(folder, depth));
+      if (!folder.collapsed) renderLevel(folder.id, depth + 1);
+    }
+    for (const inst of state.instances.filter((i) => i.parentId === parentId)) {
+      instanceListEl.appendChild(buildInstanceRow(inst, depth));
+    }
+    for (const ent of state.entities.filter((e) => e.parentId === parentId)) {
+      instanceListEl.appendChild(buildEntityRow(ent, depth));
+    }
+  };
+  renderLevel(null, 0);
 }
+
+// Dropping on the Instances page background (outside any row) moves the
+// dragged row back to the root level.
+const tabInstancesPage = document.getElementById('tab-instances');
+tabInstancesPage.addEventListener('dragover', (evt) => {
+  if (!canDropInto(null)) return;
+  evt.preventDefault();
+  evt.dataTransfer.dropEffect = 'move';
+});
+tabInstancesPage.addEventListener('drop', (evt) => {
+  evt.preventDefault();
+  dropInto(null);
+});
 
 /**
  * Apply a field's current value to state + the viewport. Shared by BOTH
@@ -577,16 +1182,21 @@ viewer.onTransformChange((id, transform) => {
     state.camera.pos = round3Axes(transform.pos);
     state.camera.rot = round3Axes(transform.rot);
   } else {
-    const instance = state.getInstance(id);
-    if (!instance) return;
-    instance.pos = round3Axes(transform.pos);
-    instance.rot = round3Axes(transform.rot);
-    if (transform.scale) instance.scale = round3Axes(transform.scale);
+    // Gizmo drags apply to model instances and editor entities alike.
+    const node = state.getInstance(id) || state.getEntity(id);
+    if (!node) return;
+    node.pos = round3Axes(transform.pos);
+    node.rot = round3Axes(transform.rot);
+    if (transform.scale) node.scale = round3Axes(transform.scale);
   }
   refreshTransformFields();
 });
 
 viewer.onSelectionChange((id) => {
+  // Any viewport pick replaces whatever was selected in the tree,
+  // including a selected folder (folders have no viewport presence, so
+  // there's nothing viewport-side to keep them selected FOR).
+  state.selectedFolderId = null;
   if (id === '__camera__') {
     state.selectedInstanceId = null;
     viewer.selectCameraGizmo();
@@ -637,19 +1247,48 @@ wireCameraField(camRotY, 'rot', 'y');
 wireCameraField(camRotZ, 'rot', 'z');
 
 // ==========================================================================
-// Transform mode panel
+// Toolbar: transform mode
 // ==========================================================================
 
+// Buttons only REQUEST the mode; the onTransformModeChange callback below
+// is the single place that records it and re-renders. That callback also
+// fires for viewer.js's own W/E/R shortcuts, so the toolbar highlight can
+// never desync from the actual gizmo mode no matter which route changed it
+// (previously W/E/R switched the gizmo but left the buttons stale).
 for (const [mode, btn] of Object.entries(modeButtons)) {
-  btn.addEventListener('click', () => {
-    currentTransformMode = mode;
-    viewer.setTransformMode(mode);
-    updateUI();
-  });
+  btn.addEventListener('click', () => viewer.setTransformMode(mode));
 }
 
+viewer.onTransformModeChange((mode) => {
+  currentTransformMode = mode;
+  updateUI();
+});
+
+// Snap settings (toolbar). Grid Snap Increment feeds the Ctrl+drag
+// quantization (both TransformControls' translationSnap and the
+// surface-drag rounding); the seam-snap tickbox toggles flush
+// bounding-box snapping against neighboring instances during any
+// translate drag. Neither belongs in undo history or the project file -
+// they're editor input preferences, like the transform mode itself.
+const fSnapIncrement = document.getElementById('f-snap-increment');
+const fSeamSnap = document.getElementById('f-seam-snap');
+
+fSnapIncrement.addEventListener('change', () => {
+  const value = parseFloat(fSnapIncrement.value);
+  if (!Number.isFinite(value) || value <= 0) {
+    fSnapIncrement.value = 1; // reject nonsense, reset visibly
+    viewer.setSnapIncrement(1);
+    return;
+  }
+  viewer.setSnapIncrement(value);
+});
+
+fSeamSnap.addEventListener('change', () => {
+  viewer.setSeamSnapEnabled(fSeamSnap.checked);
+});
+
 // ==========================================================================
-// Viewport view panel (editing orbit camera only - NOT the exported PS1
+// Toolbar: view group (editing orbit camera only - NOT the exported PS1
 // camera gizmo, which is handled separately by the "Camera panel" section
 // above via wireCameraField()).
 // ==========================================================================
@@ -661,7 +1300,7 @@ btnViewReset.addEventListener('click', () => viewer.resetViewportCamera());
 document.getElementById('view-grid').addEventListener('click', () => viewer.toggleGridVisible());
 
 // ==========================================================================
-// Transport footer: Load / Save / Export
+// Toolbar: file group - Load / Save / Export
 // ==========================================================================
 
 btnSaveProject.addEventListener('click', () => {
@@ -699,14 +1338,56 @@ fileLoadProject.addEventListener('change', async () => {
     id: inst.id,
     model: inst.model,
     palette: inst.palette,
+    // v2 fields - `?? null` also quietly flattens any pre-v2 file into
+    // "no custom names, everything at root" instead of erroring.
+    name: inst.name ?? null,
+    parentId: inst.parentId ?? null,
     pos: { ...inst.pos },
     rot: { ...inst.rot },
     scale: { ...inst.scale },
   }));
+  state.folders = (parsed.folders || []).map((folder) => ({
+    id: folder.id,
+    name: folder.name || 'Folder',
+    parentId: folder.parentId ?? null,
+    collapsed: !!folder.collapsed,
+  }));
+  // v3 field: editor entities. Unknown kinds (from a future version) are
+  // dropped rather than crashing the tree render; props merge over the
+  // kind's defaults so a schema addition gets its default on old files.
+  state.entities = (parsed.entities || [])
+    .filter((ent) => ENTITY_KINDS[ent.kind])
+    .map((ent) => {
+      const defaults = {};
+      for (const propDef of ENTITY_KINDS[ent.kind].props) {
+        defaults[propDef.key] = propDef.default;
+      }
+      return {
+        id: ent.id,
+        kind: ent.kind,
+        name: ent.name ?? null,
+        parentId: ent.parentId ?? null,
+        pos: { x: 0, y: 0, z: 0, ...ent.pos },
+        rot: { x: 0, y: 0, z: 0, ...ent.rot },
+        scale: { x: 1, y: 1, z: 1, ...ent.scale },
+        props: { ...defaults, ...ent.props },
+      };
+    });
   state.camera.pos = { ...parsed.camera.pos };
   state.camera.rot = { ...parsed.camera.rot };
   state.selectedInstanceId = null;
-  state.nextId = parsed.nextId || (Math.max(0, ...state.instances.map((i) => i.id)) + 1);
+  state.selectedFolderId = null;
+  state.nextId =
+    parsed.nextId ||
+    Math.max(
+      0,
+      ...state.instances.map((i) => i.id),
+      ...state.folders.map((f) => f.id),
+      ...state.entities.map((e) => e.id)
+    ) + 1;
+  state.nextSpawnId =
+    parsed.nextSpawnId ??
+    Math.max(-1, ...state.entities.map((e) => (Number.isFinite(e.props.spawnId) ? e.props.spawnId : -1))) + 1;
 
   // Loading a whole new project makes the PREVIOUS project's undo history
   // meaningless (undoing "into" a different loaded file would be
@@ -777,14 +1458,29 @@ function applySnapshot(snapshot) {
     id: inst.id,
     model: inst.model,
     palette: inst.palette,
+    name: inst.name ?? null,
+    parentId: inst.parentId ?? null,
     pos: { ...inst.pos },
     rot: { ...inst.rot },
     scale: { ...inst.scale },
   }));
+  state.folders = (snapshot.folders || []).map((folder) => ({ ...folder }));
+  state.entities = (snapshot.entities || []).map((ent) => ({
+    id: ent.id,
+    kind: ent.kind,
+    name: ent.name,
+    parentId: ent.parentId,
+    pos: { ...ent.pos },
+    rot: { ...ent.rot },
+    scale: { ...ent.scale },
+    props: { ...ent.props },
+  }));
   state.camera.pos = { ...snapshot.camera.pos };
   state.camera.rot = { ...snapshot.camera.rot };
   state.selectedInstanceId = snapshot.selectedInstanceId;
+  state.selectedFolderId = snapshot.selectedFolderId ?? null;
   state.nextId = snapshot.nextId;
+  state.nextSpawnId = snapshot.nextSpawnId ?? state.nextSpawnId;
 
   resyncViewportFromState();
   updateUI();
@@ -839,15 +1535,29 @@ window.addEventListener('keydown', (event) => {
   } else if (isDuplicate) {
     event.preventDefault(); // Ctrl+D is "bookmark this page" by default in most browsers - must be suppressed
     if (state.selectedInstanceId === null) return;
-    duplicateInstance(state.selectedInstanceId);
+    if (state.getInstance(state.selectedInstanceId)) {
+      duplicateInstance(state.selectedInstanceId);
+    } else if (state.getEntity(state.selectedInstanceId)) {
+      duplicateEntity(state.selectedInstanceId);
+    }
   } else if (isDelete) {
     // Backspace's browser default is "navigate back" on some pages when
     // focus isn't in a text field - preventDefault() unconditionally here
-    // (not just when an instance is actually selected) to make sure that
+    // (not just when something is actually selected) to make sure that
     // never fires while the user is working in the viewport.
     event.preventDefault();
-    if (state.selectedInstanceId === null) return;
-    deleteInstance(state.selectedInstanceId);
+    if (state.selectedInstanceId !== null) {
+      if (state.getInstance(state.selectedInstanceId)) {
+        deleteInstance(state.selectedInstanceId);
+      } else {
+        deleteEntity(state.selectedInstanceId);
+      }
+    } else if (state.selectedFolderId !== null) {
+      // With per-row Del buttons gone, the Delete key is the only way to
+      // remove a folder - it takes the whole subtree with it (confirmed
+      // first, with the contained-instance count spelled out).
+      deleteFolder(state.selectedFolderId);
+    }
   }
 });
 
@@ -856,15 +1566,117 @@ window.addEventListener('keydown', (event) => {
 // ==========================================================================
 
 /**
+ * Rebuild the entity Parameters section for the selected entity from
+ * its ENTITY_KINDS schema: checkboxes for bools, number inputs for
+ * int/number, text inputs for strings. Committing a change pushes one
+ * undo entry, writes the prop, and forwards it to the viewer so live
+ * visuals (summon patrol ring, billboard tracking/through-walls) update
+ * immediately.
+ *
+ * Skipped entirely while focus is INSIDE the section - every change
+ * event funnels through updateUI() paths that land back here, and
+ * rebuilding the input the user is actively typing in would yank focus
+ * and eat keystrokes. The skipped rebuild costs nothing: the focused
+ * input already shows what the user typed, and state already holds it.
+ */
+function renderEntityProps(ent) {
+  if (entityPropsBodyEl.contains(document.activeElement)) return;
+
+  const def = ENTITY_KINDS[ent.kind];
+  if (!def) return;
+  entityPropsTitleEl.textContent = `${def.label} Parameters`;
+  entityPropsBodyEl.innerHTML = '';
+
+  for (const propDef of def.props) {
+    const commit = (rawValue, inputEl) => {
+      let value = rawValue;
+      if (propDef.type === 'int') value = parseInt(rawValue, 10);
+      else if (propDef.type === 'number') value = parseFloat(rawValue);
+      if ((propDef.type === 'int' || propDef.type === 'number') && !Number.isFinite(value)) {
+        inputEl.value = ent.props[propDef.key]; // reject nonsense, restore visibly
+        return;
+      }
+      if (value === ent.props[propDef.key]) return;
+
+      pushHistory(state);
+      markDirty();
+      ent.props[propDef.key] = value;
+      viewer.updateEntityProps(ent.id, ent.props);
+
+      // Spawn-ID uniqueness is soft-validated (warn, don't block), same
+      // philosophy as palette rows: the author may be mid-renumber.
+      if (propDef.uniqueSpawnId) {
+        const taken = state.isSpawnIdTaken(value, ent.id);
+        inputEl.classList.toggle('field-warning', taken);
+        if (taken) showWarning(`Spawn ID ${value} is already used by another spawn/summon.`);
+      }
+    };
+
+    if (propDef.type === 'bool') {
+      const label = document.createElement('label');
+      label.className = 'checkbox-row';
+      const checkbox = document.createElement('input');
+      checkbox.type = 'checkbox';
+      checkbox.checked = !!ent.props[propDef.key];
+      checkbox.addEventListener('change', () => commit(checkbox.checked, checkbox));
+      const text = document.createElement('span');
+      text.textContent = propDef.label;
+      label.appendChild(checkbox);
+      label.appendChild(text);
+      entityPropsBodyEl.appendChild(label);
+    } else {
+      const label = document.createElement('label');
+      label.className = 'field-full';
+      label.textContent = propDef.label;
+      const input = document.createElement('input');
+      if (propDef.type === 'string') {
+        input.type = 'text';
+        input.value = ent.props[propDef.key] ?? '';
+      } else {
+        input.type = 'number';
+        input.step = propDef.type === 'int' ? '1' : '0.1';
+        input.value = ent.props[propDef.key];
+      }
+      if (propDef.uniqueSpawnId) {
+        input.classList.toggle('field-warning', state.isSpawnIdTaken(ent.props[propDef.key], ent.id));
+      }
+      input.addEventListener('change', () => commit(input.value, input));
+      label.appendChild(input);
+      entityPropsBodyEl.appendChild(label);
+    }
+  }
+}
+
+/**
  * Rewrite ONLY the numeric transform/camera/palette input fields from
  * state. Extracted from updateUI() so the continuous gizmo-drag path
  * (viewer.onTransformChange above) can refresh what the drag actually
  * changes without rebuilding the whole sidebar DOM per mouse-move.
  */
 function refreshTransformFields() {
-  const selected = state.selectedInstanceId !== null ? state.getInstance(state.selectedInstanceId) : null;
+  const selectedInst = state.selectedInstanceId !== null ? state.getInstance(state.selectedInstanceId) : null;
+  const selectedEnt = !selectedInst && state.selectedInstanceId !== null ? state.getEntity(state.selectedInstanceId) : null;
+  const selected = selectedInst || selectedEnt;
+
+  // The Properties dock swaps between the "no selection" placeholder and
+  // the object sections; the Scene Camera section below them is always
+  // visible regardless. Model instances show Appearance (palette),
+  // editor entities show their kind's Parameters section instead.
+  propsNoSelectionEl.classList.toggle('hidden', !!selected);
   if (selected) {
     instanceFieldsEl.classList.remove('hidden');
+    appearanceSectionEl.classList.toggle('hidden', !selectedInst);
+    entityPropsSectionEl.classList.toggle('hidden', !selectedEnt);
+
+    if (selectedInst) {
+      propsTargetLabelEl.textContent = instanceDisplayName(selectedInst);
+      propsTargetLabelEl.title = `${selectedInst.model} #${selectedInst.id}`; // real identity survives a rename
+    } else {
+      const def = ENTITY_KINDS[selectedEnt.kind];
+      propsTargetLabelEl.textContent = entityDisplayName(selectedEnt);
+      propsTargetLabelEl.title = `${def ? def.label : selectedEnt.kind} #${selectedEnt.id}`;
+    }
+
     fPosX.value = round3(selected.pos.x);
     fPosY.value = round3(selected.pos.y);
     fPosZ.value = round3(selected.pos.z);
@@ -874,15 +1686,22 @@ function refreshTransformFields() {
     fScaleX.value = round3(selected.scale.x);
     fScaleY.value = round3(selected.scale.y);
     fScaleZ.value = round3(selected.scale.z);
-    fPalette.value = selected.palette;
 
-    // Reflect the model's real CLUT row bound on the input itself (QOL):
-    // max clamps the spinner arrows/validation to valid rows, while the
-    // warning styling still flags values typed past it (max on a number
-    // input doesn't block typing, so both remain useful).
-    const maxPalette = state.getMaxPaletteForInstance(selected.id);
-    fPalette.max = Math.max(0, maxPalette - 1);
-    fPalette.classList.toggle('field-warning', selected.palette >= maxPalette);
+    if (selectedInst) {
+      fPalette.value = selectedInst.palette;
+
+      // Reflect the model's real CLUT row bound on the input itself (QOL):
+      // max clamps the spinner arrows/validation to valid rows, while the
+      // warning styling still flags values typed past it (max on a number
+      // input doesn't block typing, so both remain useful).
+      const maxPalette = state.getMaxPaletteForInstance(selectedInst.id);
+      fPalette.max = Math.max(0, maxPalette - 1);
+      fPalette.classList.toggle('field-warning', selectedInst.palette >= maxPalette);
+    }
+
+    if (selectedEnt) {
+      renderEntityProps(selectedEnt);
+    }
   } else {
     instanceFieldsEl.classList.add('hidden');
   }
@@ -1009,8 +1828,6 @@ function updateUI() {
   // we gate on there being something to actually export.
   btnExportScene.disabled = !(state.models.size > 0 && state.instances.length > 0);
 
-  btnAddInstance.disabled = !activeModelName;
-
   if (window.__sceneGenDiscoveredModels) {
     renderModelList(window.__sceneGenDiscoveredModels);
   }
@@ -1046,6 +1863,54 @@ const ROTATION_SENSITIVITY = 0.15;
 [fRotX, fRotY, fRotZ, camRotX, camRotY, camRotZ].forEach((el) =>
   makeScrubbable(el, { sensitivity: ROTATION_SENSITIVITY })
 );
+
+// ==========================================================================
+// Left dock tabs (.NET-style tab strip: Assets | Instances | VRAM)
+// ==========================================================================
+//
+// Pure show/hide switching - every page's DOM stays alive (and its ids
+// stay queryable) whether or not it's the visible tab, so none of the
+// existing render functions above needed to change for the tabbed layout.
+// data-tab on each button names the page element id it reveals.
+
+const dockTabButtons = Array.from(document.querySelectorAll('.dock-tab[data-tab]'));
+
+for (const tabBtn of dockTabButtons) {
+  tabBtn.addEventListener('click', () => {
+    for (const btn of dockTabButtons) {
+      btn.classList.toggle('is-active', btn === tabBtn);
+      document.getElementById(btn.dataset.tab).classList.toggle('hidden', btn !== tabBtn);
+    }
+  });
+}
+
+// ==========================================================================
+// Shortcuts popover (toolbar "?")
+// ==========================================================================
+
+const btnShortcuts = document.getElementById('btn-shortcuts');
+const shortcutsPopoverEl = document.getElementById('shortcuts-popover');
+
+btnShortcuts.addEventListener('click', (evt) => {
+  evt.stopPropagation(); // keep the document-level close handler below from instantly re-hiding it
+  const opening = shortcutsPopoverEl.classList.contains('hidden');
+  if (opening) {
+    // Anchor just under the "?" button, wherever the toolbar wrapped to.
+    const rect = btnShortcuts.getBoundingClientRect();
+    shortcutsPopoverEl.style.top = `${Math.round(rect.bottom + 6)}px`;
+  }
+  shortcutsPopoverEl.classList.toggle('hidden');
+  btnShortcuts.classList.toggle('is-active', opening);
+});
+
+// Click anywhere outside (including the viewport) dismisses it - it's
+// reference material, not a mode, so it should never need explicit closing.
+document.addEventListener('click', (evt) => {
+  if (shortcutsPopoverEl.classList.contains('hidden')) return;
+  if (shortcutsPopoverEl.contains(evt.target)) return;
+  shortcutsPopoverEl.classList.add('hidden');
+  btnShortcuts.classList.remove('is-active');
+});
 
 // ==========================================================================
 // Startup

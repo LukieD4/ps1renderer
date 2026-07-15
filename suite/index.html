@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>bit / depth . tools</title>
+  <title>ps1renderer / Suite of Tools</title>
   <link rel="stylesheet" href="css/site.css" />
   <style>
     .home {
@@ -16,13 +16,13 @@
       font-size: 28px;
       margin: 0 0 12px;
     }
-    .home p {
+    .home > p {
       color: var(--text-dim);
       line-height: 1.6;
     }
     .home-card {
       display: block;
-      margin-top: 32px;
+      margin-top: 16px;
       padding: 20px;
       background: var(--panel);
       border: 1px solid var(--border);
@@ -43,29 +43,78 @@
       font-size: 13.5px;
       margin-top: 6px;
     }
+
+    /* --- new: section grouping for the tool flow --- */
+    .home-section {
+      margin-top: 48px;
+      padding-top: 28px;
+      border-top: 1px solid var(--border-soft);
+    }
+    .home-section:first-of-type {
+      margin-top: 40px;
+    }
+    .home-section__title {
+      font-family: var(--font-display);
+      font-size: 13px;
+      letter-spacing: 0.06em;
+      text-transform: uppercase;
+      color: var(--text-faint);
+      margin: 0 0 4px;
+    }
+    .home-section__desc {
+      color: var(--text-dim);
+      font-size: 13.5px;
+      margin: 0 0 16px;
+    }
+    .home-flow-step {
+      display: inline-flex;
+      align-items: center;
+      justify-content: center;
+      min-width: 18px;
+      height: 18px;
+      padding: 0 5px;
+      margin-right: 8px;
+      font-family: var(--font-display);
+      font-size: 11px;
+      color: var(--accent);
+      background: rgba(94, 234, 212, 0.08);
+      border: 1px solid var(--accent-dim);
+      border-radius: var(--radius-sm);
+      vertical-align: middle;
+    }
   </style>
 </head>
 <body data-nav-key="home">
   <div id="site-navbar"></div>
 
   <main class="home">
-    <h1>bit / depth . tools</h1>
+    <h1>ps1renderer / Suite of Tools</h1>
     <p>Small offline tools for pushing pixels around. Everything runs locally in your browser — nothing is uploaded anywhere.</p>
 
-    <a class="home-card" href="tools/image-bpp/index.html">
-      <div class="home-card__title">BPP Image Tool</div>
-      <div class="home-card__desc">Reduce an image to a restricted color depth (4/8bpp), adjust hue/saturation/contrast, dither, edit the palette by hand, and export or save your project.</div>
-    </a>
+    <section class="home-section">
+      <h2 class="home-section__title">Texture Curation</h2>
+      <p class="home-section__desc">Work through these two in order: reduce a source image, then build the palette it will use.</p>
 
-    <a class="home-card" href="tools/palette-maker/index.html">
-      <div class="home-card__title">Palette Maker</div>
-      <div class="home-card__desc">Create and edit custom color palettes for your projects.</div>
-    </a>
+      <a class="home-card" href="tools/image-bpp/index.html">
+        <div class="home-card__title"><span class="home-flow-step">1</span>BPP Image Tool</div>
+        <div class="home-card__desc">Reduce an image by restricting color depth (4/8bpp), adjust hue/saturation/contrast, dither, edit the palette by hand, and export or save your project.</div>
+      </a>
 
-    <a class="home-card" href="tools/scene-gen/index.html">
-      <div class="home-card__title">Scene Generator</div>
-      <div class="home-card__desc">Generate random pixel art scenes with a variety of settings and export them as PNGs.</div>
-    </a>
+      <a class="home-card" href="tools/palette-maker/index.html">
+        <div class="home-card__title"><span class="home-flow-step">2</span>Palette Maker</div>
+        <div class="home-card__desc">Create Colour Lookup Tables that will correspond to ONE texture.</div>
+      </a>
+    </section>
+
+    <section class="home-section">
+      <h2 class="home-section__title">Scene Maker</h2>
+      <p class="home-section__desc">A standalone tool, not part of the texture flow above.</p>
+
+      <a class="home-card" href="tools/scene-gen/index.html">
+        <div class="home-card__title">Scene Generator</div>
+        <div class="home-card__desc">Generate random pixel art scenes with a variety of settings and export them as PNGs.</div>
+      </a>
+    </section>
   </main>
 
   <script src="js/navbar.js"></script>

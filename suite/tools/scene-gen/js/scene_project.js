@@ -21,7 +21,16 @@
  * instances will actually render in the viewport again.
  */
 
-const PROJECT_FILE_VERSION = 1;
+// Version 2: adds display names (instance.name), the folder tree
+// (folders array + instance.parentId), and each folder's collapsed flag.
+// Version 3: adds editor entities (entities array - triggers, spawns,
+// summons, particles, billboards; see scene_state.js's ENTITY_KINDS) and
+// the nextSpawnId counter backing spawn/summon unique IDs.
+// No backwards-compat shims: the loader in app.js simply defaults any
+// missing newer fields (folders -> [], entities -> [], name -> null,
+// parentId -> null), which happens to make older files load flat/empty
+// where the newer concepts would be - same content, nothing errors.
+const PROJECT_FILE_VERSION = 3;
 
 /**
  * Build the serializable project JSON from current editor state.
@@ -36,15 +45,34 @@ export function buildProjectJson(state) {
       rot: { ...state.camera.rot },
     },
     modelNames,
+    folders: state.folders.map((folder) => ({
+      id: folder.id,
+      name: folder.name,
+      parentId: folder.parentId,
+      collapsed: folder.collapsed,
+    })),
     instances: state.instances.map((inst) => ({
       id: inst.id,
       model: inst.model,
       palette: inst.palette,
+      name: inst.name,
+      parentId: inst.parentId,
       pos: { ...inst.pos },
       rot: { ...inst.rot },
       scale: { ...inst.scale },
     })),
+    entities: state.entities.map((ent) => ({
+      id: ent.id,
+      kind: ent.kind,
+      name: ent.name,
+      parentId: ent.parentId,
+      pos: { ...ent.pos },
+      rot: { ...ent.rot },
+      scale: { ...ent.scale },
+      props: { ...ent.props },
+    })),
     nextId: state.nextId,
+    nextSpawnId: state.nextSpawnId,
   };
 }
 

@@ -57,16 +57,41 @@ function snapshot(state) {
       id: inst.id,
       model: inst.model,
       palette: inst.palette,
+      name: inst.name,
+      parentId: inst.parentId,
       pos: { ...inst.pos },
       rot: { ...inst.rot },
       scale: { ...inst.scale },
+    })),
+    // Folder objects are flat plain data ({ id, name, parentId,
+    // collapsed }), so a shallow per-folder spread is a full deep clone.
+    // collapsed riding along in snapshots is deliberate-but-harmless:
+    // collapse toggles never PUSH history themselves (they're a view
+    // preference), but restoring an older snapshot restores the collapse
+    // state it was taken with, which keeps what the user SEES after an
+    // undo consistent with what they saw when that state was current.
+    folders: state.folders.map((folder) => ({ ...folder })),
+    // Entities: pos/rot/scale/props each need their own clone (they're
+    // nested one level deep); props values are all primitives per the
+    // ENTITY_KINDS schemas, so a spread of props is a full deep clone.
+    entities: state.entities.map((ent) => ({
+      id: ent.id,
+      kind: ent.kind,
+      name: ent.name,
+      parentId: ent.parentId,
+      pos: { ...ent.pos },
+      rot: { ...ent.rot },
+      scale: { ...ent.scale },
+      props: { ...ent.props },
     })),
     camera: {
       pos: { ...state.camera.pos },
       rot: { ...state.camera.rot },
     },
     selectedInstanceId: state.selectedInstanceId,
+    selectedFolderId: state.selectedFolderId,
     nextId: state.nextId,
+    nextSpawnId: state.nextSpawnId,
   };
 }
 

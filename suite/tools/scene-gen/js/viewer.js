@@ -160,6 +160,35 @@ export function initViewer(canvasEl, gizmoCanvasEl) {
   transformControls = new TransformControls(editCamera, canvas);
   scene.add(transformControls.getHelper ? transformControls.getHelper() : transformControls);
 
+  // Hold Ctrl while dragging = snap to grid (1 unit, matching the
+  // GridHelper's 1-unit divisions and therefore 1024 exported PS1 units).
+  // Two mechanisms cover the two drag styles:
+  //   - TransformControls' built-in translationSnap handles the axis
+  //     arrows and plane squares (it quantizes while the modifier is
+  //     held, live, mid-drag - the standard Blender-like feel).
+  //   - The surface-snap drag (white center square) reads ctrlSnapHeld
+  //     directly in applySurfaceSnapDrag(), rounding the landed X/Z to
+  //     whole units while leaving Y surface-derived, so a Ctrl-snapped
+  //     crate still sits flat on the shelf it landed on.
+  // The window blur listener clears the state so alt-tabbing away with
+  // Ctrl held can't leave snapping stuck on.
+  window.addEventListener('keydown', (event) => {
+    if (event.key === 'Control') {
+      ctrlSnapHeld = true;
+      transformControls.translationSnap = snapIncrement;
+    }
+  });
+  window.addEventListener('keyup', (event) => {
+    if (event.key === 'Control') {
+      ctrlSnapHeld = false;
+      transformControls.translationSnap = null;
+    }
+  });
+  window.addEventListener('blur', () => {
+    ctrlSnapHeld = false;
+    transformControls.translationSnap = null;
+  });
+
   // Standard TransformControls pattern: while the user is dragging a
   // gizmo handle, OrbitControls must be disabled, otherwise the orbit
   // drag and the gizmo drag fight over the same mouse input and the
@@ -212,6 +241,20 @@ export function initViewer(canvasEl, gizmoCanvasEl) {
       currentTransformTarget !== CAMERA_GIZMO_ID
     ) {
       applySurfaceSnapDrag(currentTransformTarget);
+    }
+
+    // Seam snap (sidebar tickbox): after whichever positioning path ran
+    // above - surface-snap drag or TransformControls' own axis/plane
+    // translation - pull the dragged object flush against neighboring
+    // objects' bounding boxes so touching faces meet with zero gap and
+    // zero overlap. Runs last so it wins over grid rounding when both
+    // are active (a seam within the threshold beats a grid line).
+    if (
+      seamSnapEnabled &&
+      transformControls.mode === 'translate' &&
+      currentTransformTarget !== CAMERA_GIZMO_ID
+    ) {
+      applySeamSnap(currentTransformTarget);
     }
 
     if (currentTransformTarget === CAMERA_GIZMO_ID) {
@@ -303,6 +346,19 @@ function renderLoop() {
     updateFreecam(dt);
   } else {
     orbitControls.update();
+  }
+
+  // Live billboard preview: any billboard entity with trackCamera on
+  // yaw-follows the edit camera every frame (Y-axis billboarding, the
+  // PS1 sprite convention), offset by its pivotAngle prop. This
+  // deliberately overrides manual Y rotation while tracking is enabled -
+  // that IS what the flag means at runtime.
+  for (const inst of instances.values()) {
+    if (!inst.isEntity || inst.kind !== 'billboard' || !inst.props.trackCamera) continue;
+    const obj = inst.object3D;
+    obj.rotation.y =
+      Math.atan2(editCamera.position.x - obj.position.x, editCamera.position.z - obj.position.z) +
+      THREE.MathUtils.degToRad(inst.props.pivotAngle || 0);
   }
 
   renderer.render(scene, editCamera);
@@ -583,6 +639,99 @@ const SNAP_DRAG_GROUND_PLANE = new THREE.Plane(new THREE.Vector3(0, 1, 0), 0);
 const snapDragRaycaster = new THREE.Raycaster();
 const lastPointerNdc = new THREE.Vector2();
 
+// True while Ctrl is held - toggled by the keydown/keyup/blur listeners
+// in initViewer(). Read by applySurfaceSnapDrag() for grid quantization;
+// the axis/plane handles get the same behavior via TransformControls'
+// own translationSnap, set in the same listeners.
+let ctrlSnapHeld = false;
+
+// Grid snap increment (viewport units) used by Ctrl-drag snapping - both
+// TransformControls' translationSnap and the surface-drag rounding.
+// Configurable from the sidebar's "Grid Snap" field via setSnapIncrement().
+let snapIncrement = 1;
+
+/**
+ * Set the Ctrl-drag grid snap increment. Values <= 0 / NaN fall back to
+ * 1. If Ctrl is currently held mid-drag, the live translationSnap is
+ * updated too so the change applies immediately.
+ */
+export function setSnapIncrement(value) {
+  snapIncrement = Number.isFinite(value) && value > 0 ? value : 1;
+  if (ctrlSnapHeld && transformControls) transformControls.translationSnap = snapIncrement;
+}
+
+// ---- seam snap ("touch seamlessly to vertices") ----
+//
+// When enabled (sidebar tickbox), any translate drag pulls the dragged
+// object's world AABB flush against nearby instances' AABBs: within
+// SEAM_SNAP_THRESHOLD units, a face-to-face gap closes to EXACTLY zero
+// (house A touches house B, no overlap and no sliver of daylight), and
+// nearly-aligned edges line up exactly (a row of houses sharing a
+// frontline). Axis-aligned boxes rather than true per-vertex matching -
+// right for this pipeline's box-y architectural assets and cheap enough
+// to run on every drag event.
+let seamSnapEnabled = false;
+const SEAM_SNAP_THRESHOLD = 0.35; // units within which edges attract
+
+export function setSeamSnapEnabled(enabled) {
+  seamSnapEnabled = !!enabled;
+}
+
+/**
+ * Nudge the dragged instance so its AABB sits flush with neighboring
+ * instances' AABBs. Per axis, candidate snaps are: TOUCH (my min to your
+ * max / my max to your min - closes the gap between adjacent objects)
+ * and ALIGN (min-to-min / max-to-max - lines edges up). A candidate on
+ * one axis only applies if the two boxes actually overlap on the OTHER
+ * two axes - otherwise distant, unrelated objects would yank the drag
+ * around. The smallest in-threshold delta per axis wins.
+ */
+function applySeamSnap(id) {
+  const inst = instances.get(id);
+  if (!inst) return;
+  const obj = inst.object3D;
+
+  const dragged = new THREE.Box3().setFromObject(obj);
+  if (dragged.isEmpty()) return;
+
+  const AXES = ['x', 'y', 'z'];
+  const best = { x: null, y: null, z: null }; // smallest |delta| per axis
+
+  const overlaps = (boxA, boxB, axis) =>
+    boxA.min[axis] < boxB.max[axis] && boxA.max[axis] > boxB.min[axis];
+
+  for (const [otherId, other] of instances.entries()) {
+    if (otherId === id) continue;
+    if (other.isEntity) continue; // entity markers must not attract seam snapping
+    const box = new THREE.Box3().setFromObject(other.object3D);
+    if (box.isEmpty()) continue;
+
+    for (const axis of AXES) {
+      const [oa, ob] = AXES.filter((a) => a !== axis);
+      // Require real adjacency on the other two axes - either already
+      // overlapping, or within snapping distance of overlapping.
+      if (!overlaps(dragged, box, oa) || !overlaps(dragged, box, ob)) continue;
+
+      const candidates = [
+        box.max[axis] - dragged.min[axis], // touch: my low side against your high side
+        box.min[axis] - dragged.max[axis], // touch: my high side against your low side
+        box.min[axis] - dragged.min[axis], // align low edges
+        box.max[axis] - dragged.max[axis], // align high edges
+      ];
+      for (const delta of candidates) {
+        if (Math.abs(delta) > SEAM_SNAP_THRESHOLD) continue;
+        if (best[axis] === null || Math.abs(delta) < Math.abs(best[axis])) {
+          best[axis] = delta;
+        }
+      }
+    }
+  }
+
+  for (const axis of AXES) {
+    if (best[axis] !== null) obj.position[axis] += best[axis];
+  }
+}
+
 /**
  * Place the dragged instance flat onto whatever surface is under the
  * cursor. "Flat" means: its world bounding box rests against the hit
@@ -598,18 +747,26 @@ const lastPointerNdc = new THREE.Vector2();
  * If neither another instance nor the ground plane is under the cursor
  * (e.g. aiming at the sky), the object simply stays where it is - no
  * position is ever derived from a depth-less screen-plane guess.
+ *
+ * Returns true if a surface (instance face or ground plane) was under
+ * the ray and the object was placed against it, false on the sky/void
+ * path. The gizmo-drag caller ignores this; the asset-placement exports
+ * below use it to decide whether a fallback position is needed.
  */
 function applySurfaceSnapDrag(id) {
   const inst = instances.get(id);
-  if (!inst) return;
+  if (!inst) return false;
   const obj = inst.object3D;
 
   snapDragRaycaster.setFromCamera(lastPointerNdc, editCamera);
 
-  // Raycast against every OTHER instance's meshes.
+  // Raycast against every OTHER instance's meshes. Entity markers are
+  // excluded - a dragged crate must never come to rest ON a trigger
+  // volume or spawn cone, only on real world geometry.
   const targets = [];
   for (const [otherId, other] of instances.entries()) {
     if (otherId === id) continue;
+    if (other.isEntity) continue;
     other.object3D.traverse((child) => {
       if (child.isMesh) targets.push(child);
     });
@@ -640,7 +797,7 @@ function applySurfaceSnapDrag(id) {
     // Aiming at the sky/void: hold the object at its current (already
     // valid) position rather than letting it fly off - just re-clamp.
     obj.position.copy(SNAP_DRAG_BOUNDS.clampPoint(obj.position, new THREE.Vector3()));
-    return;
+    return false;
   }
 
   // Current world bounding box -> where the object's ORIGIN sits relative
@@ -649,7 +806,7 @@ function applySurfaceSnapDrag(id) {
   // rotation state is always respected; Box3.setFromObject over one
   // instance is cheap at this tool's model sizes.
   const bbox = new THREE.Box3().setFromObject(obj);
-  if (bbox.isEmpty()) return;
+  if (bbox.isEmpty()) return false;
   const center = bbox.getCenter(new THREE.Vector3());
   const halfExt = bbox.getSize(new THREE.Vector3()).multiplyScalar(0.5);
   const centerOffset = center.sub(obj.position); // origin -> bbox-center offset
@@ -665,7 +822,71 @@ function applySurfaceSnapDrag(id) {
     .addScaledVector(hitNormal, supportDist)
     .sub(centerOffset);
 
+  // Ctrl held: quantize the landed position to the grid (snapIncrement
+  // units, configurable in the sidebar) on X/Z. Y stays exactly as the
+  // surface placement computed it - rounding Y would lift the object off
+  // (or sink it into) whatever it just landed on, defeating the "rests
+  // flat on the hit face" guarantee.
+  if (ctrlSnapHeld) {
+    newPos.x = Math.round(newPos.x / snapIncrement) * snapIncrement;
+    newPos.z = Math.round(newPos.z / snapIncrement) * snapIncrement;
+  }
+
   obj.position.copy(SNAP_DRAG_BOUNDS.clampPoint(newPos, new THREE.Vector3()));
+  return true;
+}
+
+// ==========================================================================
+// Asset placement (drag an asset onto the viewport / double-click an asset)
+// ==========================================================================
+
+/**
+ * Place a just-created instance at the surface under a SCREEN point
+ * (client coordinates, e.g. from a drop event) - the exact same "rests
+ * flat against whatever face is there, ground plane as fallback,
+ * Ctrl-grid quantization, world-bounds clamp" behavior as the translate
+ * gizmo's center-square surface drag, because it IS that code:
+ * applySurfaceSnapDrag() aimed through an explicit point instead of the
+ * live cursor. Returns the instance's resulting transform (for app.js to
+ * copy back into state), or null if the point aimed at sky/void and no
+ * placement could be derived - the caller decides the fallback then.
+ */
+export function placeInstanceAtScreenPoint(id, clientX, clientY) {
+  const rect = canvas.getBoundingClientRect();
+  lastPointerNdc.set(
+    ((clientX - rect.left) / rect.width) * 2 - 1,
+    -((clientY - rect.top) / rect.height) * 2 + 1
+  );
+  const placed = applySurfaceSnapDrag(id);
+  return placed ? getInstanceTransform(id) : null;
+}
+
+/**
+ * Place a just-created instance "in the center of the viewport, at a
+ * safe distance" (the double-click-an-asset path): first try the same
+ * surface placement as above but aimed through the viewport's center -
+ * so it lands ON whatever the user is currently looking at. If the
+ * center of the view is sky/void, fall back to the orbit pivot
+ * (orbitControls.target): it's by definition a comfortable, visible
+ * working distance in front of the camera, and the object is rested on
+ * the ground plane at that X/Z rather than floating at the pivot's
+ * height. Returns the resulting transform.
+ */
+export function placeInstanceAtViewCenter(id) {
+  const inst = instances.get(id);
+  if (!inst) return null;
+
+  lastPointerNdc.set(0, 0);
+  if (!applySurfaceSnapDrag(id)) {
+    const obj = inst.object3D;
+    obj.position.set(orbitControls.target.x, 0, orbitControls.target.z);
+    const bbox = new THREE.Box3().setFromObject(obj);
+    if (!bbox.isEmpty()) {
+      obj.position.y -= bbox.min.y; // lift so the box's underside rests exactly on y=0
+    }
+    obj.position.copy(SNAP_DRAG_BOUNDS.clampPoint(obj.position, new THREE.Vector3()));
+  }
+  return getInstanceTransform(id);
 }
 
 /**
@@ -904,6 +1125,203 @@ export function addInstance(id, modelName, initialTransform = {}, materialsMap =
   return object3D;
 }
 
+// ==========================================================================
+// Editor entity helpers (Triggers / Spawns / Summons / Particles / Billboards)
+// ==========================================================================
+//
+// Entities are tracked in the SAME `instances` map as model instances
+// (ids never collide - SceneState hands out one shared id sequence), so
+// click-selection raycasts, TransformControls attachment, removal, and
+// frame-selected all work on them with zero extra plumbing. Entries are
+// marked `isEntity: true` so the systems where a marker gizmo must NOT
+// behave like world geometry - freecam walking, seam-snap neighbors,
+// surface-snap raycast targets - can skip them.
+//
+// Colors mirror scene_state.js's ENTITY_KINDS (CSS side). Keep in sync.
+const ENTITY_COLORS = {
+  trigger: 0xff8c42,
+  spawn: 0x5dd06a,
+  summon: 0xb06ee0,
+  particle: 0xffd23c,
+  billboard: 0x3ec6dc,
+};
+
+/** LineLoop circle geometry in the XZ plane (patrol radius rings). */
+function makeCircleGeometry(radius, segments = 48) {
+  const pts = [];
+  for (let i = 0; i < segments; i++) {
+    const a = (i / segments) * Math.PI * 2;
+    pts.push(new THREE.Vector3(Math.cos(a) * radius, 0, Math.sin(a) * radius));
+  }
+  return new THREE.BufferGeometry().setFromPoints(pts);
+}
+
+/** Cone + base-disc + forward pointer marker shared by spawn/summon. */
+function buildSpawnMarker(group, color) {
+  const mat = new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.85 });
+  const discMat = new THREE.MeshBasicMaterial({
+    color, transparent: true, opacity: 0.3, side: THREE.DoubleSide, depthWrite: false,
+  });
+
+  const disc = new THREE.Mesh(new THREE.CircleGeometry(0.35, 24), discMat);
+  disc.rotation.x = -Math.PI / 2;
+  disc.position.y = 0.01; // sit just above the ground plane to avoid z-fighting the grid
+  group.add(disc);
+
+  const cone = new THREE.Mesh(new THREE.ConeGeometry(0.22, 0.6, 12), mat);
+  cone.position.y = 0.3;
+  group.add(cone);
+
+  // Forward pointer: which way the spawned actor will FACE (-Z, the same
+  // "forward" convention as the exported camera). Rotating the entity
+  // with the gizmo swings this pointer.
+  const pointer = new THREE.Mesh(new THREE.BoxGeometry(0.06, 0.06, 0.5), mat.clone());
+  pointer.position.set(0, 0.1, -0.5);
+  group.add(pointer);
+}
+
+function buildEntityMeshes(group, kind, color, props) {
+  switch (kind) {
+    case 'trigger': {
+      // Unit cube - the entity's SCALE is the volume's size, so the
+      // regular scale gizmo resizes the trigger region directly.
+      const fill = new THREE.Mesh(
+        new THREE.BoxGeometry(1, 1, 1),
+        new THREE.MeshBasicMaterial({
+          color, transparent: true, opacity: 0.12, side: THREE.DoubleSide, depthWrite: false,
+        })
+      );
+      group.add(fill);
+      const edges = new THREE.LineSegments(
+        new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
+        new THREE.LineBasicMaterial({ color })
+      );
+      group.add(edges);
+      break;
+    }
+    case 'spawn':
+      buildSpawnMarker(group, color);
+      break;
+    case 'summon': {
+      buildSpawnMarker(group, color);
+      const ring = new THREE.LineLoop(
+        makeCircleGeometry(Math.max(0, props.patrolRadius || 0)),
+        new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.6 })
+      );
+      ring.name = 'patrolRing';
+      ring.position.y = 0.02;
+      group.add(ring);
+      break;
+    }
+    case 'particle': {
+      const core = new THREE.Mesh(
+        new THREE.OctahedronGeometry(0.22),
+        new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 })
+      );
+      core.position.y = 0.25;
+      group.add(core);
+      const halo = new THREE.Mesh(
+        new THREE.OctahedronGeometry(0.36),
+        new THREE.MeshBasicMaterial({ color, wireframe: true, transparent: true, opacity: 0.35 })
+      );
+      halo.position.y = 0.25;
+      group.add(halo);
+      break;
+    }
+    case 'billboard': {
+      const plane = new THREE.Mesh(
+        new THREE.PlaneGeometry(1.2, 0.8),
+        new THREE.MeshBasicMaterial({
+          color, transparent: true, opacity: 0.25, side: THREE.DoubleSide, depthWrite: false,
+        })
+      );
+      plane.position.y = 0.4;
+      group.add(plane);
+      const frame = new THREE.LineSegments(
+        new THREE.EdgesGeometry(new THREE.PlaneGeometry(1.2, 0.8)),
+        new THREE.LineBasicMaterial({ color })
+      );
+      frame.position.y = 0.4;
+      group.add(frame);
+      break;
+    }
+    default: {
+      const fallback = new THREE.Mesh(
+        new THREE.SphereGeometry(0.25, 12, 8),
+        new THREE.MeshBasicMaterial({ color })
+      );
+      group.add(fallback);
+    }
+  }
+}
+
+export function addEntityHelper(id, kind, initialTransform = {}, props = {}) {
+  const group = new THREE.Group();
+  const color = ENTITY_COLORS[kind] || 0xffffff;
+  buildEntityMeshes(group, kind, color, props);
+  scene.add(group);
+
+  const pos = { x: 0, y: 0, z: 0, ...(initialTransform.pos || {}) };
+  const rot = { x: 0, y: 0, z: 0, ...(initialTransform.rot || {}) };
+  const scaleV = { x: 1, y: 1, z: 1, ...(initialTransform.scale || {}) };
+  group.position.set(pos.x, pos.y, pos.z);
+  group.rotation.set(
+    THREE.MathUtils.degToRad(rot.x),
+    THREE.MathUtils.degToRad(rot.y),
+    THREE.MathUtils.degToRad(rot.z)
+  );
+  group.scale.set(scaleV.x, scaleV.y, scaleV.z);
+
+  // materialTimData/currentPaletteRow exist so shared instance-map code
+  // paths (palette refresh etc.) treat this entry as a harmless no-op.
+  instances.set(id, {
+    object3D: group,
+    modelName: `__entity__${kind}`,
+    materialTimData: new Map(),
+    currentPaletteRow: 0,
+    isEntity: true,
+    kind,
+    props: { ...props },
+  });
+  applyEntityPropsToMeshes(instances.get(id));
+  return group;
+}
+
+/** Push edited props into the live helper visuals: summon patrol ring
+ * radius, billboard draw-through-walls (depthTest off = renders on top,
+ * previewing exactly what the runtime flag means). */
+function applyEntityPropsToMeshes(inst) {
+  if (!inst || !inst.isEntity) return;
+
+  if (inst.kind === 'summon') {
+    const ring = inst.object3D.getObjectByName('patrolRing');
+    if (ring) {
+      ring.geometry.dispose();
+      ring.geometry = makeCircleGeometry(Math.max(0, inst.props.patrolRadius || 0));
+    }
+  }
+
+  if (inst.kind === 'billboard') {
+    const onTop = !!inst.props.seeThroughWalls;
+    inst.object3D.traverse((child) => {
+      if (child.material) {
+        child.material.depthTest = !onTop;
+        child.material.needsUpdate = true;
+      }
+    });
+    // renderOrder puts it after everything else when depth-testing is off,
+    // so "through walls" reads correctly instead of depending on draw order.
+    inst.object3D.traverse((child) => { child.renderOrder = onTop ? 999 : 0; });
+  }
+}
+
+export function updateEntityProps(id, props) {
+  const inst = instances.get(id);
+  if (!inst || !inst.isEntity) return;
+  inst.props = { ...props };
+  applyEntityPropsToMeshes(inst);
+}
+
 /**
  * Returns an array of every instance id currently tracked/rendered in the
  * viewport. Used by app.js's resyncViewportFromState() (see its own
@@ -926,13 +1344,18 @@ export function removeInstance(id) {
   }
 
   scene.remove(inst.object3D);
+  // Dispose anything carrying GPU resources - meshes AND line objects
+  // (entity helpers are built from LineSegments/LineLoop as well as
+  // meshes; checking only isMesh would leak their geometries).
   inst.object3D.traverse((child) => {
-    if (!child.isMesh) return;
+    if (!child.geometry && !child.material) return;
     if (child.geometry) child.geometry.dispose();
-    const mats = Array.isArray(child.material) ? child.material : [child.material];
-    for (const mat of mats) {
-      if (mat.map) mat.map.dispose();
-      mat.dispose();
+    if (child.material) {
+      const mats = Array.isArray(child.material) ? child.material : [child.material];
+      for (const mat of mats) {
+        if (mat.map) mat.map.dispose();
+        mat.dispose();
+      }
     }
   });
 
@@ -963,8 +1386,21 @@ export function selectCameraGizmo() {
   currentTransformTarget = CAMERA_GIZMO_ID;
 }
 
+// Notifies app.js whenever the transform mode changes, from ANY entry
+// point. Needed because mode changes have two sources: the toolbar
+// buttons (app.js) and the W/E/R shortcuts (owned here, see initViewer).
+// Before this hook existed, W/E/R switched the gizmo but left the old
+// sidebar buttons highlighting a stale mode; now both routes funnel
+// through setTransformMode() and app.js re-renders off this callback.
+let transformModeCallback = null;
+
+export function onTransformModeChange(callback) {
+  transformModeCallback = callback;
+}
+
 export function setTransformMode(mode) {
   transformControls.setMode(mode);
+  if (transformModeCallback) transformModeCallback(mode);
 }
 
 export function getInstanceTransform(id) {
@@ -1316,6 +1752,7 @@ function collectWalkableMeshes() {
   if (walkableMeshCache) return walkableMeshCache;
   const meshes = [];
   for (const inst of instances.values()) {
+    if (inst.isEntity) continue; // marker gizmos are not walkable geometry - you'd stand on a spawn cone
     inst.object3D.traverse((child) => {
       if (child.isMesh) meshes.push(child);
     });

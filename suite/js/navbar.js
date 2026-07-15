@@ -36,7 +36,7 @@
       <nav class="site-nav" aria-label="Site">
         <a class="site-nav__brand" href="/index.html">
           <span class="site-nav__brand-mark" aria-hidden="true">&#9635;</span>
-          <span class="site-nav__brand-text">bit&#8202;/&#8202;depth<span class="site-nav__brand-dim">.tools</span></span>
+          <span class="site-nav__brand-text">ps1renderer&#8202;/&#8202;Suite of<span class="site-nav__brand-dim"> Tools</span></span>
         </a>
         <div class="site-nav__links">${linksHtml}</div>
       </nav>

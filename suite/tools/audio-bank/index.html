@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Audio Bank — ps1renderer / Suite of Tools</title>
+  <link rel="stylesheet" href="../../css/site.css" />
+  <link rel="stylesheet" href="css/tool.css" />
+</head>
+<body data-nav-key="audio">
+  <div id="site-navbar"></div>
+
+  <div class="workbench">
+    <!-- ============================= LEFT RAIL ============================= -->
+    <aside class="rail">
+
+      <div class="rail__section">
+        <p class="rail__label">Source audio</p>
+        <label class="dropzone" id="dropzone" for="file-input">
+          <div class="dropzone__icon">&#8593;</div>
+          <div class="dropzone__text">Drop a .wav, or click to browse</div>
+          <div class="dropzone__hint">PCM 8/16/24/32-bit &middot; float &middot; mono or stereo</div>
+          <input type="file" id="file-input" accept="audio/wav,.wav" />
+        </label>
+        <div class="file-chip" id="file-chip" hidden>
+          <span class="file-chip__name" id="file-chip-name"></span>
+          <span class="file-chip__dims" id="file-chip-dims"></span>
+        </div>
+      </div>
+
+      <div class="rail__section">
+        <p class="rail__label">Target sample rate</p>
+        <div class="segmented segmented--rate" id="rate-selector">
+          <div class="segmented__option" data-rate="44100">44.1k<span class="segmented__option-sub">native</span></div>
+          <div class="segmented__option" data-rate="32000">32k<span class="segmented__option-sub">-27%</span></div>
+          <div class="segmented__option is-active" data-rate="22050">22k<span class="segmented__option-sub">half</span></div>
+          <div class="segmented__option" data-rate="16000">16k<span class="segmented__option-sub">-64%</span></div>
+          <div class="segmented__option" data-rate="11025">11k<span class="segmented__option-sub">quarter</span></div>
+          <div class="segmented__option" data-rate="8000">8k<span class="segmented__option-sub">phone</span></div>
+          <div class="segmented__option" data-rate="4000">4k<span class="segmented__option-sub">rough</span></div>
+          <div class="segmented__option" data-rate="2000">2k<span class="segmented__option-sub">lo-fi</span></div>
+          <div class="segmented__option" data-rate="1000">1k<span class="segmented__option-sub">gnarly</span></div>
+        </div>
+        <p class="rail__note">RAM &amp; file size scale linearly with rate — the primary quality/size lever.</p>
+      </div>
+
+      <div class="rail__section">
+        <p class="rail__label">Resampler</p>
+        <div class="dither-options" id="resampler-options">
+          <div class="dither-option is-active" data-quality="sinc">
+            <span class="dither-option__dot"></span> Windowed-sinc <span class="opt-tag">recommended</span>
+          </div>
+          <div class="dither-option" data-quality="linear">
+            <span class="dither-option__dot"></span> Linear <span class="opt-tag opt-tag--muted">fast / aliases</span>
+          </div>
+        </div>
+        <div class="slider-row" style="margin-top: 12px;">
+          <div class="slider-row__head">
+            <span>Anti-alias cutoff</span>
+            <span class="slider-row__value" id="cutoff-value">90%</span>
+          </div>
+          <input type="range" id="cutoff" min="50" max="100" value="90" step="1" />
+          <p class="rail__note">Fraction of the new Nyquist. Lower = softer, cuts what ADPCM quantizes worst.</p>
+        </div>
+      </div>
+
+      <div class="rail__section">
+        <p class="rail__label">Encoder effort</p>
+        <div class="segmented" id="effort-selector">
+          <div class="segmented__option is-active" data-effort="fast">Fast<span class="segmented__option-sub">shift &plusmn;1</span></div>
+          <div class="segmented__option" data-effort="exhaustive">Exhaustive<span class="segmented__option-sub">all shifts</span></div>
+        </div>
+        <p class="rail__note">Both brute-force all 5 filters with decoder-accurate feedback. Exhaustive widens the shift search.</p>
+      </div>
+
+      <div class="rail__section">
+        <p class="rail__label">Looping</p>
+        <div class="dither-options" id="loop-options">
+          <div class="dither-option is-active" data-loop="off">
+            <span class="dither-option__dot"></span> One-shot <span class="opt-tag opt-tag--muted">+ terminator</span>
+          </div>
+          <div class="dither-option" data-loop="on">
+            <span class="dither-option__dot"></span> Looped <span class="opt-tag opt-tag--muted">sustain</span>
+          </div>
+        </div>
+        <div class="slider-row" id="loop-start-row" style="margin-top: 12px;" hidden>
+          <div class="slider-row__head">
+            <span>Loop start</span>
+            <span class="slider-row__value" id="loop-start-value">0</span>
+          </div>
+          <input type="range" id="loop-start" min="0" max="100" value="0" step="1" />
+          <p class="rail__note">Snaps to a 28-sample block boundary. WAV smpl loops auto-fill this.</p>
+        </div>
+      </div>
+
+      <div class="rail__section">
+        <p class="rail__label">VAG name</p>
+        <input type="text" id="vag-name" class="text-input" maxlength="15" placeholder="SAMPLE" />
+      </div>
+
+    </aside>
+
+    <!-- ============================= RIGHT: STAGE ============================= -->
+    <main class="stage" id="stage">
+      <div class="stage__empty" id="stage-empty">
+        <div class="stage__empty-icon">&#9835;</div>
+        Drop a WAV on the left to get started
+      </div>
+
+      <div class="scope" id="scope" hidden>
+        <div class="scope__panel">
+          <div class="scope__label">Source <span id="scope-src-rate"></span></div>
+          <canvas class="scope__canvas" id="wave-source" width="900" height="130"></canvas>
+        </div>
+        <div class="scope__panel">
+          <div class="scope__label">PS1 SPU-ADPCM decode <span id="scope-out-rate"></span></div>
+          <canvas class="scope__canvas" id="wave-output" width="900" height="130"></canvas>
+        </div>
+
+        <div class="ab" id="ab">
+          <button class="ab__btn" id="play-source"><span class="ab__ico">&#9658;</span> Source</button>
+          <button class="ab__btn ab__btn--accent" id="play-output"><span class="ab__ico">&#9658;</span> PS1 result</button>
+          <button class="ab__btn ab__btn--stop" id="play-stop"><span class="ab__ico">&#9632;</span> Stop</button>
+        </div>
+
+        <div class="stats" id="stats"></div>
+      </div>
+    </main>
+  </div>
+
+  <!-- ============================= TRANSPORT BAR ============================= -->
+  <div class="transport">
+    <div class="transport__group">
+      <button class="btn btn--export" id="btn-export-vag" disabled>Export .VAG</button>
+    </div>
+    <div class="transport__status" id="transport-status">No audio loaded</div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script src="../../js/navbar.js"></script>
+  <script src="js/wav.js"></script>
+  <script src="js/resample.js"></script>
+  <script src="js/adpcm.js"></script>
+  <script src="js/vag.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

@@ -1,10 +1,11 @@
 /*
  * tool.css - scene-gen
  *
- * Mirrors palette-maker's tool.css conventions: a 280px sidebar + 1fr main
- * "workbench" grid, panel sections styled with the shared site.css CSS
- * variables (--panel, --border, --radius-md, etc.), and a fixed-height
- * transport footer for Load/Save/Export actions.
+ * Roblox Studio-style fixed-panel layout: a horizontal ribbon toolbar at
+ * the top (file / transform-mode / snapping / view groups), a left dock
+ * with .NET-style tab buttons (Assets | Instances | VRAM), the 3D
+ * viewport as the flexible middle column, and a full-height Properties
+ * dock on the right (selected-instance transform + scene camera).
  *
  * IMPORTANT: this file intentionally does NOT define --panel, --border,
  * --radius-md, --radius-sm, --text, --text-dim, --text-faint, --accent,
@@ -24,65 +25,167 @@ body {
   min-height: 100vh;
 }
 
-/* ---------- Workbench layout ---------- */
+/* ---------- Ribbon toolbar ---------- */
 
-/* Three columns: left sidebar (Assets/Instances/Camera - the scene-
-   authoring data), the viewport (always the flexible middle column), and
-   a right sidebar (Transform Mode + Viewport View - controls for how
-   you're currently LOOKING at/manipulating the scene, kept visually
-   separate from what's actually IN the scene). */
-.workbench {
-  display: grid;
-  grid-template-columns: 280px 1fr 240px;
-  flex: 1 1 auto;
-  min-height: 0;
-}
-
-.sidebar {
-  background: var(--panel);
-  overflow-y: auto;
-  padding: 12px;
+.toolbar {
+  flex: 0 0 auto;
   display: flex;
-  flex-direction: column;
-  gap: 12px;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  padding: 6px 10px;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
 }
 
-.sidebar:not(.sidebar--right) {
-  border-right: 1px solid var(--border);
+.toolbar-group {
+  display: flex;
+  align-items: center;
+  gap: 4px;
 }
 
-.sidebar--right {
-  border-left: 1px solid var(--border);
+.toolbar-sep {
+  width: 1px;
+  align-self: stretch;
+  margin: 2px 4px;
+  background: var(--border);
 }
 
-.panel {
+/* Pushes the trailing group (help "?") to the far right. */
+.toolbar-spacer {
+  flex: 1 1 auto;
+}
+
+.tb-btn {
+  padding: 5px 10px;
+  font-size: 12px;
+}
+
+/* Labeled inline field in the toolbar (e.g. "Snap [1.0]"). */
+.tb-field {
+  display: flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.tb-field input {
+  width: 56px;
+  background: var(--panel-raised);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  padding: 4px 6px;
+  font-size: 12px;
+}
+
+.tb-field input:focus {
+  outline: none;
+  border-color: var(--accent);
+}
+
+.tb-check {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  font-size: 11px;
+  color: var(--text-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+  cursor: pointer;
+  user-select: none;
+  padding: 0 4px;
+}
+
+.tb-check input[type="checkbox"] {
+  accent-color: var(--accent);
+  cursor: pointer;
+  margin: 0;
+}
+
+/* ---------- Shortcuts popover (toolbar "?") ---------- */
+
+.shortcuts-popover {
+  position: fixed;
+  top: 96px; /* nudged below navbar + toolbar; fine-tuned by app.js */
+  right: 12px;
+  z-index: 900; /* under toasts (1000) and modals (1100) */
+  width: 320px;
+  max-height: 70vh;
+  overflow-y: auto;
   background: var(--panel-raised);
   border: 1px solid var(--border);
   border-radius: var(--radius-md);
-  padding: 12px;
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.5);
+  padding: 12px 14px;
 }
 
-.panel-title {
+.shortcuts-popover h3 {
+  margin: 0 0 8px;
   font-family: var(--font-display);
-  font-size: 13px;
+  font-size: 12px;
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--text-dim);
-  margin: 0 0 10px 0;
 }
 
-.panel-subtitle {
-  font-size: 12px;
-  color: var(--text-faint);
-  margin: 12px 0 6px 0;
-  text-transform: uppercase;
-  letter-spacing: 0.04em;
+.shortcuts-popover h3 + h3,
+.shortcuts-popover dl + h3 {
+  margin-top: 12px;
+}
+
+.shortcuts-popover dl {
+  display: grid;
+  grid-template-columns: auto 1fr;
+  gap: 4px 10px;
+  margin: 0;
+  font-size: 11px;
+}
+
+.shortcuts-popover dt {
+  color: var(--accent);
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.shortcuts-popover dd {
+  margin: 0;
+  color: var(--text-dim);
+  line-height: 1.4;
+}
+
+.shortcuts-popover p {
+  margin: 0;
+  font-size: 11px;
+  color: var(--text-dim);
+  line-height: 1.5;
+}
+
+/* ---------- Workbench layout ---------- */
+
+/* Three columns: left tab dock (scene-authoring data), the viewport
+   (always the flexible middle column), and the right Properties dock. */
+.workbench {
+  display: grid;
+  grid-template-columns: 280px 1fr 280px;
+  flex: 1 1 auto;
+  min-height: 0;
 }
 
 .main {
   position: relative;
   min-width: 0;
   min-height: 0;
+}
+
+/* Lit up while an asset from the Assets tab is dragged over the viewport
+   (drop spawns an instance at the cursor's surface point). */
+.main.is-drop-target {
+  outline: 2px dashed var(--accent);
+  outline-offset: -2px;
 }
 
 #viewport-canvas {
@@ -104,6 +207,161 @@ body {
   width: 90px;
   height: 90px;
   cursor: pointer;
+}
+
+/* ---------- Docks + tab strips (.NET-style) ---------- */
+
+.dock {
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+  background: var(--panel);
+}
+
+.dock--left {
+  border-right: 1px solid var(--border);
+}
+
+.dock--right {
+  border-left: 1px solid var(--border);
+}
+
+.dock-tabs {
+  flex: 0 0 auto;
+  display: flex;
+  background: var(--panel);
+  border-bottom: 1px solid var(--border);
+}
+
+/* Tab buttons: flat strip, active tab gets the raised page background and
+   an accent underline "attaching" it to its page, WinForms/VS style. */
+.dock-tab {
+  flex: 1 1 0;
+  appearance: none;
+  background: transparent;
+  border: none;
+  border-right: 1px solid var(--border);
+  border-bottom: 2px solid transparent;
+  padding: 8px 6px;
+  font-family: var(--font-display);
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+  cursor: pointer;
+  transition: color 0.12s ease, background-color 0.12s ease;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.dock-tab:last-child {
+  border-right: none;
+}
+
+.dock-tab:hover {
+  color: var(--text);
+}
+
+.dock-tab.is-active {
+  background: var(--panel-raised);
+  color: var(--text);
+  border-bottom-color: var(--accent);
+}
+
+.dock-pages {
+  flex: 1 1 auto;
+  min-height: 0;
+  overflow-y: auto;
+  background: var(--panel-raised);
+}
+
+.dock-page {
+  padding: 12px;
+}
+
+.panel-subtitle {
+  font-size: 12px;
+  color: var(--text-faint);
+  margin: 12px 0 6px 0;
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+/* ---------- Properties dock sections ---------- */
+
+/* Shown in the Properties dock while nothing is selected. */
+.props-placeholder {
+  font-size: 11px;
+  color: var(--text-faint);
+  line-height: 1.6;
+  margin: 4px 2px 12px;
+}
+
+/* "modelname #id" header above the selected instance's sections. */
+.props-target {
+  margin: 0 0 8px;
+  font-size: 12px;
+  color: var(--accent);
+  font-family: var(--font-display);
+  letter-spacing: 0.03em;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.props-section {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  background: var(--panel);
+  margin-bottom: 8px;
+}
+
+.props-section summary {
+  list-style: none;
+  cursor: pointer;
+  user-select: none;
+  padding: 7px 10px;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-dim);
+  transition: color 0.12s ease;
+}
+
+.props-section summary::-webkit-details-marker {
+  display: none;
+}
+
+/* Collapse chevron, rotates when the section is open. */
+.props-section summary::before {
+  content: '\25B8'; /* ▸ */
+  display: inline-block;
+  margin-right: 6px;
+  color: var(--text-faint);
+  transition: transform 0.12s ease;
+}
+
+.props-section[open] > summary::before {
+  transform: rotate(90deg);
+}
+
+.props-section summary:hover {
+  color: var(--text);
+}
+
+.props-body {
+  padding: 4px 10px 10px;
+  border-top: 1px solid var(--border);
+}
+
+.props-group-label {
+  display: block;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  color: var(--text-faint);
+  margin: 6px 0 3px;
 }
 
 /* ---------- Buttons ---------- */
@@ -138,15 +396,6 @@ body {
 .btn-accent {
   border-color: var(--accent);
   color: var(--accent);
-}
-
-.mode-buttons {
-  display: flex;
-  gap: 6px;
-}
-
-.mode-buttons .btn {
-  flex: 1 1 0;
 }
 
 .btn.is-active {
@@ -193,6 +442,18 @@ body {
   color: var(--text-faint);
 }
 
+/* Action button row at the top of a dock page (Instances tab's New
+   Folder button; buttons share the width equally if more are added). */
+.tab-actions {
+  display: flex;
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
+.tab-actions .btn {
+  flex: 1 1 0;
+}
+
 /* ---------- Lists ---------- */
 
 .item-list {
@@ -234,24 +495,142 @@ body {
   white-space: nowrap;
 }
 
-.item-list li .item-actions {
-  display: flex;
-  gap: 4px;
+/* Asset rows are drag-sources for viewport placement - signal it. */
+#model-list li {
+  cursor: grab;
 }
 
-.item-list li .item-actions button {
-  font-size: 11px;
-  padding: 2px 6px;
-  background: var(--panel-raised);
+/* "New Folder" stands apart from ordinary buttons: accent-tinted fill +
+   accent border, so the organizing action doesn't blend into the row of
+   plain controls around it. */
+.btn-folder {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, transparent);
+  font-weight: 600;
+}
+
+.btn-folder:hover:not(:disabled) {
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+}
+
+/* ---------- Insert-object menu (editor entities) ---------- */
+
+/* Accordion-style panel that opens between the action buttons and the
+   tree (in-flow, not an overlay - the dock scrolls, and an absolutely
+   positioned popover would clip against .dock-pages' overflow). */
+.insert-menu {
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
+  background: var(--panel);
+  margin-bottom: 8px;
+  overflow: hidden;
+}
+
+.insert-menu-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 8px 10px;
+  background: transparent;
+  border: none;
+  border-bottom: 1px solid var(--border);
+  cursor: pointer;
+  text-align: left;
+}
+
+.insert-menu-item:last-child {
+  border-bottom: none;
+}
+
+.insert-menu-item:hover {
+  background: var(--panel-raised);
+}
+
+.insert-menu-text {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+
+.insert-menu-label {
+  font-size: 12px;
+  color: var(--text);
+}
+
+.insert-menu-hint {
+  font-size: 10px;
+  color: var(--text-faint);
+}
+
+/* Colored kind dot, shared by insert-menu rows and tree entity rows.
+   Color set inline from ENTITY_KINDS (scene_state.js). */
+.entity-dot {
+  flex: 0 0 auto;
+  font-size: 9px;
+  line-height: 1;
+}
+
+/* ---------- Instance tree (folders + instances, see renderInstanceList) ---------- */
+
+/* Rows use the base .item-list li styles; the tree adds per-depth left
+   padding inline (app.js) plus these bits. justify-content is overridden
+   back to flex-start so chevron/name/count pack left and indentation
+   reads as hierarchy. */
+.item-list li.tree-folder,
+.item-list li.tree-instance {
+  justify-content: flex-start;
+}
+
+.tree-chevron {
+  flex: 0 0 auto;
+  appearance: none;
+  background: none;
+  border: none;
+  padding: 0 2px;
+  font-size: 10px;
+  line-height: 1;
   color: var(--text-dim);
   cursor: pointer;
 }
 
-.item-list li .item-actions button:hover {
-  border-color: var(--accent);
+.tree-chevron:hover {
   color: var(--accent);
+}
+
+.tree-folder-name {
+  font-weight: 600;
+}
+
+/* Per-folder instance count (recursive), right-aligned on the row. */
+.tree-count {
+  flex: 0 0 auto;
+  margin-left: auto;
+  font-size: 10px;
+  color: var(--text-faint);
+  font-variant-numeric: tabular-nums;
+}
+
+/* Row currently hovered as a valid drag-drop target. */
+.item-list li.drop-target {
+  border-color: var(--accent);
+  background: var(--panel-raised);
+  box-shadow: inset 0 0 0 1px var(--accent);
+}
+
+/* Inline rename editor (double-click a row; see startRename in app.js). */
+.rename-input {
+  flex: 1 1 auto;
+  min-width: 0;
+  background: var(--panel-raised);
+  border: 1px solid var(--accent);
+  border-radius: var(--radius-sm);
+  color: var(--text);
+  font-size: 12px;
+  padding: 2px 4px;
+  outline: none;
 }
 
 /* ---------- Numeric field grids ---------- */
@@ -288,6 +667,14 @@ body {
   box-sizing: border-box;
 }
 
+/* Inside the Properties dock the sections themselves sit on --panel, so
+   inputs step down to the page background for contrast instead of
+   disappearing into their parent. */
+.props-body .field-grid3 input,
+.props-body .field-full input {
+  background: var(--panel-raised);
+}
+
 .field-grid3 input:focus,
 .field-full input:focus {
   outline: none;
@@ -298,23 +685,6 @@ body {
 .field-warning {
   border-color: #d9534f !important;
   box-shadow: 0 0 0 1px rgba(217, 83, 79, 0.4);
-}
-
-/* ---------- Transport footer ---------- */
-
-.transport {
-  height: 52px;
-  flex: 0 0 52px;
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 0 12px;
-  background: var(--panel);
-  border-top: 1px solid var(--border);
-}
-
-.transport .btn {
-  margin-bottom: 0;
 }
 
 /* ---------- Toasts (replaces alert() for non-blocking messages) ---------- */
@@ -400,22 +770,10 @@ body {
 /* ---------- Responsive ---------- */
 
 @media (max-width: 1200px) {
-  /* Right sidebar collapses first (fewer, less essential controls) before
-     the two-column breakpoint below removes the grid entirely. */
+  /* Both docks narrow before the single-column breakpoint below removes
+     the grid entirely. */
   .workbench {
-    grid-template-columns: 280px 1fr;
-  }
-
-  .sidebar--right {
-    grid-column: 1 / -1;
-    border-left: none;
-    border-top: 1px solid var(--border);
-    flex-direction: row;
-    max-height: none;
-  }
-
-  .sidebar--right .panel {
-    flex: 1 1 0;
+    grid-template-columns: 240px 1fr 240px;
   }
 }
 
@@ -425,14 +783,16 @@ body {
     grid-template-rows: auto 1fr auto;
   }
 
-  .sidebar:not(.sidebar--right) {
+  .dock--left {
     border-right: none;
     border-bottom: 1px solid var(--border);
-    max-height: 45vh;
+    max-height: 40vh;
   }
 
-  .sidebar--right {
-    flex-direction: column;
+  .dock--right {
+    border-left: none;
+    border-top: 1px solid var(--border);
+    max-height: 40vh;
   }
 }
 
@@ -457,7 +817,7 @@ body {
   user-select: none;
 }
 
-/* ---------- VRAM panel ---------- */
+/* ---------- VRAM tab ---------- */
 
 .vram-row {
   display: flex;
@@ -480,7 +840,7 @@ body {
 
 .vram-bar {
   height: 6px;
-  background: var(--panel-raised);
+  background: var(--panel);
   border: 1px solid var(--border);
   border-radius: 3px;
   overflow: hidden;

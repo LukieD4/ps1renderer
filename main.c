@@ -30,7 +30,7 @@
  *   per triangle corner - instead of re-running the GTE's triple
  *   transform (gte_rtpt) for every triangle a vertex appears in
  * - Per-object frustum culling (object_is_culled()): projects each
- *   object's own bounding sphere (center + two radius-offset edge
+ *   object's own bounding sphere (centre + two radius-offset edge
  *   points) through its real composed matrix and rejects it before
  *   touching any of its triangles if it's behind the near plane or
  *   entirely outside the 320x240 screen bounds
@@ -123,7 +123,7 @@ static unsigned int textureTableCount = 0;
 
 
 // ============================================================
-// COORDINATE SYSTEM - FINALIZED (v4, verified via arrow.obj dual-tip test)
+// COORDINATE SYSTEM - FINALISED (v4, verified via arrow.obj dual-tip test)
 // ============================================================
 // Source assets are authored in Blender, exported with Forward=-Z, Up=Y.
 // The converter (py_convert_assets.py, get_split_vertex()) remaps every
@@ -166,7 +166,7 @@ int fov_speed = 10;
 #define MAX_MODEL_VERTS 512
 
 // Maximum number of triangles we cache for sorting/lighting, PER MODEL.
-#define MAX_MODEL_TRIS 256
+#define MAX_MODEL_TRIS 512//256
 
 // Ceiling on how many distinct models (modelRegistry[] entries) get their
 // own triangle/texture cache built at load time - see
@@ -352,7 +352,7 @@ static uint32_t transformedScreenSZ[MAX_MODEL_VERTS];
 // [modelRegistry index][triangle index]. Filled once at startup (not
 // per-frame) by build_triangle_texture_cache(): resolves
 // materialNames[tri->material] against textureTable[] by name, or NULL
-// if that material has no texture (flat-color materials fall back to
+// if that material has no texture (flat-colour materials fall back to
 // flat/Gouraud instead of forcing POLY_FT3).
 static MODEL_TEXTURE *modelTriTextureCache[MAX_MODELS][MAX_MODEL_TRIS];
 
@@ -408,8 +408,8 @@ void load_textures(void)
         LoadImage(slot->tim.prect, slot->tim.paddr);
 
         // Upload CLUT data to VRAM ONE ROW AT A TIME rather than as a
-        // single N-row block. 4-bit TIMs always carry a CLUT (16 colors);
-        // this would be skipped for a 24-bit direct-color TIM, but we're
+        // single N-row block. 4-bit TIMs always carry a CLUT (16 colours);
+        // this would be skipped for a 24-bit direct-colour TIM, but we're
         // 4-bit here so crect/caddr are always set for every entry in
         // this blob.
         //
@@ -431,8 +431,8 @@ void load_textures(void)
             {
                 clutRow.y = slot->tim.crect->y + row;
 
-                // caddr is a uint32_t* (2 packed 16-bit colors per word);
-                // each 16-color row is 32 bytes = 8 words, so row k's
+                // caddr is a uint32_t* (2 packed 16-bit colours per word);
+                // each 16-colour row is 32 bytes = 8 words, so row k's
                 // data starts 8*k words into caddr.
                 LoadImage(&clutRow, slot->tim.caddr + (row * 8));
             }
@@ -582,7 +582,7 @@ void init(void)
     SetDefDrawEnv(&draw[0], 0, 240, DISPLAY_W, DISPLAY_H);
     SetDefDrawEnv(&draw[1], 0,   0, DISPLAY_W, DISPLAY_H);
 
-    // Set and enable clear color (green background)
+    // Set and enable clear colour (green background)
     setRGB0(&draw[0], 0, 96, 0);
     setRGB0(&draw[1], 0, 96, 0);
     draw[0].isbg = 1;
@@ -658,7 +658,7 @@ uint8_t use_vertex_light = 1;
 // textured path for a triangle when BOTH use_texture is on AND that
 // triangle's resolved MODEL_TEXTURE is non-NULL (i.e. its material
 // actually has a texture in the blob). A triangle whose material has no
-// texture (flat-color materials) always falls back to flat/Gouraud
+// texture (flat-colour materials) always falls back to flat/Gouraud
 // regardless of this flag - see draw_object_into_ot()'s per-triangle
 // branch below.
 uint8_t use_texture = 0;
@@ -958,7 +958,7 @@ void transform_object_vertices(const MODEL_DEF *model)
 }
 
 
-// Projects this model's bounding sphere (center + two radius-offset edge
+// Projects this model's bounding sphere (centre + two radius-offset edge
 // points along model-space X/Y) through composed_matrix - which MUST
 // already be current for this object (call right after
 // update_object_world_and_compose() for the SAME object) - and rejects
@@ -970,7 +970,7 @@ void transform_object_vertices(const MODEL_DEF *model)
 // Returns nonzero if the object should be skipped entirely.
 int object_is_culled(const MODEL_DEF *model)
 {
-    // Two points offset from the bounding-sphere center by its own
+    // Two points offset from the bounding-sphere centre by its own
     // radius along model-space X and Y - bsphereCenter/bsphereRadius are
     // in the same fixed-point space as modelVerts, so this is a plain
     // integer add. Cast to short since SVECTOR fields are 16-bit; a
@@ -1005,7 +1005,7 @@ int object_is_culled(const MODEL_DEF *model)
     gte_stsxy3(&sxy[0], &sxy[1], &sxy[2]);
 
     // Approximate on-screen radius as the larger of the two edge points'
-    // screen-space offset from center (not exact under perspective, so a
+    // screen-space offset from centre (not exact under perspective, so a
     // flat safety margin is added). Deliberately conservative: under-
     // culling wastes a little work, over-culling is a visible bug.
     int screenRadiusX = sxy[1].vx - sxy[0].vx;
@@ -1128,10 +1128,10 @@ void draw_object_into_ot(const MODEL_DEF *model, MODEL_TEXTURE **triTextureCache
             if (brightness > 255)
                 brightness = 255;
 
-            // RGB here MODULATES the texture's own sampled color (GPU
-            // multiplies texel color by this RGB) rather than replacing
+            // RGB here MODULATES the texture's own sampled colour (GPU
+            // multiplies texel colour by this RGB) rather than replacing
             // it - same brightness value as the flat path, just applied
-            // as a tint instead of a literal fill color.
+            // as a tint instead of a literal fill colour.
             setRGB0(pol, brightness, brightness, brightness);
 
             setXY3(
@@ -1153,7 +1153,7 @@ void draw_object_into_ot(const MODEL_DEF *model, MODEL_TEXTURE **triTextureCache
 
             // TPAGE/CLUT resolved once at texture-load time (in
             // load_textures(), stored in tex->tim), not recomputed per-
-            // triangle-per-frame - tex->tim.mode is the color-depth bits
+            // triangle-per-frame - tex->tim.mode is the colour-depth bits
             // GetTimInfo() already decoded from that texture's TIM header.
             setTPage(pol, tex->tim.mode & 0x3, 0, tex->tim.prect->x, tex->tim.prect->y);
 
@@ -1180,7 +1180,7 @@ void draw_object_into_ot(const MODEL_DEF *model, MODEL_TEXTURE **triTextureCache
             // transformedVertNormals via this triangle's own vertex
             // indices (tri->v0/v1/v2 - same indices used to load
             // positions above). The GPU interpolates between these 3
-            // colors across the triangle face in hardware.
+            // colours across the triangle face in hardware.
             POLY_G3 *pol = (POLY_G3 *)nextpri;
             setPolyG3(pol);
 
@@ -1217,7 +1217,7 @@ void draw_object_into_ot(const MODEL_DEF *model, MODEL_TEXTURE **triTextureCache
         }
         else
         {
-            // Flat path: one color per triangle, from the precomputed,
+            // Flat path: one colour per triangle, from the precomputed,
             // GTE-rotated face normal built in rotate_object_normals().
             POLY_F3 *pol = (POLY_F3 *)nextpri;
             setPolyF3(pol);

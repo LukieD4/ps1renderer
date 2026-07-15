@@ -1,6 +1,12 @@
 #
 build/
 generated/
+suite - Copy/
+idea/
+
+*.blend
+*.blend1
+*.wav
 
 # Prerequisites
 *.d

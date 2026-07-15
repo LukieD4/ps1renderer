@@ -22,107 +22,178 @@
 <body>
   <div id="site-navbar"></div>
 
+  <!-- ======================================================================
+       Ribbon toolbar (Roblox Studio-style): everything that ACTS on the
+       scene or the viewport lives here in labeled groups - file actions,
+       gizmo mode, snapping, and view controls - instead of being scattered
+       across side panels. All ids are unchanged from the old layout so
+       app.js/viewer.js wiring is untouched by the restructure.
+       ================================================================== -->
+  <div class="toolbar">
+    <div class="toolbar-group" aria-label="File">
+      <button id="btn-load-project" class="btn tb-btn" title="Load a .SceneGen project">Load</button>
+      <button id="btn-save-project" class="btn tb-btn" title="Save project (Ctrl+S)">Save</button>
+      <button id="btn-export-scene" class="btn tb-btn btn-accent" title="Export scene.json for the PS1 runtime" disabled>Export</button>
+      <input type="file" id="file-load-project" accept=".SceneGen" class="hidden">
+    </div>
+
+    <div class="toolbar-sep"></div>
+
+    <div class="toolbar-group" aria-label="Transform mode">
+      <button id="mode-translate" class="btn tb-btn is-active" data-mode="translate" title="Translate (W)">Move</button>
+      <button id="mode-rotate" class="btn tb-btn" data-mode="rotate" title="Rotate (E)">Rotate</button>
+      <button id="mode-scale" class="btn tb-btn" data-mode="scale" title="Scale (R)">Scale</button>
+    </div>
+
+    <div class="toolbar-sep"></div>
+
+    <div class="toolbar-group" aria-label="Snapping">
+      <label class="tb-field" title="Grid snap increment - hold Ctrl while dragging to snap">
+        <span>Snap</span>
+        <input type="number" step="0.1" min="0.1" value="1" id="f-snap-increment">
+      </label>
+      <label class="tb-check" title="Seam snap: snap translate drags flush against neighboring instances">
+        <input type="checkbox" id="f-seam-snap">
+        <span>Seam</span>
+      </label>
+    </div>
+
+    <div class="toolbar-sep"></div>
+
+    <div class="toolbar-group" aria-label="View">
+      <button id="view-front" class="btn tb-btn" title="Front view (Numpad 1)">Front</button>
+      <button id="view-top" class="btn tb-btn" title="Top view (Numpad 7)">Top</button>
+      <button id="view-side" class="btn tb-btn" title="Side view (Numpad 3)">Side</button>
+      <button id="view-reset" class="btn tb-btn" title="Reset the orbit camera">Reset</button>
+      <button id="view-grid" class="btn tb-btn" title="Toggle grid (G)">Grid</button>
+    </div>
+
+    <div class="toolbar-spacer"></div>
+
+    <div class="toolbar-group" aria-label="Help">
+      <button id="btn-shortcuts" class="btn tb-btn" title="Keyboard shortcuts &amp; viewport help">?</button>
+    </div>
+  </div>
+
+  <!-- Shortcuts / viewport help popover, toggled by the "?" toolbar button.
+       Replaces the hint-text paragraphs that used to pad out the old right
+       sidebar; the reference material is one click away instead of
+       permanently occupying panel space. -->
+  <div id="shortcuts-popover" class="shortcuts-popover hidden">
+    <h3>Shortcuts</h3>
+    <dl>
+      <dt>W / E / R</dt><dd>Translate / Rotate / Scale</dd>
+      <dt>Ctrl+drag</dt><dd>Snap to grid (increment set in toolbar)</dd>
+      <dt>Ctrl+Z / Ctrl+Y</dt><dd>Undo / Redo</dd>
+      <dt>Ctrl+D</dt><dd>Duplicate selected instance</dd>
+      <dt>Del</dt><dd>Delete selected instance or folder (with its contents)</dd>
+      <dt>Dbl-click</dt><dd>Rename an instance or folder in the Instances tree</dd>
+      <dt>Ctrl+S</dt><dd>Save project</dd>
+      <dt>.</dt><dd>Frame selected</dd>
+      <dt>G</dt><dd>Toggle grid</dd>
+      <dt>F</dt><dd>Toggle Freecam (WASD + mouse-look). Space toggles Walk mode (gravity + ground snap). Esc exits.</dd>
+    </dl>
+    <h3>Viewport</h3>
+    <p>Drag a model from the Assets tab into the viewport to place it under the cursor (it rests on whatever surface is there), or double-click the model to drop it at the center of the view. Drag the axis gizmo (top-right of the viewport) to snap the view, like Blender's. Number fields are drag-to-scrub: drag vertically to nudge, click to type.</p>
+  </div>
+
   <div class="workbench">
-    <aside class="sidebar">
 
-      <section class="panel" id="panel-assets">
-        <h2 class="panel-title">Assets</h2>
-        <!-- Exactly one of these two is shown, decided at startup by
-             app.js based on hasNativeDirectoryPicker() (dnd_assets.js):
-             Chrome/Edge get the native folder-picker button, Firefox
-             (and any other browser without showDirectoryPicker) gets a
-             drag-and-drop zone instead. See dnd_assets.js's header
-             comment for why Firefox can't just use the native API. -->
-        <button id="btn-open-assets" class="btn btn-block hidden">Open Assets Folder</button>
-        <label id="dropzone-assets" class="dropzone hidden">
-          <span class="dropzone-title">Drop your assets folder here</span>
-          <span class="dropzone-subtitle">Firefox doesn't support the folder picker - drag the root assets/ folder from your file manager instead</span>
-        </label>
-        <ul id="model-list" class="item-list"></ul>
-      </section>
+    <!-- ==================================================================
+         Left dock: .NET-style tab strip. Exactly one page visible at a
+         time; app.js owns the switching. Content inside each page is the
+         same markup (same ids) the old stacked panels used.
+         ================================================================ -->
+    <aside class="dock dock--left">
+      <div class="dock-tabs" role="tablist">
+        <button class="dock-tab is-active" data-tab="tab-assets" role="tab">Assets</button>
+        <button class="dock-tab" data-tab="tab-instances" role="tab">Instances</button>
+        <button class="dock-tab" data-tab="tab-vram" role="tab">VRAM</button>
+      </div>
 
-      <section class="panel" id="panel-instances">
-        <h2 class="panel-title">Instances</h2>
-        <button id="btn-add-instance" class="btn btn-block" disabled>Add Instance</button>
-        <ul id="instance-list" class="item-list"></ul>
+      <div class="dock-pages">
 
-        <div id="instance-fields" class="hidden">
-          <h3 class="panel-subtitle">Transform</h3>
-          <div class="field-grid3">
-            <label>Pos X<input type="number" step="0.1" id="f-pos-x"></label>
-            <label>Pos Y<input type="number" step="0.1" id="f-pos-y"></label>
-            <label>Pos Z<input type="number" step="0.1" id="f-pos-z"></label>
-          </div>
-          <div class="field-grid3">
-            <label>Rot X<input type="number" step="1" id="f-rot-x"></label>
-            <label>Rot Y<input type="number" step="1" id="f-rot-y"></label>
-            <label>Rot Z<input type="number" step="1" id="f-rot-z"></label>
-          </div>
-          <div class="field-grid3">
-            <label>Scale X<input type="number" step="0.1" id="f-scale-x"></label>
-            <label>Scale Y<input type="number" step="0.1" id="f-scale-y"></label>
-            <label>Scale Z<input type="number" step="0.1" id="f-scale-z"></label>
-          </div>
-          <label class="field-full">Palette Row
-            <input type="number" step="1" min="0" id="f-palette">
+        <section class="dock-page" id="tab-assets" role="tabpanel">
+          <!-- Exactly one of these two is shown, decided at startup by
+               app.js based on hasNativeDirectoryPicker() (dnd_assets.js):
+               Chrome/Edge get the native folder-picker button, Firefox
+               (and any other browser without showDirectoryPicker) gets a
+               drag-and-drop zone instead. See dnd_assets.js's header
+               comment for why Firefox can't just use the native API. -->
+          <button id="btn-open-assets" class="btn btn-block hidden">Open Assets Folder</button>
+          <label id="dropzone-assets" class="dropzone hidden">
+            <span class="dropzone-title">Drop your assets folder here</span>
+            <span class="dropzone-subtitle">Firefox doesn't support the folder picker - drag the root assets/ folder from your file manager instead</span>
           </label>
-        </div>
-      </section>
+          <ul id="model-list" class="item-list"></ul>
+          <p class="hint-text">
+            Drag a model into the viewport to place it under the cursor,
+            or double-click it to drop it at the center of the view.
+          </p>
+        </section>
 
-      <section class="panel" id="panel-vram">
-        <h2 class="panel-title">VRAM</h2>
-        <!-- Mirrors py_convert_textures.py's packer (see js/vram.js):
-             image region 384x400 units @ (640,0), CLUT strip 32 rows
-             @ y480. Counts every unique texture across loaded models. -->
-        <div class="vram-row">
-          <span class="vram-label">Textures</span>
-          <span class="vram-value" id="vram-image-label">-</span>
-        </div>
-        <div class="vram-bar"><div class="vram-bar-fill" id="vram-image-bar"></div></div>
-        <div class="vram-row">
-          <span class="vram-label">CLUT rows</span>
-          <span class="vram-value" id="vram-clut-label">-</span>
-        </div>
-        <div class="vram-bar"><div class="vram-bar-fill" id="vram-clut-bar"></div></div>
-        <div class="vram-row">
-          <span class="vram-label">Total</span>
-          <span class="vram-value" id="vram-total-label">-</span>
-        </div>
-        <p class="hint-text" id="vram-warnings"></p>
+        <section class="dock-page hidden" id="tab-instances" role="tabpanel">
+          <div class="tab-actions">
+            <button id="btn-new-folder" class="btn btn-folder" title="Create a folder (inside the selected folder, if any)">&#128193; New Folder</button>
+            <button id="btn-insert-entity" class="btn" title="Insert an editor object (trigger, spawn, summon, particle, billboard)">&#65291; Insert &#9662;</button>
+          </div>
+          <!-- Insert-object menu, toggled by the button above and
+               populated by app.js from scene_state.js's ENTITY_KINDS
+               registry (single source of truth for kinds/colors/hints). -->
+          <div id="insert-entity-menu" class="insert-menu hidden"></div>
+          <!-- Rendered as a TREE by app.js's renderInstanceList(): folder
+               rows with a collapse chevron, instance rows indented under
+               their folder. Rows are drag-and-drop reorganizable. -->
+          <ul id="instance-list" class="item-list"></ul>
+          <p class="hint-text">
+            Double-click a row to rename it. Drag rows onto a folder to
+            group them, or onto empty space to move them back to root.
+            Ctrl+D duplicates, Del deletes the selected row. Inserted
+            objects (triggers, spawns, ...) appear at the center of the
+            view and are editor-only until the runtime supports them.
+          </p>
+        </section>
 
-        <!-- Hardcoded PS1 runtime limits, mirrored from main.c's #defines
-             (MAX_MODELS / MAX_SCENE_OBJECTS / MAX_TEXTURES / MAX_MODEL_TRIS).
-             If main.c's values change, update MAINC_LIMITS in app.js. -->
-        <h3 class="panel-subtitle">MAIN.C Limits</h3>
-        <div class="vram-row">
-          <span class="vram-label">Models</span>
-          <span class="vram-value" id="mainc-models-label">-</span>
-        </div>
-        <div class="vram-row">
-          <span class="vram-label">Scene objects</span>
-          <span class="vram-value" id="mainc-objects-label">-</span>
-        </div>
-        <div class="vram-row">
-          <span class="vram-label">Textures</span>
-          <span class="vram-value" id="mainc-textures-label">-</span>
-        </div>
-        <p class="hint-text" id="mainc-warnings"></p>
-      </section>
+        <section class="dock-page hidden" id="tab-vram" role="tabpanel">
+          <!-- Mirrors py_convert_textures.py's packer (see js/vram.js):
+               image region 384x400 units @ (640,0), CLUT strip 32 rows
+               @ y480. Counts every unique texture across loaded models. -->
+          <div class="vram-row">
+            <span class="vram-label">Textures</span>
+            <span class="vram-value" id="vram-image-label">-</span>
+          </div>
+          <div class="vram-bar"><div class="vram-bar-fill" id="vram-image-bar"></div></div>
+          <div class="vram-row">
+            <span class="vram-label">CLUT rows</span>
+            <span class="vram-value" id="vram-clut-label">-</span>
+          </div>
+          <div class="vram-bar"><div class="vram-bar-fill" id="vram-clut-bar"></div></div>
+          <div class="vram-row">
+            <span class="vram-label">Total</span>
+            <span class="vram-value" id="vram-total-label">-</span>
+          </div>
+          <p class="hint-text" id="vram-warnings"></p>
 
-      <section class="panel" id="panel-camera">
-        <h2 class="panel-title">Camera</h2>
-        <div class="field-grid3">
-          <label>Pos X<input type="number" step="0.1" id="cam-pos-x"></label>
-          <label>Pos Y<input type="number" step="0.1" id="cam-pos-y"></label>
-          <label>Pos Z<input type="number" step="0.1" id="cam-pos-z"></label>
-        </div>
-        <div class="field-grid3">
-          <label>Rot X<input type="number" step="1" id="cam-rot-x"></label>
-          <label>Rot Y<input type="number" step="1" id="cam-rot-y"></label>
-          <label>Rot Z<input type="number" step="1" id="cam-rot-z"></label>
-        </div>
-      </section>
+          <!-- Hardcoded PS1 runtime limits, mirrored from main.c's #defines
+               (MAX_MODELS / MAX_SCENE_OBJECTS / MAX_TEXTURES / MAX_MODEL_TRIS).
+               If main.c's values change, update MAINC_LIMITS in app.js. -->
+          <h3 class="panel-subtitle">MAIN.C Limits</h3>
+          <div class="vram-row">
+            <span class="vram-label">Models</span>
+            <span class="vram-value" id="mainc-models-label">-</span>
+          </div>
+          <div class="vram-row">
+            <span class="vram-label">Scene objects</span>
+            <span class="vram-value" id="mainc-objects-label">-</span>
+          </div>
+          <div class="vram-row">
+            <span class="vram-label">Textures</span>
+            <span class="vram-value" id="mainc-textures-label">-</span>
+          </div>
+          <p class="hint-text" id="mainc-warnings"></p>
+        </section>
 
+      </div>
     </aside>
 
     <main class="main">
@@ -131,44 +202,98 @@
       <div id="freecam-indicator" class="freecam-indicator hidden"></div>
     </main>
 
-    <aside class="sidebar sidebar--right">
+    <!-- ==================================================================
+         Right dock: full-height Properties panel (Roblox Studio-style).
+         Shows the selected instance's transform + palette in collapsible
+         sections, plus the exported PS1 camera (a SCENE object, not the
+         editing view - that distinction used to be split across two
+         sidebars and is now just two sections of one panel).
+         ================================================================ -->
+    <aside class="dock dock--right">
+      <div class="dock-tabs">
+        <button class="dock-tab is-active" role="tab">Properties</button>
+      </div>
 
-      <section class="panel" id="panel-transform-mode">
-        <h2 class="panel-title">Transform Mode</h2>
-        <div class="mode-buttons">
-          <button id="mode-translate" class="btn is-active" data-mode="translate">Translate</button>
-          <button id="mode-rotate" class="btn" data-mode="rotate">Rotate</button>
-          <button id="mode-scale" class="btn" data-mode="scale">Scale</button>
-        </div>
-        <p class="hint-text">Shortcuts: W = Translate, E = Rotate, R = Scale</p>
-      </section>
+      <div class="dock-pages">
+        <section class="dock-page" role="tabpanel">
 
-      <section class="panel" id="panel-viewport-camera">
-        <h2 class="panel-title">Viewport View</h2>
-        <!-- These control the EDITING orbit camera only (how you're looking
-             at the scene right now) - NOT the exported PS1 camera gizmo in
-             the "Camera" panel on the left, which is a placed scene object. -->
-        <div class="mode-buttons">
-          <button id="view-front" class="btn" title="Front (Numpad 1)">Front</button>
-          <button id="view-top" class="btn" title="Top (Numpad 7)">Top</button>
-          <button id="view-side" class="btn" title="Side (Numpad 3)">Side</button>
-        </div>
-        <button id="view-reset" class="btn btn-block">Reset View</button>
-        <button id="view-grid" class="btn btn-block">Toggle Grid (G)</button>
-        <p class="hint-text">Drag the axis gizmo (top-right of viewport) to snap the view, like Blender's.</p>
-        <p class="hint-text">Press F to toggle Freecam (WASD + mouse-look). While in Freecam, press Space to toggle Walk mode (gravity + ground snapping). Esc exits Freecam.</p>
-        <p class="hint-text">Shortcuts: . = frame selected, G = toggle grid, Ctrl+S = save project.</p>
-      </section>
+          <p id="props-no-selection" class="props-placeholder">
+            No instance selected.<br>
+            Click an object in the viewport or pick one from the Instances tab.
+          </p>
 
+          <div id="instance-fields" class="hidden">
+            <p class="props-target" id="props-target-label"></p>
+
+            <details class="props-section" open>
+              <summary>Transform</summary>
+              <div class="props-body">
+                <span class="props-group-label">Position</span>
+                <div class="field-grid3">
+                  <label>X<input type="number" step="0.1" id="f-pos-x"></label>
+                  <label>Y<input type="number" step="0.1" id="f-pos-y"></label>
+                  <label>Z<input type="number" step="0.1" id="f-pos-z"></label>
+                </div>
+                <span class="props-group-label">Rotation</span>
+                <div class="field-grid3">
+                  <label>X<input type="number" step="1" id="f-rot-x"></label>
+                  <label>Y<input type="number" step="1" id="f-rot-y"></label>
+                  <label>Z<input type="number" step="1" id="f-rot-z"></label>
+                </div>
+                <span class="props-group-label">Scale</span>
+                <div class="field-grid3">
+                  <label>X<input type="number" step="0.1" id="f-scale-x"></label>
+                  <label>Y<input type="number" step="0.1" id="f-scale-y"></label>
+                  <label>Z<input type="number" step="0.1" id="f-scale-z"></label>
+                </div>
+              </div>
+            </details>
+
+            <details class="props-section" open id="appearance-section">
+              <summary>Appearance</summary>
+              <div class="props-body">
+                <label class="field-full">Palette Row
+                  <input type="number" step="1" min="0" id="f-palette">
+                </label>
+              </div>
+            </details>
+
+            <!-- Kind-specific entity parameters (spawn IDs, summon
+                 behavior, billboard config, ...). Hidden for model
+                 instances; app.js builds the editors dynamically from
+                 the selected entity's ENTITY_KINDS schema. -->
+            <details class="props-section hidden" open id="entity-props-section">
+              <summary id="entity-props-title">Parameters</summary>
+              <div class="props-body" id="entity-props-body"></div>
+            </details>
+          </div>
+
+          <details class="props-section" open>
+            <summary>Scene Camera</summary>
+            <div class="props-body">
+              <!-- The EXPORTED PS1 camera (a placed scene object with its
+                   own gizmo) - NOT the editing orbit camera, which is
+                   driven by the toolbar's view buttons. -->
+              <span class="props-group-label">Position</span>
+              <div class="field-grid3">
+                <label>X<input type="number" step="0.1" id="cam-pos-x"></label>
+                <label>Y<input type="number" step="0.1" id="cam-pos-y"></label>
+                <label>Z<input type="number" step="0.1" id="cam-pos-z"></label>
+              </div>
+              <span class="props-group-label">Rotation</span>
+              <div class="field-grid3">
+                <label>X<input type="number" step="1" id="cam-rot-x"></label>
+                <label>Y<input type="number" step="1" id="cam-rot-y"></label>
+                <label>Z<input type="number" step="1" id="cam-rot-z"></label>
+              </div>
+            </div>
+          </details>
+
+        </section>
+      </div>
     </aside>
-  </div>
 
-  <footer class="transport">
-    <button id="btn-load-project" class="btn">Load Project</button>
-    <button id="btn-save-project" class="btn">Save Project</button>
-    <button id="btn-export-scene" class="btn btn-accent" disabled>Export scene.json</button>
-    <input type="file" id="file-load-project" accept=".SceneGen" class="hidden">
-  </footer>
+  </div>
 
   <script src="../../js/navbar.js"></script>
   <script type="module" src="js/app.js"></script>
