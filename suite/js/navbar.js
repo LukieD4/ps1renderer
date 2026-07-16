@@ -13,8 +13,11 @@
 (function () {
   const NAV_LINKS = [
     { key: "home", label: "Home", href: "/index.html" },
-    { key: "bpp", label: "BPP Image Tool", href: "/tools/image-bpp/index.html" },
-    { key: "palette", label: "PaletteGen", href: "/tools/palette-maker/index.html" }
+    { key: "bpp", label: "BppProject", href: "/tools/image-bpp/index.html" },
+    { key: "palette", label: "PaletteGen", href: "/tools/palette-maker/index.html" },
+    { key: "vag", label: "VAG", href: "/tools/audio-vag/index.html" },
+    { key: "ost", label: "OST Studio", href: "/tools/audio-ost/index.html" },
+    { key: "scene", label: "SceneGen", href: "/tools/scene-gen/index.html" },
     // Future tools go here, e.g.:
     // { key: "sprite-packer", label: "Sprite Packer", href: "/tools/sprite-packer/index.html" },
   ];

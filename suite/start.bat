@@ -13,5 +13,5 @@ if errorlevel 1 (
     exit /b 1
 )
 
-start "" http://localhost:8420/tools/scene-gen/index.html
-node serve.js 8420
+start "" http://localhost:8420/index.html
+node tools/scene-gen/serve.js 8420

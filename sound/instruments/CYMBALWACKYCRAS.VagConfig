@@ -1,0 +1,17 @@
+{
+  "format": "VagConfig",
+  "version": 2,
+  "targetRate": 4000,
+  "quality": "sinc",
+  "cutoffPct": 90,
+  "effort": "exhaustive",
+  "loop": false,
+  "loopStartFrac": 0,
+  "name": "CYMBALWACKYCRAS",
+  "volume": 1,
+  "trimStart": 0,
+  "trimEnd": 2.542403628117914,
+  "monitor": "output",
+  "playhead": 0,
+  "sourceFileName": "Cymbal-Wacky-Crash.wav"
+}

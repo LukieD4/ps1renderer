@@ -62,6 +62,20 @@
 			<file name="SYSTEM.CNF"		type="data" source="${PROJECT_SOURCE_DIR}/system.cnf" />
 			<file name="TEMPLATE.EXE"	type="data" source="template.exe" />
 			<!--
+				Ambient wind loop (SPU-ADPCM VAG), loaded at boot by sound.c
+				via CdSearchFile("\WIND.VAG;1"). 8.3 uppercase name; the path
+				matches what sound.c searches for.
+			-->
+			<file name="WIND.VAG"		type="data" source="${PROJECT_SOURCE_DIR}/sound/wind/WIND.VAG" />
+			<!--
+				Music: VAB instrument bank + SEQ score pair, played by
+				music.c (loaded at boot via CdSearchFile("\SONG.VAB;1") /
+				("\SONG.SEQ;1")). Exported from the suite's OST Studio tool;
+				drop new exports into sound/music/ under these 8.3 names.
+			-->
+			<file name="SONG.VAB"		type="data" source="${PROJECT_SOURCE_DIR}/sound/music/SONG.VAB" />
+			<file name="SONG.SEQ"		type="data" source="${PROJECT_SOURCE_DIR}/sound/music/SONG.SEQ" />
+			<!--
 				This file is only required if you are using dynamic linking
 				(see the system/dynlink example). It contains the executable's
 				symbol map and can be used to obtain the address of a function

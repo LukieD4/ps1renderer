@@ -60,6 +60,12 @@
 #include <psxpad.h>   // PadButton enums (PAD_UP, PAD_DOWN, PAD_LEFT, PAD_RIGHT)
 #include <inline_c.h> // GTE macros (gte_ldv0, gte_rtpt, gte_nclip, etc.)
 
+// SPU sound layer (sound.c): loads WIND.VAG off the CD into SPU RAM and plays
+// it as a looping ambient. sound_init() must run after ResetGraph()/InitGeom()
+// (see init()); START toggles it (see update()).
+#include "sound.h"
+#include "music.h"
+
 
 // Every discovered assets/<name>/<name>.obj, baked in unconditionally.
 // Defines MODEL_TRI/MODEL_DEF (via model_common.h), each <name>_model*
@@ -583,8 +589,8 @@ void init(void)
     SetDefDrawEnv(&draw[1], 0,   0, DISPLAY_W, DISPLAY_H);
 
     // Set and enable clear colour (green background)
-    setRGB0(&draw[0], 0, 96, 0);
-    setRGB0(&draw[1], 0, 96, 0);
+    setRGB0(&draw[0], 128, 128, 128);
+    setRGB0(&draw[1], 128, 128, 128);
     draw[0].isbg = 1;
     draw[1].isbg = 1;
 
@@ -628,6 +634,21 @@ void init(void)
     // Make the first baked scene (sceneRegistry[0]) active: pulls its
     // camera into `camera`, resolves every object's model name once.
     load_scene(0);
+
+    // Boot the SPU + CD and stream the ambient wind loop into SPU RAM, then
+    // start it playing. Kept last in init() (after ResetGraph/InitGeom, which
+    // CdInit/SpuInit both depend on) - a missing/oversized WIND.VAG degrades
+    // to silence inside sound_init(), it won't hang the boot.
+    sound_init();
+    sound_wind_start();
+
+    // Music: load the VAB instrument bank + SEQ score exported by OST Studio
+    // (suite/tools/audio-ost) and start it looping. Same degrade-to-silence
+    // philosophy as the wind - a missing/oversized/malformed pair just leaves
+    // music_playing() false, visible on the debug overlay. Must run after
+    // sound_init() (SPU + CD up, SPU RAM allocator ready).
+    if (music_load("\\SONG.VAB;1", "\\SONG.SEQ;1"))
+        music_play();
 }
 
 
@@ -778,6 +799,14 @@ void update(void)
         if (!(raw & PAD_CIRCLE) && (prevPadRaw & PAD_CIRCLE))
             active_palette = (active_palette - 1) & 0x0F;
     }
+
+    // START toggles the ambient wind loop on/off. Schema-independent (works
+    // whether L2 is held or not) and edge-detected against prevPadRaw, same
+    // released->pressed pattern as the TRIANGLE/SQUARE toggles above, so a
+    // held button doesn't re-toggle every frame. START is otherwise unused by
+    // either control schema.
+    if (!(raw & PAD_START) && (prevPadRaw & PAD_START))
+        sound_wind_toggle();
 
     prevPadRaw = raw;
 }
@@ -1368,6 +1397,29 @@ void debug_text(int counter)
     FntPrint(-1, "TEXTURES_LOADED=%d\n", textureTableCount);
     FntPrint(-1, "ACTIVE_PALETTE=%d\n", active_palette);
     FntPrint(-1, "SCHEMA=%s (hold L2 for CAMERA)\n", cameraSchemaActive ? "CAMERA" : "DEBUG");
+    FntPrint(-1, "WIND=%s (START toggles) LOADED=%s LOOP=%s\n",
+        sound_wind_playing() ? "ON" : "OFF",
+        sound_wind_loaded() ? "Y" : "N",
+        sound_wind_is_looped() ? "Y" : "N");
+
+    // SPU RAM budget: bytes of waveform data resident vs. the ~508 KB usable
+    // (512 KB minus the reserved capture area). PCT is used*100/capacity. As
+    // more sound effects are added, watch this climb toward 100 - an upload
+    // that would push past it is refused by the SPU bump allocator (the sound
+    // just won't load) rather than corrupting another sample.
+    FntPrint(-1, "SPU RAM=%d/%d B (%d%%)\n",
+        sound_spu_used(), sound_spu_capacity(),
+        (int)((sound_spu_used() * 100) / sound_spu_capacity()));
+
+    // Music sequencer: playing/loaded state, voices currently keyed on (of
+    // the 16-voice music pool), and the bank's share of the SPU RAM figure
+    // above. LOADED=N means the SONG.VAB/SONG.SEQ pair didn't make it off
+    // the disc (or failed to parse) - the game runs silently, same as WIND.
+    FntPrint(-1, "MUSIC=%s LOADED=%s V=%d/%d BANK=%dB\n",
+        music_playing() ? "ON" : "OFF",
+        music_loaded() ? "Y" : "N",
+        music_voices_active(), MUSIC_VOICE_COUNT,
+        music_spu_used());
 }
 
 
@@ -1418,6 +1470,12 @@ int main(int argc, const char *argv[])
         FntFlush(-1);
 
         display();
+
+        // Advance the music sequencer exactly once per displayed frame -
+        // display() has just synced to VBlank, which is the cadence the
+        // sequencer's fixed-point tempo accumulator is calibrated against
+        // (MUSIC_VSYNC_HZ in music.h). Cheap no-op when nothing is playing.
+        music_tick();
 
         counter++;
     }

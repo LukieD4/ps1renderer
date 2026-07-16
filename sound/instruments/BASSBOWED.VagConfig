@@ -1,0 +1,17 @@
+{
+  "format": "VagConfig",
+  "version": 2,
+  "targetRate": 4000,
+  "quality": "sinc",
+  "cutoffPct": 90,
+  "effort": "exhaustive",
+  "loop": false,
+  "loopStartFrac": 0,
+  "name": "BASSBOWED",
+  "volume": 1,
+  "trimStart": 0,
+  "trimEnd": 3.3592743764172335,
+  "monitor": "output",
+  "playhead": 0,
+  "sourceFileName": "Bass-Bowed.wav"
+}

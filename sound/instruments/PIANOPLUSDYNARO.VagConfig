@@ -1,0 +1,17 @@
+{
+  "format": "VagConfig",
+  "version": 2,
+  "targetRate": 8000,
+  "quality": "sinc",
+  "cutoffPct": 90,
+  "effort": "exhaustive",
+  "loop": false,
+  "loopStartFrac": 0,
+  "name": "PIANOPLUSDYNARO",
+  "volume": 1,
+  "trimStart": 0,
+  "trimEnd": 2.542403628117914,
+  "monitor": "output",
+  "playhead": 1.7013333333333378,
+  "sourceFileName": "Piano-Plus-Dyna-Roadz-C3.wav"
+}

@@ -1,0 +1,67 @@
+engine/ — VAB+SEQ music player drop-in for the ps1renderer engine
+==================================================================
+
+FILES
+  music.h / music.c   NEW: the sequencer + bank loader (PSn00bSDK 0.24, no libsnd).
+  sound.h / sound.c   UPDATED copies of your existing module. Diff against yours:
+                        - spu_alloc() renamed/made public as sound_spu_reserve(),
+                          plus a LIFO sound_spu_release() (used by music_unload).
+                        - wind loop-scan now matches (flag & 0x03) == 0x03 so a
+                          sample that self-loops on its final block (flag 0x07)
+                          still reports LOOP=Y.
+                      Nothing else changed; wind behavior is identical.
+
+INTEGRATION (main.c)
+  1. After sound_init():
+         if (music_load("\\SONG.VAB;1", "\\SONG.SEQ;1"))
+             music_play();
+  2. Once per frame in the main loop (near VSync):
+         music_tick();
+  3. Debug overlay (next to the SPU RAM line):
+         FntPrint(-1, "MUS=%s V=%d BANK=%dB\n",
+             music_playing() ? "ON" : "OFF",
+             music_voices_active(), music_spu_used());
+
+ISO
+  Add to iso.xml alongside WIND.VAG:
+      <file name="SONG.VAB" type="data" source="SONG.VAB"/>
+      <file name="SONG.SEQ" type="data" source="SONG.SEQ"/>
+  (Export both from OST Studio; the internal song name becomes the filename —
+  keep it 8.3-friendly for the ISO.)
+
+PAL
+  #define MUSIC_VSYNC_HZ 50 in music.h (tick accumulator is calibrated per vsync).
+
+VOICE MAP (compile-time partition, extend in one place)
+  0        wind        (sound.c)
+  1..7     future SFX  (one-shot barks/caws module)
+  8..23    music       (music.c, MUSIC_VOICE_FIRST/COUNT)
+
+SCENE-ASSET ROADMAP (future-proofing notes)
+  Target shape: each scene ships a manifest listing its assets —
+    MUSIC   one VAB+SEQ pair            -> music_load()/music_play()
+    SFXBANK one-shot VAGs               -> future sfx_load_bank(): same
+            (standalone, attached to a     chunked-CdRead + sound_spu_reserve
+            character, or event-fired)     pattern as music.c's load_vab()
+    CHAR    meshes/anims + attached sfx refs
+    FX      particle definitions
+  What this module already guarantees for that world:
+    - data-driven paths, no hardcoded filenames;
+    - load/play split so a scene loader can prefetch behind a fade;
+    - one SPU budget (sound_spu_reserve) shared by all audio modules, so the
+      manifest loader can check music+sfx fit BEFORE streaming anything;
+    - teardown story: release in reverse load order (LIFO). If scenes later
+      need arbitrary unload order, upgrade sound.c's bump allocator to a free
+      list — callers don't change.
+  Suggested load order per scene: SFX banks first (long-lived), music last
+  (swapped most often), so music_unload() can always LIFO-release cleanly.
+
+CAVEATS (v1, by design)
+  - One tone per program (matches the exporter). Multi-tone key-splits would
+    need the tone-range scan added to note_on().
+  - ADSR words are written verbatim from the VH; the exporter's UI→ADSR
+    mapping is heuristic, so expect to calibrate envelopes against hardware
+    once, then bake corrections into the exporter.
+  - Pitch bend / vibrato / CC volume events are skipped (exporter never emits
+    them yet).
+  - VH must fit one 32 KB chunk: max 48 programs (MUSIC_MAX_PROGRAMS).

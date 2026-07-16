@@ -1,0 +1,17 @@
+{
+  "format": "VagConfig",
+  "version": 2,
+  "targetRate": 11025,
+  "quality": "linear",
+  "cutoffPct": 90,
+  "effort": "exhaustive",
+  "loop": false,
+  "loopStartFrac": 0,
+  "name": "ORGANGLASS",
+  "volume": 1,
+  "trimStart": 0,
+  "trimEnd": 3.65265306122449,
+  "monitor": "output",
+  "playhead": 1.650666666666666,
+  "sourceFileName": "Organ-Glass.wav"
+}

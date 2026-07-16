@@ -134,9 +134,17 @@ add_custom_target(convert_everything
 # committed hand-written file. tex_blob_table.c likewise.
 psn00bsdk_add_executable(template GPREL
     main.c
+    sound.c
+    music.c
     "${TEX_BLOB_S}"
     "${TEX_BLOB_TABLE}"
 )
+
+# sound.c pulls in the SPU and CD-ROM libraries. The default template only
+# referenced psxgpu/psxgte/psxetc/psxapi/psxpad (linked implicitly); psxspu and
+# psxcd must be linked explicitly now that we upload samples and read the VAG
+# off the disc.
+target_link_libraries(template PRIVATE psxspu psxcd)
 
 # Ensure both conversion pipelines complete before building the executable
 add_dependencies(template convert_everything)
@@ -149,6 +157,9 @@ psn00bsdk_add_cd_image(
     template
     iso.xml
     DEPENDS template system.cnf
+        "${CMAKE_SOURCE_DIR}/sound/wind/WIND.VAG"
+        "${CMAKE_SOURCE_DIR}/sound/music/SONG.VAB"
+        "${CMAKE_SOURCE_DIR}/sound/music/SONG.SEQ"
 )
 
 # ------------------------------------------------------------

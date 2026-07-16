@@ -1,0 +1,233 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>OST Studio — ps1renderer / Suite of Tools</title>
+  <link rel="stylesheet" href="../../css/site.css" />
+  <link rel="stylesheet" href="css/tool.css" />
+</head>
+<body data-nav-key="ost" data-view="arrange">
+  <div id="site-navbar"></div>
+
+  <!-- ============================= TRANSPORT BAR ============================= -->
+  <div class="transport">
+    <div class="transport__group">
+      <span class="transport__title">OST Studio</span>
+      <div class="filegroup">
+        <div class="file-chip file-chip--song" id="song-chip" title="Song name — used for saved and exported filenames">
+          <span class="file-chip__name" id="file-chip-name" contenteditable="true" spellcheck="false">song</span>
+          <span class="file-chip__dims" id="file-chip-dims">.OstSong</span>
+        </div>
+        <button class="btn btn--sm" id="btn-load-song" title="Load song (.OstSong)">Load</button>
+        <button class="btn btn--sm" id="btn-save-song" title="Save song (.OstSong)">Save</button>
+        <button class="btn btn--sm btn--export" id="btn-export" title="Export SEQ + VAB for PS1">Export</button>
+        <input type="file" id="song-file-input" class="hidden-input" accept=".OstSong,.ostsong,application/json,.json" />
+      </div>
+      <div class="segmented viewswitch" id="viewswitch">
+        <div class="segmented__option is-active" data-view="arrange">Arrange</div>
+        <div class="segmented__option" data-view="live">Live</div>
+      </div>
+    </div>
+
+    <div class="transport__group transport__controls" id="transport-controls">
+      <button class="tbtn tbtn--text" id="btn-to-start" title="Jump to start">|&#8249;</button>
+      <button class="tbtn tbtn--play" id="btn-play" title="Play / Stop (Space)" aria-label="Play">
+        <svg class="ico-play" viewBox="0 0 16 16" width="14" height="14"><path d="M3 1.5l11 6.5-11 6.5z" fill="currentColor"/></svg>
+        <svg class="ico-stop" viewBox="0 0 16 16" width="12" height="12" hidden><rect x="2" y="2" width="12" height="12" fill="currentColor"/></svg>
+      </button>
+      <button class="tbtn tbtn--rec" id="btn-record" title="Arm recording">
+        <svg viewBox="0 0 16 16" width="12" height="12"><circle cx="8" cy="8" r="6" fill="currentColor"/></svg>
+      </button>
+      <button class="tbtn tbtn--text" id="btn-to-end" title="Jump to end">&#8250;|</button>
+      <div class="tempo">
+        <input type="number" id="bpm-input" min="20" max="300" value="120" /><span class="tempo__u">BPM</span>
+      </div>
+      <div class="pos-readout" id="pos-readout">1 : 1</div>
+      <button class="tbtn tbtn--text" id="btn-loop" title="Toggle loop region">Loop</button>
+      <label class="mini-field"><span>Snap</span>
+        <select class="select select--mini" id="snap-select">
+          <option value="1">1/1</option>
+          <option value="2">1/2</option>
+          <option value="4" selected>1/4</option>
+          <option value="8">1/8</option>
+          <option value="16">1/16</option>
+          <option value="0">Off</option>
+        </select>
+      </label>
+      <div class="zoombtns">
+        <button class="tbtn tbtn--text" id="btn-zoom-out" title="Zoom out">−</button>
+        <button class="tbtn tbtn--text" id="btn-zoom-in" title="Zoom in">+</button>
+      </div>
+    </div>
+
+    <div class="transport__group">
+      <span class="voicecount" title="SPU voices sounding"><b id="voice-count-mini">0</b>/24</span>
+      <div class="master">
+        <span class="master__label">Master</span>
+        <input type="range" id="master-gain" min="0" max="100" value="80" step="1" />
+      </div>
+      <button class="btn" id="btn-panic" title="Stop all sound">Panic</button>
+    </div>
+  </div>
+
+  <div class="workbench">
+    <!-- ============================= LEFT RAIL: INSTRUMENT ============================= -->
+    <aside class="rail rail--left">
+      <div class="rail__section">
+        <p class="rail__label">Instrument <span class="rail__target" id="inst-target">— live</span></p>
+        <label class="dropzone" id="dropzone" for="file-input">
+          <div class="dropzone__icon" aria-hidden="true">
+            <svg viewBox="0 0 24 24" width="24" height="24" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round">
+              <path d="M9 18V6l10-2v12"/><circle cx="6" cy="18" r="3"/><circle cx="16" cy="16" r="3"/>
+            </svg>
+          </div>
+          <div class="dropzone__text">Drop .VAG files</div>
+          <div class="dropzone__hint">Adds to the library · assigns to the selected track · convert audio with the audio-vag tool</div>
+          <input type="file" id="file-input" accept=".vag,.VAG" multiple />
+        </label>
+        <div class="samplelib" id="sample-lib" hidden>
+          <p class="samplelib__label">Library</p>
+          <div class="samplelib__list" id="sample-lib-list"></div>
+        </div>
+      </div>
+
+      <div class="rail__section track-only" id="track-section">
+        <p class="rail__label">Track <span class="rail__target" id="track-target"></span></p>
+        <div class="slider-row"><div class="slider-row__head"><span>Volume</span><span class="slider-row__value" id="tvol-value">100%</span></div><input type="range" id="track-volume" min="0" max="100" value="100" step="1" /></div>
+        <div class="field-row" style="margin-top:8px;">
+          <label class="field"><span class="field__k">Transpose</span>
+            <input type="number" id="track-transpose" class="num-input" min="-48" max="48" value="0" /></label>
+          <div class="field field--readout"><span class="field__k">semitones</span><span class="field__v" id="track-transpose-oct">0</span></div>
+        </div>
+      </div>
+
+      <div class="rail__section">
+        <p class="rail__label">Pitch</p>
+        <div class="field-row">
+          <label class="field"><span class="field__k">Center note</span>
+            <input type="number" id="center-note" class="num-input" min="0" max="127" value="60" /></label>
+          <div class="field field--readout"><span class="field__k">= note</span><span class="field__v" id="center-note-name">C4</span></div>
+        </div>
+        <div class="slider-row" style="margin-top:12px;"><div class="slider-row__head"><span>Fine tune</span><span class="slider-row__value" id="detune-value">0 ¢</span></div><input type="range" id="detune" min="-100" max="100" value="0" step="1" /></div>
+      </div>
+
+      <div class="rail__section">
+        <p class="rail__label">Envelope (ADSR)</p>
+        <div class="slider-row"><div class="slider-row__head"><span>Attack</span><span class="slider-row__value" id="atk-value">5 ms</span></div><input type="range" id="adsr-attack" min="0" max="1000" value="5" step="1" /></div>
+        <div class="slider-row"><div class="slider-row__head"><span>Decay</span><span class="slider-row__value" id="dec-value">120 ms</span></div><input type="range" id="adsr-decay" min="0" max="2000" value="120" step="1" /></div>
+        <div class="slider-row"><div class="slider-row__head"><span>Sustain</span><span class="slider-row__value" id="sus-value">70%</span></div><input type="range" id="adsr-sustain" min="0" max="100" value="70" step="1" /></div>
+        <div class="slider-row"><div class="slider-row__head"><span>Release</span><span class="slider-row__value" id="rel-value">180 ms</span></div><input type="range" id="adsr-release" min="0" max="3000" value="180" step="1" /></div>
+      </div>
+
+    </aside>
+
+    <!-- ============================= CENTER: STAGE ============================= -->
+    <main class="stage stage--flush" id="stage">
+
+      <!-- ARRANGE VIEW (the DAW) -->
+      <section class="view view--arrange" id="view-arrange">
+        <div class="arrange">
+          <div class="arrange__side">
+            <div class="tracklist__head">
+              <span>Tracks</span>
+              <button class="btn btn--sm" id="btn-add-track">+ Add</button>
+            </div>
+            <div class="tracklist" id="tracklist"></div>
+            <div class="io-row">
+              <button class="btn btn--sm btn--wide" id="btn-import-midi">Import MIDI…</button>
+              <button class="btn btn--sm btn--wide" id="btn-export-midi" title="Export the song as a Standard MIDI File (transpose baked in)">Export MIDI…</button>
+              <input type="file" id="midi-file-input" class="hidden-input" accept=".mid,.midi" />
+            </div>
+          </div>
+          <div class="rollwrap">
+            <canvas id="roll-canvas" class="roll-canvas"></canvas>
+          </div>
+        </div>
+        <div class="arrange__foot">
+          <span class="foot-hint">Space = play/stop · click to draw · drag empty space to box-select, drag the group to move · Ctrl-A select all · Ctrl-C/X/V copy/cut/paste at the playhead · click the empty track-list area for ALL-track selection scope · Shift-click / Del delete · middle-drag pan · Ctrl-scroll zoom · Ctrl-Z/Y undo · Shift-drag the ruler = loop region; amber flags / grey end-marker = loop &amp; song end.</span>
+        </div>
+      </section>
+
+      <!-- LIVE VIEW (instrument tester, from Milestone 1) -->
+      <section class="view view--live" id="view-live" hidden>
+        <div class="voicebar">
+          <div class="voicebar__head"><span class="voicebar__label">SPU voices</span><span class="voicebar__count"><span id="voice-count">0</span> / 24</span></div>
+          <div class="voicebar__slots" id="voice-slots"></div>
+          <div class="voicebar__hint">Peak <span id="voice-peak">0</span> · 24-voice hardware ceiling; oldest notes are stolen past it.</div>
+        </div>
+        <div class="sample-view">
+          <div class="scope__label">Instrument waveform <span id="sample-name">—</span></div>
+          <canvas class="sample-canvas" id="sample-canvas" width="900" height="120"></canvas>
+        </div>
+        <div class="now-note" id="now-note">Press a key, click the piano, or connect a MIDI device</div>
+        <div class="piano" id="piano" aria-label="On-screen keyboard"></div>
+        <div class="piano-help">
+          Computer keys <kbd>A</kbd><kbd>W</kbd><kbd>S</kbd><kbd>E</kbd><kbd>D</kbd>… play notes ·
+          <kbd>Z</kbd>/<kbd>X</kbd> shift octave · base octave <b id="kbd-octave">4</b>
+        </div>
+      </section>
+    </main>
+
+    <!-- ============================= RIGHT RAIL ============================= -->
+    <aside class="rail rail--right">
+      <div class="rail__section">
+        <p class="rail__label">MIDI keyboard</p>
+        <div class="midi-status" id="midi-status"><span class="midi-status__dot" id="midi-dot"></span><span id="midi-status-text">Not connected</span></div>
+        <button class="btn btn--wide" id="btn-midi" style="margin-top:10px;">Connect MIDI device</button>
+        <select class="select" id="midi-select" style="margin-top:10px;" hidden></select>
+        <p class="rail__note">Plug in a USB/Bluetooth MIDI keyboard and click connect (Chromium / Web MIDI).</p>
+      </div>
+      <div class="rail__section">
+        <p class="rail__label">Engine</p>
+        <div class="stats stats--col">
+          <div class="stat"><div class="stat__k">Voices</div><div class="stat__v">24 <small>max</small></div></div>
+          <div class="stat"><div class="stat__k">Sample rate</div><div class="stat__v" id="stat-rate">—</div></div>
+          <div class="stat"><div class="stat__k">Length</div><div class="stat__v" id="stat-len">—</div></div>
+          <div class="stat"><div class="stat__k">Loop</div><div class="stat__v" id="stat-loop">—</div></div>
+        </div>
+      </div>
+      <div class="rail__section">
+        <p class="rail__label">Tone shaping <span class="rail__target" id="tone-target"></span></p>
+        <div class="slider-row"><div class="slider-row__head"><span>Lowpass cutoff</span><span class="slider-row__value" id="cutoff-value">off</span></div><input type="range" id="cutoff" min="200" max="20000" value="20000" step="100" /></div>
+        <div class="slider-row"><div class="slider-row__head"><span>Resonance</span><span class="slider-row__value" id="reso-value">0.7</span></div><input type="range" id="resonance" min="1" max="200" value="7" step="1" /></div>
+        <div class="slider-row"><div class="slider-row__head"><span>Reverb send</span><span class="slider-row__value" id="reverb-value">0%</span></div><input type="range" id="reverb-send" min="0" max="100" value="0" step="1" /></div>
+        <div class="slider-row"><div class="slider-row__head"><span>Glide</span><span class="slider-row__value" id="glide-value">0 ms</span></div><input type="range" id="glide" min="0" max="600" value="0" step="1" /></div>
+      </div>
+
+      <div class="rail__section">
+        <p class="rail__label">Pan &amp; loop</p>
+        <div class="slider-row"><div class="slider-row__head"><span>Pan</span><span class="slider-row__value" id="pan-value">C</span></div><input type="range" id="pan" min="-100" max="100" value="0" step="1" /></div>
+        <div class="dither-options" id="loop-options" style="margin-top:12px;">
+          <div class="dither-option" data-loop="off"><span class="dither-option__dot"></span> One-shot <span class="opt-tag opt-tag--muted">no sustain</span></div>
+          <div class="dither-option is-active" data-loop="on"><span class="dither-option__dot"></span> Looped <span class="opt-tag opt-tag--muted">sustain</span></div>
+        </div>
+        <div id="loop-region" hidden>
+          <div class="slider-row" style="margin-top:12px;"><div class="slider-row__head"><span>Loop start</span><span class="slider-row__value" id="loopstart-value">0%</span></div><input type="range" id="loop-start" min="0" max="1000" value="0" step="1" /></div>
+          <div class="slider-row"><div class="slider-row__head"><span>Loop end</span><span class="slider-row__value" id="loopend-value">100%</span></div><input type="range" id="loop-end" min="0" max="1000" value="1000" step="1" /></div>
+          <button class="btn btn--sm btn--wide" id="btn-trim-loop" style="margin-top:8px;">Auto: trim silence &amp; set sustain loop</button>
+          <p class="rail__note">The note plays the attack once, then repeats the loop region until note-off. Keep the end before the trailing silence. Points snap to 28-sample blocks.</p>
+        </div>
+      </div>
+
+      <div class="rail__section">
+        <p class="rail__label">Export</p>
+        <p class="rail__note">Export builds a PS1 VAB instrument bank + SEQ score from your tracks. ADSR mapping and VAG-table offsets are approximate — round-trip through vgmstream to confirm before shipping.</p>
+      </div>
+    </aside>
+  </div>
+
+  <div class="toast" id="toast"></div>
+
+  <script src="../../js/navbar.js"></script>
+  <script src="js/adpcm.js"></script>
+  <script src="js/vag.js"></script>
+  <script src="js/spu.js"></script>
+  <script src="js/song.js"></script>
+  <script src="js/roll.js"></script>
+  <script src="js/scheduler.js"></script>
+  <script src="js/seqvab.js"></script>
+  <script src="js/midi.js"></script>
+  <script src="js/app.js"></script>
+</body>
+</html>

@@ -1,0 +1,17 @@
+{
+  "format": "VagConfig",
+  "version": 2,
+  "targetRate": 8000,
+  "quality": "sinc",
+  "cutoffPct": 90,
+  "effort": "exhaustive",
+  "loop": false,
+  "loopStartFrac": 0,
+  "name": "SNAREWACKY",
+  "volume": 1,
+  "trimStart": 0,
+  "trimEnd": 0.41113378684807256,
+  "monitor": "output",
+  "playhead": 0,
+  "sourceFileName": "Snare-Wacky.wav"
+}

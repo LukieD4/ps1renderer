@@ -1,0 +1,17 @@
+{
+  "format": "VagConfig",
+  "version": 2,
+  "targetRate": 11025,
+  "quality": "sinc",
+  "cutoffPct": 90,
+  "effort": "exhaustive",
+  "loop": false,
+  "loopStartFrac": 0,
+  "name": "PIANOREVERSEC3",
+  "volume": 1,
+  "trimStart": 4,
+  "trimEnd": 6.098866213151927,
+  "monitor": "output",
+  "playhead": 0,
+  "sourceFileName": "Piano-Reverse-C3.wav"
+}

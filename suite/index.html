@@ -66,6 +66,24 @@
       font-size: 13.5px;
       margin: 0 0 16px;
     }
+    .home-card__warn {
+      display: flex;
+      align-items: baseline;
+      gap: 6px;
+      margin-top: 10px;
+      padding: 8px 10px;
+      font-size: 12.5px;
+      line-height: 1.5;
+      color: var(--text-dim);
+      background: rgba(234, 179, 8, 0.08);
+      border: 1px solid rgba(234, 179, 8, 0.35);
+      border-radius: var(--radius-sm);
+    }
+    .home-card__warn::before {
+      content: "⚠";
+      color: #eab308;
+      font-size: 13px;
+    }
     .home-flow-step {
       display: inline-flex;
       align-items: center;
@@ -92,6 +110,17 @@
     <p>Small offline tools for pushing pixels around. Everything runs locally in your browser — nothing is uploaded anywhere.</p>
 
     <section class="home-section">
+      <h2 class="home-section__title">Scene Maker</h2>
+      <p class="home-section__desc">A standalone tool, not part of the texture flow above.</p>
+
+      <a class="home-card" href="tools/scene-gen/index.html">
+        <div class="home-card__title">Scene Generator</div>
+        <div class="home-card__desc">Generate random pixel art scenes with a variety of settings and export them as PNGs.</div>
+        <div class="home-card__warn">Requires the local server (node serve.js) to be running; not from file:// -- Run start.bat to fix this</div>
+      </a>
+    </section>
+
+    <section class="home-section">
       <h2 class="home-section__title">Texture Curation</h2>
       <p class="home-section__desc">Work through these two in order: reduce a source image, then build the palette it will use.</p>
 
@@ -107,14 +136,20 @@
     </section>
 
     <section class="home-section">
-      <h2 class="home-section__title">Scene Maker</h2>
-      <p class="home-section__desc">A standalone tool, not part of the texture flow above.</p>
+      <h2 class="home-section__title">Sound Manipulation</h2>
+      <p class="home-section__desc">Tools for working with PS1-style audio, including conversion and playback.</p>
 
-      <a class="home-card" href="tools/scene-gen/index.html">
-        <div class="home-card__title">Scene Generator</div>
-        <div class="home-card__desc">Generate random pixel art scenes with a variety of settings and export them as PNGs.</div>
+      <a class="home-card" href="tools/audio-vag/index.html">
+        <div class="home-card__title"><span class="home-flow-step">1</span>Audio Bank Tool</div>
+        <div class="home-card__desc">Convert a .wav into a PS1 SPU-ADPCM .VAG, with sample-rate, anti-alias, effort and loop controls, and A/B preview.</div>
+      </a>
+
+      <a class="home-card" href="tools/audio-ost/index.html">
+        <div class="home-card__title"><span class="home-flow-step">2</span>OST Studio</div>
+        <div class="home-card__desc">Play VAG/WAV instruments through an in-browser SPU engine — polyphonic, with ADSR, pitch, the 24-voice limit, and MIDI-keyboard input. The music-making side, built on the same ADPCM core.</div>
       </a>
     </section>
+    
   </main>
 
   <script src="js/navbar.js"></script>
