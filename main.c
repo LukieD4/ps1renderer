@@ -174,7 +174,9 @@ int fov_speed = 10;
 #define MAX_MODEL_VERTS 512
 
 // Maximum number of triangles we cache for sorting/lighting, PER MODEL.
-#define MAX_MODEL_TRIS 512//256
+// (Raised from the original 256 alongside the MAX_MODEL_VERTS bump above;
+// py_convert_assets.py's MAX_MATERIALS_PER_MODEL note tracks this value.)
+#define MAX_MODEL_TRIS 512
 
 // Ceiling on how many distinct models (modelRegistry[] entries) get their
 // own triangle/texture cache built at load time - see
@@ -1428,11 +1430,10 @@ void debug_text(int counter)
     FntPrint(-1, "MODELS_BAKED=%d\n", modelRegistryCount);
 
     FntPrint(-1, "DEBUGSCALE=%d\n", debug_scale);
-    // NOTE: this prints FOCAL_LENGTH+fov as if it's the live projection
-    // distance, but see the comment above update() - fov currently isn't
-    // fed back into gte_SetGeomScreen(), so this number moves while the
-    // actual FOV does not. Either wire fov into the GTE each frame or
-    // drop it from this readout until that's done.
+    // Live projection distance: update_camera_matrix() pushes
+    // FOCAL_LENGTH+fov into gte_SetGeomScreen() once per frame, so this
+    // readout tracks the real GTE state (fov driven by CROSS/CIRCLE in
+    // the debug schema).
     FntPrint(-1, "FOV=%d\n", FOCAL_LENGTH+fov);
     FntPrint(-1, "ROTX=%d\n", model_rot.vx);
     FntPrint(-1, "ROTY=%d\n", model_rot.vy);

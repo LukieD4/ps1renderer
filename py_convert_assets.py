@@ -20,9 +20,9 @@ FIXED_POINT_MATH_UPSCALE = 1024  # converts from decimal to int, something which
 # normalized 0.0-1.0 UV, so this is just that scaled into a byte.
 UV_BYTE_SCALE = 255  # 256x256 image
 
-# Per-model triangle count is currently capped at 256 (MAX_MODEL_TRIS in
-# main.c) and material indices are stored as unsigned char (0-255), so
-# 256 distinct materials per model is the hard ceiling either way.
+# Per-model triangle count is currently capped at 512 (MAX_MODEL_TRIS in
+# main.c), but material indices are stored as unsigned char (0-255), so
+# 256 distinct materials per model is still the hard ceiling here.
 MAX_MATERIALS_PER_MODEL = 256
 
 # Multiple simultaneous models (stages) means every generated .c file now

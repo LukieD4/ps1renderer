@@ -1,36 +1,44 @@
-engine/ — VAB+SEQ music player drop-in for the ps1renderer engine
+VAB+SEQ music player for the ps1renderer engine — INTEGRATED
 ==================================================================
+(Originally delivered as a drop-in; everything below is now merged and
+live in the tree. This doc describes the module as it exists today.)
 
 FILES
-  music.h / music.c   NEW: the sequencer + bank loader (PSn00bSDK 0.24, no libsnd).
-  sound.h / sound.c   UPDATED copies of your existing module. Diff against yours:
+  music.h / music.c   The sequencer + bank loader (PSn00bSDK 0.24 ships no
+                      libsnd, so this module IS the sequencer).
+  sound.h / sound.c   Existing module, extended for music support:
                         - spu_alloc() renamed/made public as sound_spu_reserve(),
                           plus a LIFO sound_spu_release() (used by music_unload).
-                        - wind loop-scan now matches (flag & 0x03) == 0x03 so a
+                        - wind loop-scan matches (flag & 0x03) == 0x03 so a
                           sample that self-loops on its final block (flag 0x07)
                           still reports LOOP=Y.
                       Nothing else changed; wind behavior is identical.
 
-INTEGRATION (main.c)
-  1. After sound_init():
+INTEGRATION (main.c) — done
+  1. init() calls, after sound_init():
          if (music_load("\\SONG.VAB;1", "\\SONG.SEQ;1"))
              music_play();
-  2. Once per frame in the main loop (near VSync):
-         music_tick();
-  3. Debug overlay (next to the SPU RAM line):
-         FntPrint(-1, "MUS=%s V=%d BANK=%dB\n",
+  2. main() calls music_tick() once per displayed frame, right after
+     display() returns from its VSync.
+  3. debug_text() prints, next to the SPU RAM line:
+         FntPrint(-1, "MUSIC=%s LOADED=%s V=%d/%d BANK=%dB\n",
              music_playing() ? "ON" : "OFF",
-             music_voices_active(), music_spu_used());
+             music_loaded() ? "Y" : "N",
+             music_voices_active(), MUSIC_VOICE_COUNT,
+             music_spu_used());
 
-ISO
-  Add to iso.xml alongside WIND.VAG:
-      <file name="SONG.VAB" type="data" source="SONG.VAB"/>
-      <file name="SONG.SEQ" type="data" source="SONG.SEQ"/>
+ISO — done
+  iso.xml carries, alongside WIND.VAG:
+      <file name="SONG.VAB" type="data" source=".../sound/music/SONG.VAB"/>
+      <file name="SONG.SEQ" type="data" source=".../sound/music/SONG.SEQ"/>
   (Export both from OST Studio; the internal song name becomes the filename —
-  keep it 8.3-friendly for the ISO.)
+  keep it 8.3-friendly for the ISO. Drop new exports into sound/music/.)
 
 PAL
-  #define MUSIC_VSYNC_HZ 50 in music.h (tick accumulator is calibrated per vsync).
+  #define MUSIC_VSYNC_HZ 50 in music.h. Tempo is anchored to REAL vblank
+  counts (VSync(-1) deltas) against the true centihertz rate — 59.94 Hz
+  NTSC / 50.00 PAL, see MUSIC_VSYNC_CHZ in music.c — so a renderer that
+  skips vblanks doesn't slow the music, and 60-vs-59.94 drift is gone.
 
 VOICE MAP (compile-time partition, extend in one place)
   0        wind        (sound.c)
