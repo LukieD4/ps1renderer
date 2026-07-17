@@ -13,117 +13,108 @@ project(
 find_package(Python3 REQUIRED)
 
 # ------------------------------------------------------------
-# 1. OBJ -> C asset generation
+# 1. Asset conversion pipeline (OBJ + TIM + stage.json -> generated/)
 # ------------------------------------------------------------
+# ONE atomic custom command runs all three conversion scripts in their
+# required order (assets -> textures -> stages). This replaces the old
+# three-separate-targets scheme, which had a fatal flaw: Ninja ran the
+# three targets IN PARALLEL, but py_convert_assets.py WIPES generated/
+# on startup - so whenever assets re-ran, it could delete the texture
+# blob and stage files that the other two steps had just written (or
+# that Ninja had already stat'ed as "up to date"), leaving generated/
+# half-populated by the time main.c compiled. Running the scripts by
+# hand in order never hit this, which is why manual runs were flawless.
+#
+# Folding them into one command makes the race impossible by
+# construction: the wipe and every regeneration happen inside a single
+# build edge, so generated/ is always either fully old or fully new.
+# The lost incrementality is negligible - the wipe already meant any
+# assets re-run forced the other two to re-run anyway.
+#
 # NOTE: file(GLOB ...) runs at CMake CONFIGURE time, which is BEFORE
-# py_convert_assets.py has ever produced anything on a clean checkout -
-# so globbing generated/*.c as the OUTPUT here would see an empty list on
-# first configure and the custom command would never be wired up
-# correctly (no OUTPUT = nothing for other targets to depend on).
+# the scripts have ever produced anything on a clean checkout - so we
+# glob SOURCE files (which already exist in the repo), not generated
+# output. CONFIGURE_DEPENDS makes Ninja re-run CMake automatically when
+# a source file is ADDED or REMOVED (same mechanism as the .vag glob in
+# section 3b) - without it, a newly added .obj/.tim/stage.json was
+# invisible until a manual reconfigure, so conversions silently didn't
+# re-run and main.c hit missing symbols.
 #
-# Instead we glob the SOURCE .obj files (these already exist in the repo)
-# and treat the whole generated/ directory as a single stamp file dependency
-# via a marker, so Ninja/Make actually reruns the conversion whenever any
-# .obj/.mtl changes, without requiring the generated .c files to exist yet
-# at configure time.
-file(GLOB_RECURSE SOURCE_OBJ_FILES "${CMAKE_SOURCE_DIR}/assets/object/*.obj")
-file(GLOB_RECURSE SOURCE_MTL_FILES "${CMAKE_SOURCE_DIR}/assets/object/*.mtl")
+# Textures: the script consumes hand-authored .tim files (see
+# py_convert_textures.py's header) - the old glob watched *.png only,
+# so re-exporting a .tim never retriggered conversion. Both are watched
+# now (.png kept since PaletteGen's source art lives alongside).
+file(GLOB_RECURSE SOURCE_OBJ_FILES   CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/object/*.obj")
+file(GLOB_RECURSE SOURCE_MTL_FILES   CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/object/*.mtl")
+file(GLOB_RECURSE SOURCE_TIM_FILES   CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/object/*/textures/*.tim")
+file(GLOB_RECURSE SOURCE_PNG_FILES   CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/object/*/textures/*.png")
+file(GLOB_RECURSE SOURCE_STAGE_FILES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/stage/*/stage.json")
 
-set(ASSETS_STAMP "${CMAKE_BINARY_DIR}/generatedonverted.stamp")
-
-add_custom_command(
-    OUTPUT "${ASSETS_STAMP}"
-    COMMAND "${Python3_EXECUTABLE}" -u "${CMAKE_SOURCE_DIR}/py_convert_assets.py"
-    COMMAND "${CMAKE_COMMAND}" -E touch "${ASSETS_STAMP}"
-    DEPENDS ${SOURCE_OBJ_FILES} ${SOURCE_MTL_FILES} "${CMAKE_SOURCE_DIR}/py_convert_assets.py"
-    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    COMMENT "Converting OBJ assets into C arrays"
+# Deletion/rename safety net: Ninja only re-runs a custom command when a
+# DEPENDS file is NEWER, so merely REMOVING a source file (model deleted/
+# renamed) would leave the stamp "up to date" and stale .c files in
+# generated/. Writing the current source list to a manifest (only when
+# its content actually changes, via copy_if_different, so mtime is
+# preserved otherwise) and depending on it closes that hole: any
+# add/remove reconfigures (CONFIGURE_DEPENDS), changes the manifest, and
+# dirties the pipeline.
+set(CONVERT_MANIFEST "${CMAKE_BINARY_DIR}/convert_sources_manifest.txt")
+string(JOIN "\n" CONVERT_MANIFEST_CONTENT
+    ${SOURCE_OBJ_FILES} ${SOURCE_MTL_FILES}
+    ${SOURCE_TIM_FILES} ${SOURCE_PNG_FILES}
+    ${SOURCE_STAGE_FILES}
 )
-add_custom_target(convert_assets
-    DEPENDS "${ASSETS_STAMP}"
+file(WRITE "${CONVERT_MANIFEST}.tmp" "${CONVERT_MANIFEST_CONTENT}\n")
+execute_process(COMMAND "${CMAKE_COMMAND}" -E copy_if_different
+    "${CONVERT_MANIFEST}.tmp" "${CONVERT_MANIFEST}"
 )
 
-# ------------------------------------------------------------
-# 2. PNG -> texture blob conversion
-# ------------------------------------------------------------
-# Same reasoning as above - depend on source PNGs + the script, not a
-# glob of generated output that may not exist yet.
-#
-# py_convert_textures.py now emits FOUR fixed-path artifacts regardless
-# of how many textures are discovered under assets/object/*/textures/:
+# py_convert_textures.py emits FOUR fixed-path artifacts regardless of
+# how many textures are discovered:
 #   - generated/textures.bin      the concatenated TIM blob
-#   - generated/tex_blob.S        fixed .incbin of textures.bin (never
-#                                  changes shape as textures are added)
-#   - generated/tex_blob_table.c  offset/length/paletteCount table, keyed
-#                                  by material name, read by main.c
-#   - generated/tex_blob_table.h  the TEX_BLOB_ENTRY struct + externs,
-#                                  shared by tex_blob_table.c AND main.c
-#                                  (which #includes it directly) - must be
-#                                  listed as an OUTPUT below too, or a
-#                                  clean checkout has no dependency edge
-#                                  telling CMake it must exist before
-#                                  main.c compiles.
-#
-# Because these paths are fixed (unlike the old single-texture
-# FACE_TIM_PATH scheme where the path itself depended on which model was
-# active), we can list them directly as OUTPUT here - no per-texture
-# CMake changes are needed when TEXTURES grows.
+#   - generated/tex_blob.S        fixed .incbin of textures.bin
+#   - generated/tex_blob_table.c  offset/length/paletteCount table
+#   - generated/tex_blob_table.h  TEX_BLOB_ENTRY struct + externs,
+#                                  #included by main.c - must be an
+#                                  OUTPUT below so a clean checkout has
+#                                  a dependency edge saying it exists
+#                                  before main.c compiles.
+# They double as canaries: py_convert_assets.py's wipe deletes them, so
+# if the pipeline ever dies mid-run, the missing OUTPUTs force a re-run
+# on the next build instead of silently building against half a
+# generated/ dir.
 set(TEX_BLOB_BIN     "${CMAKE_SOURCE_DIR}/generated/textures.bin")
 set(TEX_BLOB_S       "${CMAKE_SOURCE_DIR}/generated/tex_blob.S")
 set(TEX_BLOB_TABLE   "${CMAKE_SOURCE_DIR}/generated/tex_blob_table.c")
 set(TEX_BLOB_TABLE_H "${CMAKE_SOURCE_DIR}/generated/tex_blob_table.h")
 
-file(GLOB_RECURSE SOURCE_PNG_FILES "${CMAKE_SOURCE_DIR}/assets/object/*/textures/*.png")
+set(CONVERT_STAMP "${CMAKE_BINARY_DIR}/conversion_pipeline.stamp")
 
 add_custom_command(
-    OUTPUT "${TEX_BLOB_BIN}" "${TEX_BLOB_S}" "${TEX_BLOB_TABLE}" "${TEX_BLOB_TABLE_H}"
+    OUTPUT "${CONVERT_STAMP}"
+        "${TEX_BLOB_BIN}" "${TEX_BLOB_S}" "${TEX_BLOB_TABLE}" "${TEX_BLOB_TABLE_H}"
+    COMMAND "${Python3_EXECUTABLE}" -u "${CMAKE_SOURCE_DIR}/py_convert_assets.py"
     COMMAND "${Python3_EXECUTABLE}" -u "${CMAKE_SOURCE_DIR}/py_convert_textures.py"
-    DEPENDS ${SOURCE_PNG_FILES} "${CMAKE_SOURCE_DIR}/py_convert_textures.py"
-    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    COMMENT "Converting PNG textures into a concatenated TIM blob"
-)
-add_custom_target(convert_textures
-    DEPENDS "${TEX_BLOB_BIN}" "${TEX_BLOB_S}" "${TEX_BLOB_TABLE}" "${TEX_BLOB_TABLE_H}"
-)
-
-# ------------------------------------------------------------
-# 1c. stage.json -> C stage data
-# ------------------------------------------------------------
-# Same stamp-file reasoning as convert_assets above (py_convert_stages.py's
-# outputs - stage_common.h, stage_registry.c, per-stage stage_<name>.c,
-# stages_all.h - aren't known at CMake configure time on a clean
-# checkout). Stage objects only reference model names as plain strings,
-# resolved at RUNTIME by main.c (see find_model_index_by_name()), so this
-# doesn't strictly need to run after convert_assets to produce correct
-# output - kept as a separate stage anyway (not folded into convert_assets)
-# so a stage-only edit doesn't force re-parsing every .obj in assets/object/.
-file(GLOB_RECURSE SOURCE_STAGE_FILES "${CMAKE_SOURCE_DIR}/assets/stage/*/stage.json")
-
-set(STAGES_STAMP "${CMAKE_BINARY_DIR}/stages_converted.stamp")
-
-add_custom_command(
-    OUTPUT "${STAGES_STAMP}"
     COMMAND "${Python3_EXECUTABLE}" -u "${CMAKE_SOURCE_DIR}/py_convert_stages.py"
-    COMMAND "${CMAKE_COMMAND}" -E touch "${STAGES_STAMP}"
-    DEPENDS ${SOURCE_STAGE_FILES} "${CMAKE_SOURCE_DIR}/py_convert_stages.py"
+    COMMAND "${CMAKE_COMMAND}" -E touch "${CONVERT_STAMP}"
+    DEPENDS
+        ${SOURCE_OBJ_FILES} ${SOURCE_MTL_FILES}
+        ${SOURCE_TIM_FILES} ${SOURCE_PNG_FILES}
+        ${SOURCE_STAGE_FILES}
+        "${CONVERT_MANIFEST}"
+        "${CMAKE_SOURCE_DIR}/py_convert_assets.py"
+        "${CMAKE_SOURCE_DIR}/py_convert_textures.py"
+        "${CMAKE_SOURCE_DIR}/py_convert_stages.py"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    COMMENT "Converting stage.json files into C stage data"
-)
-add_custom_target(convert_stages
-    DEPENDS "${STAGES_STAMP}"
+    COMMENT "Converting assets (OBJ -> C, TIM -> blob, stage.json -> C)"
 )
 
-# ------------------------------------------------------------
-# 2b. Combined "convert everything" target
-# ------------------------------------------------------------
-# Single entry point that runs every conversion pass in the correct
-# order (assets before textures, per py_convert_textures.py's own
-# "Run after py_convert_assets.py!" comment; stages can run independently
-# of both but is included here too) - lets you type one target name
-# instead of remembering which of the three to run, or in which order.
-add_custom_target(convert_everything
-    DEPENDS convert_assets convert_textures convert_stages
-)
+# convert_everything is the entry point; the old per-step names are kept
+# as aliases for muscle memory - they all run the same atomic pipeline.
+add_custom_target(convert_everything DEPENDS "${CONVERT_STAMP}")
+add_custom_target(convert_assets     DEPENDS "${CONVERT_STAMP}")
+add_custom_target(convert_textures   DEPENDS "${CONVERT_STAMP}")
+add_custom_target(convert_stages     DEPENDS "${CONVERT_STAMP}")
 
 # ------------------------------------------------------------
 # 3. Build PS1 executable (main.c + generated blob table + blob .S)
