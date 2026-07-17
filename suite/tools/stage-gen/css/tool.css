@@ -1,11 +1,11 @@
 /*
- * tool.css - scene-gen
+ * tool.css - stage-gen
  *
  * Roblox Studio-style fixed-panel layout: a horizontal ribbon toolbar at
  * the top (file / transform-mode / snapping / view groups), a left dock
  * with .NET-style tab buttons (Assets | Instances | VRAM), the 3D
  * viewport as the flexible middle column, and a full-height Properties
- * dock on the right (selected-instance transform + scene camera).
+ * dock on the right (selected-instance transform + stage camera).
  *
  * IMPORTANT: this file intentionally does NOT define --panel, --border,
  * --radius-md, --radius-sm, --text, --text-dim, --text-faint, --accent,
@@ -166,7 +166,7 @@ body {
 
 /* ---------- Workbench layout ---------- */
 
-/* Three columns: left tab dock (scene-authoring data), the viewport
+/* Three columns: left tab dock (stage-authoring data), the viewport
    (always the flexible middle column), and the right Properties dock. */
 .workbench {
   display: grid;
@@ -197,8 +197,8 @@ body {
 /* Blender-style orientation gizmo, pinned to the top-right corner of the
    main viewport. A separate small canvas overlaid on top of the main one
    (rather than sharing a single canvas) so viewer.js can render it with
-   its own tiny orthographic camera/scene each frame without touching the
-   main scene's camera or projection at all. pointer-events left enabled
+   its own tiny orthographic camera/stage each frame without touching the
+   main stage's camera or projection at all. pointer-events left enabled
    (unlike most overlays) since the gizmo is click/drag-to-snap-view. */
 #viewport-gizmo-canvas {
   position: absolute;
@@ -566,7 +566,7 @@ body {
 }
 
 /* Colored kind dot, shared by insert-menu rows and tree entity rows.
-   Color set inline from ENTITY_KINDS (scene_state.js). */
+   Color set inline from ENTITY_KINDS (stage_state.js). */
 .entity-dot {
   flex: 0 0 auto;
   font-size: 9px;
@@ -656,7 +656,8 @@ body {
 }
 
 .field-grid3 input,
-.field-full input {
+.field-full input,
+.field-full select {
   background: var(--panel);
   border: 1px solid var(--border);
   border-radius: var(--radius-sm);
@@ -671,12 +672,14 @@ body {
    inputs step down to the page background for contrast instead of
    disappearing into their parent. */
 .props-body .field-grid3 input,
-.props-body .field-full input {
+.props-body .field-full input,
+.props-body .field-full select {
   background: var(--panel-raised);
 }
 
 .field-grid3 input:focus,
-.field-full input:focus {
+.field-full input:focus,
+.field-full select:focus {
   outline: none;
   border-color: var(--accent);
 }

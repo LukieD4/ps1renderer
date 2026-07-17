@@ -1,11 +1,11 @@
 /*
  * serve.js
  *
- * Minimal zero-dependency static file server for scene-gen.
+ * Minimal zero-dependency static file server for stage-gen.
  *
  * WHY THIS EXISTS
  * ----------------------------------------------------------------------
- * scene-gen's app.js is loaded as an ES module (`<script type="module">`),
+ * stage-gen's app.js is loaded as an ES module (`<script type="module">`),
  * which browsers refuse to fetch over file:// (CORS/module-source
  * restrictions - see the error this file was added to fix). Separately,
  * the File System Access API's showDirectoryPicker() (used by "Open
@@ -19,24 +19,24 @@
  *
  *   node serve.js
  *
- * then open the printed http://localhost:PORT/tools/scene-gen/ URL in
+ * then open the printed http://localhost:PORT/tools/stage-gen/ URL in
  * Chrome or Edge.
  *
  * ----------------------------------------------------------------------
- * WHY THE SERVER ROOT IS "suite/", NOT "scene-gen/"
+ * WHY THE SERVER ROOT IS "suite/", NOT "stage-gen/"
  * ----------------------------------------------------------------------
- * scene-gen's index.html references shared suite-wide files one level
+ * stage-gen's index.html references shared suite-wide files one level
  * above every tool folder - "../../css/site.css" and "../../js/navbar.js"
  * - the same convention palette-maker and image-bpp use, so all three
  * tools share one stylesheet/navbar instead of duplicating them.
  *
- * If this server only serves the scene-gen/ folder itself, those "../../"
- * requests resolve to a path OUTSIDE scene-gen/ - which this server's own
+ * If this server only serves the stage-gen/ folder itself, those "../../"
+ * requests resolve to a path OUTSIDE stage-gen/ - which this server's own
  * path-traversal guard (see below) correctly refuses, but that means
  * site.css/navbar.js 404 silently and the page renders unstyled (white
  * background, generic font - exactly the symptom this comment block was
  * added to explain). Serving from suite/ instead (two levels up from this
- * file, i.e. scene-gen/../..) makes "../../css/site.css" resolve to a
+ * file, i.e. stage-gen/../..) makes "../../css/site.css" resolve to a
  * REAL file inside the served root, so it works the same way it does for
  * every other tool in the suite.
  */
@@ -47,12 +47,12 @@ const path = require("path");
 
 const PORT = process.env.PORT ? Number(process.env.PORT) : 8420;
 
-// This file lives at suite/tools/scene-gen/serve.js, so two levels up is
+// This file lives at suite/tools/stage-gen/serve.js, so two levels up is
 // suite/ - the root every tool's shared "../../css/site.css" /
 // "../../js/navbar.js" references actually resolve against.
 const ROOT = path.resolve(__dirname, "..", "..");
 
-// Minimal extension -> Content-Type map. Only what scene-gen actually
+// Minimal extension -> Content-Type map. Only what stage-gen actually
 // serves (html/css/js) plus a few common static asset types, in case
 // this ever needs to serve an image/font alongside the tool.
 const MIME_TYPES = {
@@ -69,7 +69,7 @@ const MIME_TYPES = {
 
 const server = http.createServer((req, res) => {
     // Strip query string, decode %-escapes, default "/" to the suite's own
-    // index.html (suite/index.html) rather than scene-gen's, since ROOT is
+    // index.html (suite/index.html) rather than stage-gen's, since ROOT is
     // now suite/ itself.
     let urlPath = decodeURIComponent(req.url.split("?")[0]);
     if (urlPath === "/") urlPath = "/index.html";
@@ -100,10 +100,10 @@ const server = http.createServer((req, res) => {
 
 server.listen(PORT, () => {
     console.log(`suite static server running at http://localhost:${PORT}/`);
-    console.log(`scene-gen: http://localhost:${PORT}/tools/scene-gen/`);
+    console.log(`stage-gen: http://localhost:${PORT}/tools/stage-gen/`);
     console.log(`palette-maker: http://localhost:${PORT}/tools/palette-maker/`);
     console.log(`image-bpp: http://localhost:${PORT}/tools/image-bpp/`);
-    console.log("Open scene-gen's URL in Chrome or Edge for the folder-picker");
+    console.log("Open stage-gen's URL in Chrome or Edge for the folder-picker");
     console.log("workflow (Firefox falls back to drag-and-drop automatically).");
     console.log("Ctrl+C to stop.");
 });

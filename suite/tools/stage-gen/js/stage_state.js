@@ -1,5 +1,5 @@
 /*
- * scene_state.js
+ * stage_state.js
  *
  * Central editor state, mirroring palette-maker's "PaletteManager" class
  * pattern: one class instance holds all mutable editor state, and every
@@ -9,8 +9,8 @@
  * Units note: instance/camera pos/rot/scale stored here are in VIEWPORT
  * space, i.e. the same Blender-equivalent, un-remapped, unscaled units the
  * artist sees in the 3D viewport (1 unit == 1 Blender/OBJ unit). The
- * PS1-space remap and the *1024 scale to integer scene.json units only
- * happen at export time, in scene_export.js. Keeping raw viewport units
+ * PS1-space remap and the *1024 scale to integer stage.json units only
+ * happen at export time, in stage_export.js. Keeping raw viewport units
  * here means the viewport, OrbitControls, and TransformControls all just
  * work in a single consistent space without back-and-forth conversions
  * during editing.
@@ -32,9 +32,9 @@
  *             default } - plus `uniqueSpawnId: true` on fields that must
  *             be unique across all spawn-like entities.
  *
- * NOTE: these are deliberately NOT exported into scene.json yet - the
+ * NOTE: these are deliberately NOT exported into stage.json yet - the
  * PS1 runtime has no loader for them (all "tbd"). They persist in the
- * .SceneGen project file (format v3) only, so authoring can start now
+ * .StageGen project file (format v3) only, so authoring can start now
  * and the exporter can pick them up whenever main.c grows support.
  */
 export const ENTITY_KINDS = {
@@ -86,9 +86,88 @@ export const ENTITY_KINDS = {
       { key: 'seeThroughWalls', label: 'Draw Through Walls', type: 'bool', default: false },
     ],
   },
+  sound: {
+    // FIRST entity kind the PS1 runtime actually loads: stage_export.js
+    // graduates these into stage.json's "sounds" array (unlike every
+    // other kind above, which is still project-file-only - see the
+    // NOTE on ENTITY_KINDS). Runtime is sfx.c: play modes (loop / once /
+    // random interval), optional directional audio (distance falloff
+    // inside `radius` + stereo pan, updated per frame from the camera),
+    // and mute-after-played (finished sound is forced silent and never
+    // retriggers - it stays resident so a future trigger can re-arm it).
+    label: 'Sound',
+    hint: 'Ambient / one-shot audio emitter',
+    color: '#e05d8a',
+    props: [
+      // Matched against assets/sound/**/<NAME>.vag by 8.3 uppercase
+      // convention at convert time ("wind" -> \WIND.VAG;1). A typo'd or
+      // missing sample degrades to silence at runtime and is counted on
+      // the debug overlay's SFX UNRESOLVED readout - same free-text,
+      // resolve-late philosophy as stage object model names.
+      { key: 'sample',   label: 'Sample Name (e.g. WIND, not WIND.VAG)',    type: 'string', default: '' },
+      { key: 'volume',   label: 'Volume (0-1)',   type: 'number', default: 0.5 },
+      // Mutually exclusive playback behaviors as ONE selector (a set of
+      // tickboxes would allow contradictions like loop+once):
+      //   loop     - continuous: hardware-looped when the VAG carries loop
+      //              flags, otherwise sfx.c re-keys it from the top each
+      //              playthrough (software loop) - so Loop ALWAYS loops,
+      //              however the sample was encoded
+      //   once     - plays a single time at start
+      //   interval - re-fires after a random delay in [intervalMin,
+      //              intervalMax] seconds (bird caws, distant dog barks)
+      //   music    - THIS STAGE'S MUSIC TRACK: the sample name maps to
+      //              assets/sound/music/<NAME>.VAB + <NAME>.SEQ (not a
+      //              .vag), loaded by music.c at boot for the entered
+      //              stage. Position/directional/etc. don't apply - a
+      //              music entity is a stage-level marker that happens
+      //              to live in the entity tree. First one wins if a
+      //              stage authors several.
+      { key: 'mode', label: 'Play Mode', type: 'select', default: 'loop',
+        options: [
+          { value: 'loop',     label: 'Loop' },
+          { value: 'once',     label: 'Play Once' },
+          { value: 'interval', label: 'Random Interval' },
+          { value: 'music',    label: 'Music' },
+        ] },
+      // Music only: when live stage transitioning lands, cross-fade this
+      // track in while the previous stage's music fades out (vs. a hard
+      // cut). Baked into STAGE_SOUND now so stages author it ahead of
+      // that system existing.
+      { key: 'fadeOnStageEnter', label: 'Fade entering new stage', type: 'bool', default: true,
+        showIf: (props) => props.mode === 'music' },
+      // Seconds before the FIRST play (0 = immediate): loop/once start
+      // after the delay; interval schedules its first random fire after
+      // it. Hidden for music - the runtime ignores it there today.
+      { key: 'delay', label: 'Delay (s)', type: 'number', default: 0,
+        showIf: (props) => props.mode !== 'music' },
+      // Bounds of the random silence between plays, in seconds. Only
+      // meaningful - and only SHOWN (showIf, see renderEntityProps) -
+      // in Random Interval mode.
+      { key: 'intervalMin', label: 'Interval Min (s)', type: 'number', default: 2,
+        showIf: (props) => props.mode === 'interval' },
+      { key: 'intervalMax', label: 'Interval Max (s)', type: 'number', default: 8,
+        showIf: (props) => props.mode === 'interval' },
+      // Distance falloff (inside `radius`) + stereo pan, updated per
+      // frame from the camera. Off = constant volume everywhere.
+      // Hidden for music (a track has no world position).
+      { key: 'directional', label: 'Directional Audio', type: 'bool', default: false,
+        showIf: (props) => props.mode !== 'music' },
+      // Falloff radius in viewport units for directional sounds;
+      // 0 = no distance falloff (pan still applies when directional).
+      { key: 'radius',   label: 'Radius (0=global)', type: 'number', default: 0,
+        showIf: (props) => props.mode !== 'music' },
+      // After the sound has completed one playthrough, force it silent
+      // and stop retriggering (loop mode never "finishes", so it
+      // ignores this). Sample + voice stay resident for later re-arming.
+      // Hidden for music.
+      { key: 'muteAfterPlay', label: 'Mute After Played', type: 'bool', default: false,
+        showIf: (props) => props.mode !== 'music' },
+      { key: 'autoplay', label: 'Autoplay',       type: 'bool',   default: true },
+    ],
+  },
 };
 
-export class SceneState {
+export class StageState {
   constructor() {
     // modelName -> { objText, mtlText, materialsMap: Map<matName, decodedTim|null>, dirHandle }
     this.models = new Map();
@@ -105,7 +184,7 @@ export class SceneState {
     // this.nextId counter as instances so a parentId can never be
     // ambiguous between the two kinds. They exist purely to organize the
     // editor's instance list (and are saved in the project file so the
-    // organization survives reload) - scene_export.js flattens them away
+    // organization survives reload) - stage_export.js flattens them away
     // entirely, since the PS1 runtime has no concept of them.
     this.folders = [];
 
@@ -113,7 +192,7 @@ export class SceneState {
     // { id, kind, name, parentId, pos, rot, scale, props }. Same id
     // counter and same tree-parenting rules as instances; props is a
     // flat object matching the kind's schema. Not exported to
-    // scene.json (yet) - see ENTITY_KINDS' note.
+    // stage.json (yet) - see ENTITY_KINDS' note.
     this.entities = [];
 
     // Next spawn ID handed to a freshly created spawn/summon entity.
@@ -125,7 +204,7 @@ export class SceneState {
     // above, pitched down. Since the viewport is Blender-equivalent space
     // (Forward=-Z, Up=Y), a camera at positive Z pointing toward -Z (i.e.
     // toward the objects clustered near the origin) with a downward pitch
-    // gives a reasonable "looking at the scene from a 3/4 angle" starting
+    // gives a reasonable "looking at the stage from a 3/4 angle" starting
     // view without requiring the artist to reposition it before doing
     // anything useful.
     this.camera = {

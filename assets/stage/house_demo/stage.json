@@ -54,9 +54,9 @@
       "model": "honda",
       "palette": 0,
       "pos": [
-        1371,
-        -410,
-        -2633
+        1209,
+        -349,
+        -2387
       ],
       "rot": [
         0,
@@ -106,6 +106,62 @@
         1,
         1
       ]
+    }
+  ],
+  "sounds": [
+    {
+      "sample": "WIND",
+      "pos": [
+        1617,
+        -6762,
+        -6018
+      ],
+      "volume": 0.4,
+      "radius": 0,
+      "mode": "loop",
+      "delay": 0,
+      "fadeOnStageEnter": true,
+      "intervalMin": 2,
+      "intervalMax": 8,
+      "directional": false,
+      "muteAfterPlay": false,
+      "autoplay": true
+    },
+    {
+      "sample": "CAW1",
+      "pos": [
+        -4952,
+        -1983,
+        398
+      ],
+      "volume": 0.1,
+      "radius": 0,
+      "mode": "loop",
+      "delay": 0,
+      "fadeOnStageEnter": true,
+      "intervalMin": 2,
+      "intervalMax": 8,
+      "directional": true,
+      "muteAfterPlay": false,
+      "autoplay": true
+    },
+    {
+      "sample": "SIAMISS",
+      "pos": [
+        892,
+        -6530,
+        -1646
+      ],
+      "volume": 0.5,
+      "radius": 0,
+      "mode": "music",
+      "delay": 0,
+      "fadeOnStageEnter": true,
+      "intervalMin": 2,
+      "intervalMax": 8,
+      "directional": false,
+      "muteAfterPlay": false,
+      "autoplay": true
     }
   ]
 }

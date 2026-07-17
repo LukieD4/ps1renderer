@@ -1,7 +1,7 @@
 /*
  * app.js
  *
- * Entry point / controller. Wires DOM events to scene_state.js mutations
+ * Entry point / controller. Wires DOM events to stage_state.js mutations
  * and viewer.js viewport calls, and re-renders the whole sidebar from a
  * single central updateUI() function after every mutation (mirrors
  * palette-maker's app.js "one central re-render" pattern).
@@ -9,7 +9,7 @@
  * MODULE STRATEGY DEVIATION FROM PALETTE-MAKER:
  * palette-maker's non-module files use the IIFE + `window.PaletteGen`
  * global-namespace pattern, loaded via plain <script> tags in a fixed
- * order. scene-gen deviates from that here: every JS file (including
+ * order. stage-gen deviates from that here: every JS file (including
  * viewer.js and app.js) is a proper ES module using `export`, and
  * index.html loads ONLY this file via <script type="module" src="js/app.js">.
  * This is necessary because the Three.js addons (OBJLoader, OrbitControls,
@@ -25,9 +25,9 @@
 import { pickAssetsFolder, scanModels } from './fs_assets.js';
 import { hasNativeDirectoryPicker, initDropZone } from './dnd_assets.js';
 import { resolveMaterials } from './mtl_resolver.js';
-import { SceneState, ENTITY_KINDS } from './scene_state.js';
-import { buildSceneJson, downloadSceneJson } from './scene_export.js';
-import { buildProjectJson, downloadProjectFile, loadProjectFile } from './scene_project.js';
+import { StageState, ENTITY_KINDS } from './stage_state.js';
+import { buildStageJson, downloadStageJson } from './stage_export.js';
+import { buildProjectJson, downloadProjectFile, loadProjectFile } from './stage_project.js';
 import { pushHistory, undo, redo, canUndo, canRedo, clearHistory } from './history.js';
 import { showError, showWarning, showInfo } from './toast.js';
 import { showConfirm } from './modal.js';
@@ -86,11 +86,11 @@ const modeButtons = {
 
 const btnLoadProject = document.getElementById('btn-load-project');
 const btnSaveProject = document.getElementById('btn-save-project');
-const btnExportScene = document.getElementById('btn-export-scene');
+const btnExportStage = document.getElementById('btn-export-stage');
 const fileLoadProject = document.getElementById('file-load-project');
 
 // ---- app state ----
-const state = new SceneState();
+const state = new StageState();
 let activeModelName = null; // the Assets-list model currently highlighted (loaded/previewed)
 let currentTransformMode = 'translate';
 
@@ -121,7 +121,7 @@ function round3(value) {
 }
 
 /**
- * Make the VIEWPORT (Three.js scene) match state.instances, INCREMENTALLY:
+ * Make the VIEWPORT (Three.js stage) match state.instances, INCREMENTALLY:
  *   - remove any tracked viewport instance whose id no longer exists in
  *     state.instances at all (deletions, or a full state swap)
  *   - add any state.instances entry that ISN'T yet represented in the
@@ -237,7 +237,7 @@ async function handleRootFolderHandle(rootHandle) {
   // Store the discovered handles for on-demand loading when the user
   // clicks a model in the list (avoids loading every model's .obj/.mtl/
   // .tim data up front, which could be slow for a large assets folder).
-  window.__sceneGenDiscoveredModels = found;
+  window.__stageGenDiscoveredModels = found;
 
   // BUG FIX (project-first, assets-second ordering): the auto-load of a
   // project's referenced models used to live ONLY in the project-load
@@ -271,7 +271,7 @@ async function handleRootFolderHandle(rootHandle) {
 // Firefox (and anything else missing that API) gets a drag-and-drop zone
 // instead, since Firefox has no native directory picker and the known
 // showDirectoryPicker() ponyfill doesn't reliably walk more than one
-// level deep - not safe for this tool's two-level assets/<model>/textures/
+// level deep - not safe for this tool's two-level assets/object/<model>/textures/
 // structure. See dnd_assets.js's header comment for the full story.
 if (hasNativeDirectoryPicker()) {
   btnOpenAssets.classList.remove('hidden');
@@ -335,10 +335,10 @@ async function loadModelData(modelEntry) {
     dirHandle: modelEntry.dirHandle,
   });
 
-  const strayCount = viewer.loadModelIntoScene(modelEntry.name, objText, materialsMap);
+  const strayCount = viewer.loadModelIntoStage(modelEntry.name, objText, materialsMap);
   if (strayCount > 0) {
     // Stray edges/points would otherwise silently turn the whole object
-    // into a wireframe (see loadModelIntoScene's sanitization comment).
+    // into a wireframe (see loadModelIntoStage's sanitization comment).
     // The viewer already stripped them; this warning is so the artist
     // knows to clean the source asset (Blender: Mesh > Clean Up >
     // Delete Loose) rather than shipping strays to the PS1 converter.
@@ -435,7 +435,7 @@ function renderModelList(discoveredModels) {
  * transform back into state and selects the new instance.
  */
 async function spawnInstanceFromAsset(modelName, place) {
-  const discovered = window.__sceneGenDiscoveredModels || [];
+  const discovered = window.__stageGenDiscoveredModels || [];
   const entry = discovered.find((d) => d.name === modelName);
   if (!entry) return;
 
@@ -1305,7 +1305,7 @@ document.getElementById('view-grid').addEventListener('click', () => viewer.togg
 
 btnSaveProject.addEventListener('click', () => {
   const json = buildProjectJson(state);
-  downloadProjectFile(json, 'development.SceneGen');
+  downloadProjectFile(json, 'development.StageGen');
   isDirty = false; // saved - beforeunload prompt no longer needed until the next mutation
 });
 
@@ -1327,7 +1327,7 @@ fileLoadProject.addEventListener('change', async () => {
   }
 
   // Reset instance/camera state from the loaded project. Model BINARY data
-  // (dirHandle, materialsMap) is NOT restored - see scene_project.js
+  // (dirHandle, materialsMap) is NOT restored - see stage_project.js
   // header comment for why - but if the referenced model is ALREADY loaded
   // in this session's state.models (e.g. the assets folder was opened
   // before loading this project, or is still open from earlier), there is
@@ -1397,7 +1397,7 @@ fileLoadProject.addEventListener('change', async () => {
 
   // Auto-load every model this project's instances reference, PROVIDED
   // the assets folder is already open this session (i.e. its entry
-  // exists in window.__sceneGenDiscoveredModels - populated by
+  // exists in window.__stageGenDiscoveredModels - populated by
   // handleRootFolderHandle() when "Open Assets Folder" was used, at any
   // point before or after this project load). Previously the user had to
   // manually click each model name in the sidebar list one at a time
@@ -1407,7 +1407,7 @@ fileLoadProject.addEventListener('change', async () => {
   // the template), this just calls it automatically for every name the
   // project actually needs instead of waiting for a click per model.
   const referencedModelNames = new Set(state.instances.map((inst) => inst.model));
-  const discovered = window.__sceneGenDiscoveredModels || [];
+  const discovered = window.__stageGenDiscoveredModels || [];
   for (const name of referencedModelNames) {
     const entry = discovered.find((d) => d.name === name);
     if (entry) await loadModelData(entry);
@@ -1425,7 +1425,7 @@ fileLoadProject.addEventListener('change', async () => {
   updateUI();
 });
 
-btnExportScene.addEventListener('click', () => {
+btnExportStage.addEventListener('click', () => {
   const warnings = state.validatePaletteAssignments();
   if (warnings.length > 0) {
     // We warn but do not block export: a slightly out-of-range palette
@@ -1437,8 +1437,8 @@ btnExportScene.addEventListener('click', () => {
     showWarning(`Palette warnings:\n${warnings.map((w) => w.message).join('\n')}`);
   }
 
-  const json = buildSceneJson(state);
-  downloadSceneJson(json, 'scene.json');
+  const json = buildStageJson(state);
+  downloadStageJson(json, 'stage.json');
 });
 
 // ==========================================================================
@@ -1491,7 +1491,7 @@ window.addEventListener('keydown', (event) => {
   // Don't hijack Ctrl+Z/Delete/Ctrl+D while editing a number field - e.g.
   // Backspace needs to delete a character in a focused input, not the
   // selected 3D instance, and Ctrl+Z inside a field should probably use
-  // the browser's own native text-undo rather than the scene history.
+  // the browser's own native text-undo rather than the stage history.
   if (tag === 'INPUT' || tag === 'TEXTAREA') return;
 
   const isUndo = (event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'z';
@@ -1568,7 +1568,13 @@ window.addEventListener('keydown', (event) => {
 /**
  * Rebuild the entity Parameters section for the selected entity from
  * its ENTITY_KINDS schema: checkboxes for bools, number inputs for
- * int/number, text inputs for strings. Committing a change pushes one
+ * int/number, text inputs for strings, dropdowns for selects (propDef
+ * carries an `options: [{ value, label }]` list; the committed prop
+ * value is the option's `value` string). A propDef may also carry
+ * `showIf: (props) => bool` - the field is skipped entirely while the
+ * predicate is false (e.g. sound interval bounds only exist in Random
+ * Interval mode); committing a select re-renders the section so those
+ * dependent fields appear/disappear immediately. Committing a change pushes one
  * undo entry, writes the prop, and forwards it to the viewer so live
  * visuals (summon patrol ring, billboard tracking/through-walls) update
  * immediately.
@@ -1588,6 +1594,11 @@ function renderEntityProps(ent) {
   entityPropsBodyEl.innerHTML = '';
 
   for (const propDef of def.props) {
+    // Conditionally-relevant fields (showIf) are skipped while their
+    // predicate is false - the stored prop value is untouched, it just
+    // isn't editable (or exported as meaningful) in that state.
+    if (propDef.showIf && !propDef.showIf(ent.props)) continue;
+
     const commit = (rawValue, inputEl) => {
       let value = rawValue;
       if (propDef.type === 'int') value = parseInt(rawValue, 10);
@@ -1602,6 +1613,16 @@ function renderEntityProps(ent) {
       markDirty();
       ent.props[propDef.key] = value;
       viewer.updateEntityProps(ent.id, ent.props);
+
+      // A select can change which showIf fields are relevant (e.g. Play
+      // Mode -> interval bounds) - rebuild the section so they appear/
+      // disappear immediately. Blur first: renderEntityProps skips the
+      // rebuild while focus sits inside the section (anti-keystroke-eating
+      // guard), which would otherwise swallow this refresh.
+      if (propDef.type === 'select') {
+        if (inputEl && typeof inputEl.blur === 'function') inputEl.blur();
+        renderEntityProps(ent);
+      }
 
       // Spawn-ID uniqueness is soft-validated (warn, don't block), same
       // philosophy as palette rows: the author may be mid-renumber.
@@ -1623,6 +1644,26 @@ function renderEntityProps(ent) {
       text.textContent = propDef.label;
       label.appendChild(checkbox);
       label.appendChild(text);
+      entityPropsBodyEl.appendChild(label);
+    } else if (propDef.type === 'select') {
+      const label = document.createElement('label');
+      label.className = 'field-full';
+      label.textContent = propDef.label;
+      const select = document.createElement('select');
+      for (const opt of propDef.options || []) {
+        const optionEl = document.createElement('option');
+        optionEl.value = opt.value;
+        optionEl.textContent = opt.label;
+        select.appendChild(optionEl);
+      }
+      // An unknown stored value (e.g. a project file from a future
+      // schema) falls back to the DEFAULT option rather than silently
+      // committing whatever the browser picked first.
+      const current = ent.props[propDef.key];
+      const valid = (propDef.options || []).some((opt) => opt.value === current);
+      select.value = valid ? current : propDef.default;
+      select.addEventListener('change', () => commit(select.value, select));
+      label.appendChild(select);
       entityPropsBodyEl.appendChild(label);
     } else {
       const label = document.createElement('label');
@@ -1659,7 +1700,7 @@ function refreshTransformFields() {
   const selected = selectedInst || selectedEnt;
 
   // The Properties dock swaps between the "no selection" placeholder and
-  // the object sections; the Scene Camera section below them is always
+  // the object sections; the Stage Camera section below them is always
   // visible regardless. Model instances show Appearance (palette),
   // editor entities show their kind's Parameters section instead.
   propsNoSelectionEl.classList.toggle('hidden', !!selected);
@@ -1726,12 +1767,12 @@ const vramWarningsEl = document.getElementById('vram-warnings');
 // hand-maintained (the web tool can't read main.c) - if main.c's values
 // ever change, change them here too:
 //   #define MAX_MODELS        16
-//   #define MAX_SCENE_OBJECTS 32
+//   #define MAX_STAGE_OBJECTS 32
 //   #define MAX_TEXTURES      32
 //   #define MAX_MODEL_TRIS    256
 const MAINC_LIMITS = {
   models: 16,
-  sceneObjects: 32,
+  stageObjects: 32,
   textures: 32,
   modelTris: 256,
 };
@@ -1746,11 +1787,11 @@ const maincWarningsEl = document.getElementById('mainc-warnings');
  * instances, total placed instances, and unique textures, each against
  * the runtime's hardcoded array sizes. Values at/over their limit turn
  * red - the PS1 loader clamps/rejects past these, so an over-budget
- * scene here IS a broken scene there.
+ * stage here IS a broken stage there.
  */
 function renderMaincPanel(uniqueTextureCount) {
   // main.c's MAX_MODELS bounds its model table - count DISTINCT models
-  // actually referenced by placed instances (what a scene load consumes),
+  // actually referenced by placed instances (what a stage load consumes),
   // not how many happen to be loaded in this editor session.
   const modelsUsed = new Set(state.instances.map((inst) => inst.model)).size;
   const objectsUsed = state.instances.length;
@@ -1758,15 +1799,15 @@ function renderMaincPanel(uniqueTextureCount) {
   maincModelsLabel.textContent = `${modelsUsed} / ${MAINC_LIMITS.models}`;
   maincModelsLabel.classList.toggle('limit-danger', modelsUsed > MAINC_LIMITS.models);
 
-  maincObjectsLabel.textContent = `${objectsUsed} / ${MAINC_LIMITS.sceneObjects}`;
-  maincObjectsLabel.classList.toggle('limit-danger', objectsUsed > MAINC_LIMITS.sceneObjects);
+  maincObjectsLabel.textContent = `${objectsUsed} / ${MAINC_LIMITS.stageObjects}`;
+  maincObjectsLabel.classList.toggle('limit-danger', objectsUsed > MAINC_LIMITS.stageObjects);
 
   maincTexturesLabel.textContent = `${uniqueTextureCount} / ${MAINC_LIMITS.textures}`;
   maincTexturesLabel.classList.toggle('limit-danger', uniqueTextureCount > MAINC_LIMITS.textures);
 
   const warnings = [];
-  if (objectsUsed > MAINC_LIMITS.sceneObjects) {
-    warnings.push(`Too many instances: main.c only loads ${MAINC_LIMITS.sceneObjects} scene objects.`);
+  if (objectsUsed > MAINC_LIMITS.stageObjects) {
+    warnings.push(`Too many instances: main.c only loads ${MAINC_LIMITS.stageObjects} stage objects.`);
   }
   if (modelsUsed > MAINC_LIMITS.models) {
     warnings.push(`Too many distinct models: main.c's model table holds ${MAINC_LIMITS.models}.`);
@@ -1823,13 +1864,13 @@ function updateUI() {
   renderVramPanel();
 
   // Export button enabled only when at least one model is loaded AND at
-  // least one instance has been placed - an empty scene.json with zero
+  // least one instance has been placed - an empty stage.json with zero
   // objects is technically valid JSON but not a useful export target, so
   // we gate on there being something to actually export.
-  btnExportScene.disabled = !(state.models.size > 0 && state.instances.length > 0);
+  btnExportStage.disabled = !(state.models.size > 0 && state.instances.length > 0);
 
-  if (window.__sceneGenDiscoveredModels) {
-    renderModelList(window.__sceneGenDiscoveredModels);
+  if (window.__stageGenDiscoveredModels) {
+    renderModelList(window.__stageGenDiscoveredModels);
   }
 
   renderInstanceList();

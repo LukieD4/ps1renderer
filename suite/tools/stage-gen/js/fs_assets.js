@@ -1,7 +1,7 @@
 /*
  * fs_assets.js
  *
- * Wraps the browser File System Access API (FSA API) for scene-gen.
+ * Wraps the browser File System Access API (FSA API) for stage-gen.
  * We use `window.showDirectoryPicker()` instead of a plain <input type="file">
  * because the tool needs to walk a whole assets folder tree (model subfolders,
  * their .obj/.mtl, and their textures/ subfolder full of .tim files) and
@@ -10,9 +10,9 @@
  * handles or relative-path resolution, only flat file lists.
  *
  * Folder-naming convention (mirrors the Python OBJ/TIM export pipeline):
- *   assets/<model_name>/<model_name>.obj
- *   assets/<model_name>/<model_name>.mtl
- *   assets/<model_name>/textures/<MaterialName>.tim
+ *   assets/object/<model_name>/<model_name>.obj
+ *   assets/object/<model_name>/<model_name>.mtl
+ *   assets/object/<model_name>/textures/<MaterialName>.tim
  * i.e. the model's folder name and its .obj/.mtl base filename are always
  * identical. This lets scanModels() find a model's files without parsing
  * any manifest - it just checks for <dirname>/<dirname>.obj and .mtl.
@@ -42,12 +42,29 @@ export async function pickAssetsFolder() {
  * that unrelated folders (e.g. a stray textures-only folder) don't break
  * the scan.
  *
+ * Model folders canonically live one level down, under object/
+ * (assets/object/<model>/...). To keep the tool forgiving about exactly
+ * which folder gets dropped, we transparently descend into an "object"
+ * subdirectory when the dropped root has one - so dropping the whole
+ * assets/ folder (which also contains sound/ and stage/) works just as
+ * well as dropping assets/object/ itself.
+ *
  * Returns: Array<{name, dirHandle, objHandle, mtlHandle}>
  */
 export async function scanModels(rootDirHandle) {
   const results = [];
 
-  for await (const [entryName, entryHandle] of rootDirHandle.entries()) {
+  // If the dropped root contains an object/ folder, that's where the
+  // model folders actually live - scan inside it. Otherwise assume the
+  // root already IS the models folder (e.g. assets/object was dropped).
+  let modelsRoot = rootDirHandle;
+  try {
+    modelsRoot = await rootDirHandle.getDirectoryHandle('object');
+  } catch (err) {
+    // No object/ subdir - fall through and scan rootDirHandle directly.
+  }
+
+  for await (const [entryName, entryHandle] of modelsRoot.entries()) {
     if (entryHandle.kind !== 'directory') continue;
 
     const modelName = entryName;

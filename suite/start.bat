@@ -1,5 +1,5 @@
 @echo off
-REM start.bat - launches scene-gen's local static server and opens it
+REM start.bat - launches stage-gen's local static server and opens it
 REM in the default browser. Double-click this file instead of running
 REM `node serve.js` by hand. Requires Node.js to be installed and on PATH.
 
@@ -14,4 +14,4 @@ if errorlevel 1 (
 )
 
 start "" http://localhost:8420/index.html
-node tools/scene-gen/serve.js 8420
+node tools/stage-gen/serve.js 8420

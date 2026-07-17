@@ -240,8 +240,110 @@
         "health": 100,
         "canSeeThroughWalls": false
       }
+    },
+    {
+      "id": 14,
+      "kind": "sound",
+      "name": "Wind SFX",
+      "parentId": null,
+      "pos": {
+        "x": 1.579,
+        "y": 6.604,
+        "z": 5.877
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "sample": "WIND",
+        "volume": 0.4,
+        "mode": "loop",
+        "fadeOnStageEnter": true,
+        "delay": 0,
+        "intervalMin": 2,
+        "intervalMax": 8,
+        "directional": false,
+        "radius": 0,
+        "muteAfterPlay": false,
+        "autoplay": true
+      }
+    },
+    {
+      "id": 15,
+      "kind": "sound",
+      "name": "Cawcaw",
+      "parentId": null,
+      "pos": {
+        "x": -4.836,
+        "y": 1.937,
+        "z": -0.389
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "sample": "CAW1",
+        "volume": 0.1,
+        "mode": "loop",
+        "fadeOnStageEnter": true,
+        "delay": 0,
+        "intervalMin": 2,
+        "intervalMax": 8,
+        "directional": true,
+        "radius": 0,
+        "muteAfterPlay": false,
+        "autoplay": true
+      }
+    },
+    {
+      "id": 16,
+      "kind": "sound",
+      "name": "Music - Something is amiss",
+      "parentId": null,
+      "pos": {
+        "x": 0.871,
+        "y": 6.377,
+        "z": 1.607
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "sample": "SIAMISS",
+        "volume": 0.5,
+        "mode": "music",
+        "fadeOnStageEnter": true,
+        "delay": 0,
+        "intervalMin": 2,
+        "intervalMax": 8,
+        "directional": false,
+        "radius": 0,
+        "muteAfterPlay": false,
+        "autoplay": true
+      }
     }
   ],
-  "nextId": 14,
+  "nextId": 17,
   "nextSpawnId": 5
 }

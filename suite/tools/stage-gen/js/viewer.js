@@ -1,7 +1,7 @@
 /*
  * viewer.js
  *
- * Three.js viewport module for scene-gen. This is a module-level singleton
+ * Three.js viewport module for stage-gen. This is a module-level singleton
  * (there is only ever one <canvas id="viewport-canvas"> on the page), so
  * rather than exporting a class we keep viewer state in module-scope
  * variables and export plain functions that operate on it - simpler for
@@ -10,10 +10,10 @@
  * COORDINATE SPACE NOTE: everything in this module operates in "viewport
  * space", which is the SAME space the source .obj files were authored in
  * (Blender: Forward=-Z, Up=Y). Three.js's default world orientation is
- * already Y-up, so no special camera/scene rotation is needed to make the
+ * already Y-up, so no special camera/stage rotation is needed to make the
  * viewport "feel like Blender" - we just don't apply the renderer-space
  * coordinate remap here at all. That remap only happens at export time,
- * in scene_export.js.
+ * in stage_export.js.
  */
 
 import * as THREE from 'three';
@@ -25,7 +25,7 @@ const CAMERA_GIZMO_ID = '__camera__';
 
 // ---- module-level viewer state ----
 let renderer = null;
-let scene = null;
+let stage = null;
 let editCamera = null; // the camera we look through while editing (not the exported PS1 camera)
 let orbitControls = null;
 let transformControls = null;
@@ -34,7 +34,7 @@ let canvas = null;
 
 // ---- axis gizmo (Blender-style orientation cube, top-right overlay) ----
 let gizmoRenderer = null;
-let gizmoScene = null;
+let gizmoStage = null;
 let gizmoCamera = null;
 let gizmoCanvas = null;
 let gizmoRaycaster = null;
@@ -50,10 +50,10 @@ let cameraGizmo = null; // small cone mesh representing the exported PS1 camera'
 let grid = null; // GridHelper, kept module-level so toggleGridVisible() can reach it
 
 // modelName -> triangle count of the parsed template (computed once at
-// load time in loadModelIntoScene, displayed in the sidebar model list).
+// load time in loadModelIntoStage, displayed in the sidebar model list).
 const modelTriCounts = new Map();
 
-// modelName -> parsed template Object3D (never added to `scene` directly, only cloned)
+// modelName -> parsed template Object3D (never added to `stage` directly, only cloned)
 const modelTemplates = new Map();
 
 // instanceId -> { object3D, modelName, materialTimData: Map<materialName, decodedTim> }
@@ -80,7 +80,7 @@ let suppressNextClick = false;
  * flipY - traced end-to-end against py_convert_assets.py (the ONLY other
  * place in this whole toolchain that touches V), not guessed:
  * ----------------------------------------------------------------------
- *   1. OBJLoader.parse() (used in loadModelIntoScene() below) loads 'vt'
+ *   1. OBJLoader.parse() (used in loadModelIntoStage() below) loads 'vt'
  *      lines completely RAW, with zero modification. Raw OBJ V uses the
  *      OBJ/Blender convention: v=0 is the BOTTOM of the texture as the
  *      artist sees it in their image editor.
@@ -124,7 +124,7 @@ function buildDataTexture(decodedTim, row) {
 }
 
 /**
- * Initialize the renderer, scene, cameras, lights, grid, and controls.
+ * Initialize the renderer, stage, cameras, lights, grid, and controls.
  * Call once at app startup with the main viewport <canvas> and the small
  * overlay <canvas> the axis orientation gizmo renders into (top-right
  * corner, see tool.css #viewport-gizmo-canvas).
@@ -135,8 +135,8 @@ export function initViewer(canvasEl, gizmoCanvasEl) {
   renderer = new THREE.WebGLRenderer({ canvas, antialias: true });
   renderer.setPixelRatio(window.devicePixelRatio || 1);
 
-  scene = new THREE.Scene();
-  scene.background = new THREE.Color(0x1a1a1e);
+  stage = new THREE.Scene();
+  stage.background = new THREE.Color(0x1a1a1e);
 
   editCamera = new THREE.PerspectiveCamera(60, 1, 0.01, 1000);
   editCamera.position.set(6, 5, 10);
@@ -150,15 +150,15 @@ export function initViewer(canvasEl, gizmoCanvasEl) {
   // Blender/OBJ unit == 1024 exported PS1 units, so this grid gives the
   // artist a sense of scale that lines up with the export math.
   grid = new THREE.GridHelper(20, 20);
-  scene.add(grid);
+  stage.add(grid);
 
-  scene.add(new THREE.AmbientLight(0xffffff, 0.6));
+  stage.add(new THREE.AmbientLight(0xffffff, 0.6));
   const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
   dirLight.position.set(5, 10, 7.5);
-  scene.add(dirLight);
+  stage.add(dirLight);
 
   transformControls = new TransformControls(editCamera, canvas);
-  scene.add(transformControls.getHelper ? transformControls.getHelper() : transformControls);
+  stage.add(transformControls.getHelper ? transformControls.getHelper() : transformControls);
 
   // Hold Ctrl while dragging = snap to grid (1 unit, matching the
   // GridHelper's 1-unit divisions and therefore 1024 exported PS1 units).
@@ -275,7 +275,7 @@ export function initViewer(canvasEl, gizmoCanvasEl) {
   cameraGizmo = new THREE.Mesh(gizmoGeometry, gizmoMaterial);
   cameraGizmo.position.set(0, 2, 8);
   cameraGizmo.rotation.x = THREE.MathUtils.degToRad(-20);
-  scene.add(cameraGizmo);
+  stage.add(cameraGizmo);
 
   raycaster = new THREE.Raycaster();
   canvas.addEventListener('mousedown', onCanvasMouseDown);
@@ -361,7 +361,7 @@ function renderLoop() {
       THREE.MathUtils.degToRad(inst.props.pivotAngle || 0);
   }
 
-  renderer.render(scene, editCamera);
+  renderer.render(stage, editCamera);
   renderAxisGizmo();
 }
 
@@ -370,7 +370,7 @@ function renderLoop() {
 // ==========================================================================
 //
 // Six colored balls on the end of three axis stalks (+X/-X/+Y/-Y/+Z/-Z),
-// rendered in its OWN small scene/camera/renderer that always mirrors the
+// rendered in its OWN small stage/camera/renderer that always mirrors the
 // main editCamera's ORIENTATION (not position - the gizmo camera is fixed
 // at a constant distance looking at the origin, only its rotation is
 // copied every frame) - exactly like Blender's viewport gizmo: it shows
@@ -392,7 +392,7 @@ function initAxisGizmo(gizmoCanvasEl) {
   gizmoRenderer = new THREE.WebGLRenderer({ canvas: gizmoCanvas, alpha: true, antialias: true });
   gizmoRenderer.setPixelRatio(window.devicePixelRatio || 1);
 
-  gizmoScene = new THREE.Scene();
+  gizmoStage = new THREE.Scene();
 
   // Orthographic so the gizmo doesn't get perspective-distorted at this
   // tiny size, and fixed at a constant distance from the origin - only
@@ -402,7 +402,7 @@ function initAxisGizmo(gizmoCanvasEl) {
   gizmoCamera = new THREE.OrthographicCamera(-1.6, 1.6, 1.6, -1.6, 0.1, 10);
   gizmoCamera.position.set(0, 0, 4);
 
-  gizmoScene.add(new THREE.AmbientLight(0xffffff, 1.0));
+  gizmoStage.add(new THREE.AmbientLight(0xffffff, 1.0));
 
   // Thin stalks from the origin to each axis ball, so the gizmo reads as
   // "spokes" rather than 6 disconnected floating dots (matches Blender's
@@ -413,13 +413,13 @@ function initAxisGizmo(gizmoCanvasEl) {
       axis.dir.clone().multiplyScalar(0.9),
     ]);
     const stalk = new THREE.Line(stalkGeom, new THREE.LineBasicMaterial({ color: axis.color }));
-    gizmoScene.add(stalk);
+    gizmoStage.add(stalk);
 
     const ballGeom = new THREE.SphereGeometry(0.28, 16, 16);
     const ballMat = new THREE.MeshBasicMaterial({ color: axis.color });
     const ball = new THREE.Mesh(ballGeom, ballMat);
     ball.position.copy(axis.dir).multiplyScalar(0.9);
-    gizmoScene.add(ball);
+    gizmoStage.add(ball);
 
     gizmoAxisMeshes.push({ mesh: ball, dir: axis.dir, label: axis.label });
   }
@@ -437,7 +437,7 @@ function handleGizmoResize() {
 }
 
 function renderAxisGizmo() {
-  if (!gizmoRenderer || !gizmoScene || !gizmoCamera || !editCamera) return;
+  if (!gizmoRenderer || !gizmoStage || !gizmoCamera || !editCamera) return;
 
   // Copy ONLY the main camera's orientation (via lookAt from a fixed
   // distance along the same direction), not its position - see this
@@ -448,7 +448,7 @@ function renderAxisGizmo() {
   gizmoCamera.lookAt(0, 0, 0);
   gizmoCamera.up.copy(editCamera.up);
 
-  gizmoRenderer.render(gizmoScene, gizmoCamera);
+  gizmoRenderer.render(gizmoStage, gizmoCamera);
 }
 
 function onGizmoClick(event) {
@@ -472,7 +472,7 @@ function onGizmoClick(event) {
  * Snap the editing orbit camera to look straight down the given axis
  * direction, preserving the current distance from the orbit target (so
  * "Front"/"Top"/"Side"/clicking a gizmo ball all feel like re-framing the
- * SAME scene rather than resetting zoom too).
+ * SAME stage rather than resetting zoom too).
  *
  * ----------------------------------------------------------------------
  * WHY THIS NEVER TOUCHES editCamera.up (fixes the "drunk controls" bug)
@@ -892,9 +892,9 @@ export function placeInstanceAtViewCenter(id) {
 /**
  * Parse an .obj's text and materialsMap into a reusable template Object3D,
  * stored keyed by modelName. The template itself is never added to the
- * scene - addInstance() clones it per placed instance.
+ * stage - addInstance() clones it per placed instance.
  */
-export function loadModelIntoScene(modelName, objText, materialsMap) {
+export function loadModelIntoStage(modelName, objText, materialsMap) {
   // ------------------------------------------------------------------
   // STRAY EDGE/POINT SANITIZATION (confirmed root cause of the "faces
   // not filled / wireframe only / falling through the grass in walk
@@ -942,7 +942,7 @@ export function loadModelIntoScene(modelName, objText, materialsMap) {
   // reading as transparent). main.c's own PS1 renderer does its OWN
   // software backface cull at runtime (see draw_object_into_ot()'s
   // cross-product winding test) using whatever winding the export
-  // pipeline actually produces, so scene-gen showing both sides here is
+  // pipeline actually produces, so stage-gen showing both sides here is
   // purely an editing-time convenience - it doesn't need to match the
   // PS1 runtime's culling 1:1, and erring toward "always visible while
   // authoring" is much less confusing than a mesh silently vanishing.
@@ -1059,10 +1059,10 @@ export function frameInstance(id) {
 
 /**
  * Clone the stored template for `modelName`, apply the initial transform,
- * add it to the scene, and track it under `id`.
+ * add it to the stage, and track it under `id`.
  *
  * `materialsMap` is the SAME Map<materialName, decodedTim|null> that was
- * passed to loadModelIntoScene() for this model (app.js keeps it around on
+ * passed to loadModelIntoStage() for this model (app.js keeps it around on
  * state.models). We store it per-instance (materialTimData) rather than
  * relying on a shared reference, because updateInstancePaletteRow() needs
  * the raw decoded CLUT/index data to rebuild a DataTexture for whichever
@@ -1094,7 +1094,7 @@ export function addInstance(id, modelName, initialTransform = {}, materialsMap =
       : child.material.clone();
   });
 
-  scene.add(object3D);
+  stage.add(object3D);
 
   const materialTimData = materialsMap ? new Map(materialsMap) : new Map();
 
@@ -1111,7 +1111,7 @@ export function addInstance(id, modelName, initialTransform = {}, materialsMap =
   object3D.scale.set(scaleV.x, scaleV.y, scaleV.z);
 
   // currentPaletteRow starts at 0 because the cloned material's texture
-  // came from the template, which loadModelIntoScene() always builds at
+  // came from the template, which loadModelIntoStage() always builds at
   // row 0 (see its own comment) - so a freshly added instance is
   // genuinely showing row 0 until updateInstancePaletteRow() says
   // otherwise. This must be set correctly here (not left undefined) for
@@ -1130,20 +1130,21 @@ export function addInstance(id, modelName, initialTransform = {}, materialsMap =
 // ==========================================================================
 //
 // Entities are tracked in the SAME `instances` map as model instances
-// (ids never collide - SceneState hands out one shared id sequence), so
+// (ids never collide - StageState hands out one shared id sequence), so
 // click-selection raycasts, TransformControls attachment, removal, and
 // frame-selected all work on them with zero extra plumbing. Entries are
 // marked `isEntity: true` so the systems where a marker gizmo must NOT
 // behave like world geometry - freecam walking, seam-snap neighbors,
 // surface-snap raycast targets - can skip them.
 //
-// Colors mirror scene_state.js's ENTITY_KINDS (CSS side). Keep in sync.
+// Colors mirror stage_state.js's ENTITY_KINDS (CSS side). Keep in sync.
 const ENTITY_COLORS = {
   trigger: 0xff8c42,
   spawn: 0x5dd06a,
   summon: 0xb06ee0,
   particle: 0xffd23c,
   billboard: 0x3ec6dc,
+  sound: 0xe05d8a,
 };
 
 /** LineLoop circle geometry in the XZ plane (patrol radius rings). */
@@ -1245,6 +1246,36 @@ function buildEntityMeshes(group, kind, color, props) {
       group.add(frame);
       break;
     }
+    case 'sound': {
+      // Speaker-ish marker: solid core sphere + two concentric wireframe
+      // "emission" shells, plus a ground-plane radius ring (like summon's
+      // patrol ring) that live-tracks the falloff radius prop. Radius 0
+      // means "global/non-directional" - the ring is hidden then (see
+      // applyEntityPropsToMeshes).
+      const core = new THREE.Mesh(
+        new THREE.SphereGeometry(0.16, 12, 8),
+        new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.9 })
+      );
+      core.position.y = 0.25;
+      group.add(core);
+      for (const r of [0.3, 0.44]) {
+        const shell = new THREE.Mesh(
+          new THREE.SphereGeometry(r, 12, 8),
+          new THREE.MeshBasicMaterial({ color, wireframe: true, transparent: true, opacity: 0.3 })
+        );
+        shell.position.y = 0.25;
+        group.add(shell);
+      }
+      const ring = new THREE.LineLoop(
+        makeCircleGeometry(Math.max(0, props.radius || 0)),
+        new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.6 })
+      );
+      ring.name = 'soundRadiusRing';
+      ring.position.y = 0.02;
+      ring.visible = (props.radius || 0) > 0;
+      group.add(ring);
+      break;
+    }
     default: {
       const fallback = new THREE.Mesh(
         new THREE.SphereGeometry(0.25, 12, 8),
@@ -1259,7 +1290,7 @@ export function addEntityHelper(id, kind, initialTransform = {}, props = {}) {
   const group = new THREE.Group();
   const color = ENTITY_COLORS[kind] || 0xffffff;
   buildEntityMeshes(group, kind, color, props);
-  scene.add(group);
+  stage.add(group);
 
   const pos = { x: 0, y: 0, z: 0, ...(initialTransform.pos || {}) };
   const rot = { x: 0, y: 0, z: 0, ...(initialTransform.rot || {}) };
@@ -1301,6 +1332,16 @@ function applyEntityPropsToMeshes(inst) {
     }
   }
 
+  if (inst.kind === 'sound') {
+    const ring = inst.object3D.getObjectByName('soundRadiusRing');
+    if (ring) {
+      const r = Math.max(0, inst.props.radius || 0);
+      ring.geometry.dispose();
+      ring.geometry = makeCircleGeometry(r);
+      ring.visible = r > 0; // 0 = global/non-directional, no falloff circle to show
+    }
+  }
+
   if (inst.kind === 'billboard') {
     const onTop = !!inst.props.seeThroughWalls;
     inst.object3D.traverse((child) => {
@@ -1326,7 +1367,7 @@ export function updateEntityProps(id, props) {
  * Returns an array of every instance id currently tracked/rendered in the
  * viewport. Used by app.js's resyncViewportFromState() (see its own
  * comment) to clear the viewport down to nothing before re-adding
- * instances from a freshly-restored SceneState snapshot (project load,
+ * instances from a freshly-restored StageState snapshot (project load,
  * undo/redo) - it needs a way to enumerate "what's currently shown" from
  * outside this module, since `instances` itself is module-private.
  */
@@ -1343,7 +1384,7 @@ export function removeInstance(id) {
     currentTransformTarget = null;
   }
 
-  scene.remove(inst.object3D);
+  stage.remove(inst.object3D);
   // Dispose anything carrying GPU resources - meshes AND line objects
   // (entity helpers are built from LineSegments/LineLoop as well as
   // meshes; checking only isMesh would leak their geometries).
@@ -1730,7 +1771,7 @@ function toggleFreecamWalk() {
 }
 
 /**
- * Collect every mesh currently placed in the scene that walk-mode's ground
+ * Collect every mesh currently placed in the stage that walk-mode's ground
  * raycast should be able to stand on: all instance geometry, plus the grid
  * helper is deliberately EXCLUDED (GridHelper is a LineSegments object, not
  * a walkable surface, and including it would make the raycaster treat an
@@ -1741,7 +1782,7 @@ function toggleFreecamWalk() {
 // EVERY walk-mode frame. The set of meshes only actually changes when an
 // instance is added or removed, so addInstance()/removeInstance() just
 // invalidate the cache (see invalidateWalkableMeshCache) and the traverse
-// runs once per scene change instead of 60x/sec.
+// runs once per stage change instead of 60x/sec.
 let walkableMeshCache = null;
 
 function invalidateWalkableMeshCache() {

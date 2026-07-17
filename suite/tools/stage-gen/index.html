@@ -3,7 +3,7 @@
 <head>
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title>scene-gen | PS1 Toolchain</title>
+<title>stage-gen | PS1 Toolchain</title>
 
 <!-- Shared site styles (lives outside this tool's folder, part of the suite shell) -->
 <link rel="stylesheet" href="../../css/site.css">
@@ -24,17 +24,17 @@
 
   <!-- ======================================================================
        Ribbon toolbar (Roblox Studio-style): everything that ACTS on the
-       scene or the viewport lives here in labeled groups - file actions,
+       stage or the viewport lives here in labeled groups - file actions,
        gizmo mode, snapping, and view controls - instead of being scattered
        across side panels. All ids are unchanged from the old layout so
        app.js/viewer.js wiring is untouched by the restructure.
        ================================================================== -->
   <div class="toolbar">
     <div class="toolbar-group" aria-label="File">
-      <button id="btn-load-project" class="btn tb-btn" title="Load a .SceneGen project">Load</button>
+      <button id="btn-load-project" class="btn tb-btn" title="Load a .StageGen project">Load</button>
       <button id="btn-save-project" class="btn tb-btn" title="Save project (Ctrl+S)">Save</button>
-      <button id="btn-export-scene" class="btn tb-btn btn-accent" title="Export scene.json for the PS1 runtime" disabled>Export</button>
-      <input type="file" id="file-load-project" accept=".SceneGen" class="hidden">
+      <button id="btn-export-stage" class="btn tb-btn btn-accent" title="Export stage.json for the PS1 runtime" disabled>Export</button>
+      <input type="file" id="file-load-project" accept=".StageGen" class="hidden">
     </div>
 
     <div class="toolbar-sep"></div>
@@ -138,7 +138,7 @@
             <button id="btn-insert-entity" class="btn" title="Insert an editor object (trigger, spawn, summon, particle, billboard)">&#65291; Insert &#9662;</button>
           </div>
           <!-- Insert-object menu, toggled by the button above and
-               populated by app.js from scene_state.js's ENTITY_KINDS
+               populated by app.js from stage_state.js's ENTITY_KINDS
                registry (single source of truth for kinds/colors/hints). -->
           <div id="insert-entity-menu" class="insert-menu hidden"></div>
           <!-- Rendered as a TREE by app.js's renderInstanceList(): folder
@@ -175,7 +175,7 @@
           <p class="hint-text" id="vram-warnings"></p>
 
           <!-- Hardcoded PS1 runtime limits, mirrored from main.c's #defines
-               (MAX_MODELS / MAX_SCENE_OBJECTS / MAX_TEXTURES / MAX_MODEL_TRIS).
+               (MAX_MODELS / MAX_STAGE_OBJECTS / MAX_TEXTURES / MAX_MODEL_TRIS).
                If main.c's values change, update MAINC_LIMITS in app.js. -->
           <h3 class="panel-subtitle">MAIN.C Limits</h3>
           <div class="vram-row">
@@ -183,7 +183,7 @@
             <span class="vram-value" id="mainc-models-label">-</span>
           </div>
           <div class="vram-row">
-            <span class="vram-label">Scene objects</span>
+            <span class="vram-label">Stage objects</span>
             <span class="vram-value" id="mainc-objects-label">-</span>
           </div>
           <div class="vram-row">
@@ -205,7 +205,7 @@
     <!-- ==================================================================
          Right dock: full-height Properties panel (Roblox Studio-style).
          Shows the selected instance's transform + palette in collapsible
-         sections, plus the exported PS1 camera (a SCENE object, not the
+         sections, plus the exported PS1 camera (a STAGE object, not the
          editing view - that distinction used to be split across two
          sidebars and is now just two sections of one panel).
          ================================================================ -->
@@ -269,9 +269,9 @@
           </div>
 
           <details class="props-section" open>
-            <summary>Scene Camera</summary>
+            <summary>Stage Camera</summary>
             <div class="props-body">
-              <!-- The EXPORTED PS1 camera (a placed scene object with its
+              <!-- The EXPORTED PS1 camera (a placed stage object with its
                    own gizmo) - NOT the editing orbit camera, which is
                    driven by the toolbar's view buttons. -->
               <span class="props-group-label">Position</span>

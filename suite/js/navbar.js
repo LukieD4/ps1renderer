@@ -17,7 +17,7 @@
     { key: "palette", label: "PaletteGen", href: "/tools/palette-maker/index.html" },
     { key: "vag", label: "VAG", href: "/tools/audio-vag/index.html" },
     { key: "ost", label: "OST Studio", href: "/tools/audio-ost/index.html" },
-    { key: "scene", label: "SceneGen", href: "/tools/scene-gen/index.html" },
+    { key: "stage", label: "StageGen", href: "/tools/stage-gen/index.html" },
     // Future tools go here, e.g.:
     // { key: "sprite-packer", label: "Sprite Packer", href: "/tools/sprite-packer/index.html" },
   ];

@@ -1,7 +1,7 @@
 // root/music.c
 //
 // VAB + SEQ music player, v1. See music.h for the module contract and the
-// scene-asset roadmap. Format references: PS1AUDIO_SEMANTICS.txt §6-7 and
+// stage-asset roadmap. Format references: PS1AUDIO_SEMANTICS.txt §6-7 and
 // psx-spx; the OST Studio exporter (suite/tools/audio-ost) writes exactly
 // this layout.
 //
@@ -17,9 +17,9 @@
 // WHY A FIXED-POINT ACCUMULATOR
 //   ticks/second = ppq * 1,000,000 / usPerQuarter (from the SEQ header, or a
 //   mid-song FF 51). Per elapsed VBLANK we add (ticks/second << 12) scaled
-//   by the REAL vblank rate (NTSC is 59.94 Hz, not 60 - see
-//   MUSIC_VSYNC_CHZ) and consume whole ticks, so tempo stays exact over
-//   minutes even though ticks-per-frame is fractional.
+//   by the REAL vblank rate - detected PAL/NTSC at load, 240p progressive
+//   rates, see vsync_chz - and consume whole ticks, so tempo stays exact
+//   over minutes even though ticks-per-frame is fractional.
 //
 // PARITY WITH THE DAW (suite/tools/audio-ost)
 //   - fine pitch: the tone's fine-pitch byte (1/128 semitone) carries the
@@ -52,9 +52,18 @@
 // Tunables / limits
 // ------------------------------------------------------------
 
-// Real vblank rate in CENTIHERTZ: NTSC fields at 59.94 Hz (60/1.001), PAL at
-// 50.00. Using 60 flat would run music 0.1% slow (~2 s drift per half hour).
-#define MUSIC_VSYNC_CHZ  (MUSIC_VSYNC_HZ == 60 ? 5994 : 5000)
+// Real vblank rate in CENTIHERTZ, resolved at music_load() time from the GPU
+// video mode (ResetGraph inherits it from the BIOS, so an SCEE disc booted on
+// a PAL console/BIOS lands on PAL automatically - no build-time switch to
+// forget). The values are the 240p PROGRESSIVE frame rates, not the 59.94/50
+// interlaced field rates: we never set DISPENV.isinter, and non-interlaced
+// video scans a whole extra line per frame (NTSC 263 lines -> 59.83 Hz, PAL
+// 314 lines -> 49.76 Hz, per psx-spx). Getting this wrong is audible: 60 flat
+// on PAL ran music 17% slow vs the DAW preview; even 59.94 vs 59.83 drifts
+// ~2 s per half hour.
+#define MUSIC_VSYNC_CHZ_NTSC  5983
+#define MUSIC_VSYNC_CHZ_PAL   4976
+static uint32_t vsync_chz = MUSIC_VSYNC_CHZ_NTSC;
 
 // CD bounce buffer for streaming the VAB into SPU RAM. The whole VH
 // (32 + 2048 + 512*progs + 512 bytes) must fit one chunk, which caps
@@ -321,11 +330,16 @@ static int load_vab(const char *path)
     return 1;
 }
 
-// ticks/second -> accumulator increment per vblank, against the REAL
-// centihertz vblank rate (59.94 NTSC / 50.00 PAL).
-static uint32_t inc_for(uint32_t tps)
+// us-per-quarter (SEQ header / FF 51 tempo meta) -> accumulator increment per
+// vblank, against the REAL centihertz vblank rate (see vsync_chz). One fused
+// 64-bit divide: the old two-step form truncated ticks/second to an integer
+// first, which alone ran the music up to ~0.1% slow at tempos where
+// ppq*1e6/uspq isn't whole. (Numerator worst case: 65535 ppq * 1e8 << 12
+// ~= 2.7e16, comfortably inside u64.)
+static uint32_t inc_for_uspq(uint32_t uspq)
 {
-    return (uint32_t)(((uint64_t)tps << 12) * 100u / MUSIC_VSYNC_CHZ);
+    return (uint32_t)((((uint64_t)seq_ppq * 1000000u * 100u) << 12)
+                      / ((uint64_t)uspq * vsync_chz));
 }
 
 static int load_seq(const char *path)
@@ -347,7 +361,7 @@ static int load_seq(const char *path)
     if (!seq_ppq) seq_ppq = 480;
     if (!uspq) uspq = 500000;
 
-    tick_inc = inc_for((uint32_t)(((uint64_t)seq_ppq * 1000000u) / uspq));
+    tick_inc = inc_for_uspq(uspq);
 
     seq_ev = s + 15;                                           // past header
     seq_len = (uint32_t)file.size - 15;
@@ -357,6 +371,10 @@ static int load_seq(const char *path)
 int music_load(const char *vab_path, const char *seq_path)
 {
     music_stop();
+    // Calibrate the tempo accumulator against the video mode we're ACTUALLY
+    // running (must happen before load_seq(), which bakes it into tick_inc).
+    vsync_chz = (GetVideoMode() == MODE_PAL) ? MUSIC_VSYNC_CHZ_PAL
+                                             : MUSIC_VSYNC_CHZ_NTSC;
     loaded = 0;
     bank_spu_bytes = 0;
     prog_count = 0;
@@ -480,7 +498,7 @@ static void process_event(uint32_t *on_mask, uint32_t *off_mask)
                             ((uint32_t)seq_ev[pos + 1] << 8) | seq_ev[pos + 2];
             pos += 3;
             if (uspq)
-                tick_inc = inc_for((uint32_t)(((uint64_t)seq_ppq * 1000000u) / uspq));
+                tick_inc = inc_for_uspq(uspq);
         } else if (mt == 0x2f) {             // end of track (followed by 0x00)
             pos++;
             ended = 1;
@@ -558,7 +576,10 @@ void music_tick(void)
     int dv = now_v - last_vsync;
     last_vsync = now_v;
     if (dv < 1) dv = 1;
-    if (dv > MUSIC_VSYNC_HZ / 4) dv = MUSIC_VSYNC_HZ / 4;   // >250 ms hitch: slew
+    {
+        int dv_max = (int)(vsync_chz / 400);                // ~250 ms of vblanks
+        if (dv > dv_max) dv = dv_max;                       // long hitch: slew
+    }
 
     acc += tick_inc * (uint32_t)dv;
     int steps = (int)(acc >> 12);

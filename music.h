@@ -10,19 +10,22 @@
 // so they show up in the same debug-overlay RAM budget as the wind.
 //
 // VOICE MAP (24 hardware voices):
-//   0        wind ambient          (sound.c)
-//   1..7     one-shot SFX / barks  (future sfx module)
+//   0..7     stage-driven SFX      (sfx.c - looping ambients now, one-shot
+//                                   barks/caws on the unpinned voices later)
 //   8..23    music                 (this module, 16-voice pool)
 //
-// FUTURE SCOPE — scene-driven assets. The plan is a per-scene manifest that
-// lists every asset the scene needs: music (one VAB+SEQ), SFX banks (one-shot
+// FUTURE SCOPE — stage-driven assets. The plan is a per-stage manifest that
+// lists every asset the stage needs: music (one VAB+SEQ), SFX banks (one-shot
 // VAGs, standalone / chained to a character / fired by an event trigger),
 // characters, particles. This module is already shaped for that:
 //   - fully data-driven: load takes file paths, nothing is hardcoded;
-//   - load/play are split, so a scene loader can prefetch during a fade;
-//   - music_unload() rewinds the SPU allocator mark it took, so scene
-//     teardown is load-order-independent as long as music loads last of the
-//     audio assets (or the allocator grows a real free list later);
+//   - load/play are split, so a stage loader can prefetch during a fade;
+//   - music_unload() rewinds the SPU allocator mark it took. NOTE the boot
+//     ordering flipped when stage-driven sfx landed: music (still global)
+//     now loads FIRST, so per-stage sfx sits ABOVE the bank and can be
+//     LIFO-released on a stage switch without touching it. If music itself
+//     becomes stage-driven, unload sfx before music (reverse load order),
+//     or grow the allocator into a real free list;
 //   - the voice pool is a compile-time partition the future sfx module
 //     extends rather than fights with.
 //
@@ -38,9 +41,10 @@
 #define MUSIC_VOICE_FIRST   8
 #define MUSIC_VOICE_COUNT   16
 
-// Vertical sync rate the tick accumulator is calibrated against. Set to 50
-// before building for PAL.
-#define MUSIC_VSYNC_HZ      60
+// NOTE: the tick accumulator's vblank-rate calibration is no longer a
+// compile-time constant. music_load() reads the GPU video mode (PAL/NTSC,
+// inherited from the BIOS by ResetGraph) and picks the real 240p progressive
+// vblank rate at runtime - see MUSIC_VSYNC_CHZ_* in music.c.
 
 // Load a VAB (instrument bank -> SPU RAM, attributes -> main RAM) and a SEQ
 // (score -> main RAM) from the CD. Returns 1 on success, 0 on any failure
@@ -65,7 +69,7 @@ int  music_playing(void);
 void music_tick(void);
 
 // Master music volume, 0..0x3fff per channel (default 0x3000). Applied to
-// new notes and pushed onto already-sounding voices immediately, so a scene
+// new notes and pushed onto already-sounding voices immediately, so a stage
 // can duck music under dialogue.
 void music_set_volume(int left, int right);
 

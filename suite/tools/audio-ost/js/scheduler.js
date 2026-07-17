@@ -36,12 +36,14 @@
   var LOOKAHEAD = 0.12;   // seconds scheduled ahead
   var INTERVAL = 25;      // ms between scheduler ticks
 
-  // PARITY: the console's sequencer processes events once per vblank
-  // (59.94 Hz NTSC), so every note on/off lands on that grid. Quantizing
-  // the preview's event times UP to the same grid reproduces the (<=16 ms)
-  // timing texture the PS1 will have, instead of previewing sample-accurate
-  // timing the hardware can't deliver.
-  var VBLANK_SEC = 100 / 5994;
+  // PARITY: the console's sequencer processes events once per vblank, so
+  // every note on/off lands on that grid. Quantizing the preview's event
+  // times UP to the same grid reproduces the (<=20 ms) timing texture the
+  // PS1 will have, instead of previewing sample-accurate timing the
+  // hardware can't deliver. The game ships on a PAL (SCEE) disc and runs
+  // 240p progressive: 314 lines/frame = 49.76 Hz (music.c detects the same
+  // rate at runtime - keep the two in sync). NTSC would be 100 / 5983.
+  var VBLANK_SEC = 100 / 4976;
   function quantizeUp(anchor, t) {
     return anchor + Math.ceil((t - anchor - 1e-9) / VBLANK_SEC) * VBLANK_SEC;
   }

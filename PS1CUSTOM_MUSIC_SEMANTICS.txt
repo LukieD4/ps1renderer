@@ -37,8 +37,8 @@ VOICE MAP (compile-time partition, extend in one place)
   1..7     future SFX  (one-shot barks/caws module)
   8..23    music       (music.c, MUSIC_VOICE_FIRST/COUNT)
 
-SCENE-ASSET ROADMAP (future-proofing notes)
-  Target shape: each scene ships a manifest listing its assets —
+STAGE-ASSET ROADMAP (future-proofing notes)
+  Target shape: each stage ships a manifest listing its assets —
     MUSIC   one VAB+SEQ pair            -> music_load()/music_play()
     SFXBANK one-shot VAGs               -> future sfx_load_bank(): same
             (standalone, attached to a     chunked-CdRead + sound_spu_reserve
@@ -47,13 +47,13 @@ SCENE-ASSET ROADMAP (future-proofing notes)
     FX      particle definitions
   What this module already guarantees for that world:
     - data-driven paths, no hardcoded filenames;
-    - load/play split so a scene loader can prefetch behind a fade;
+    - load/play split so a stage loader can prefetch behind a fade;
     - one SPU budget (sound_spu_reserve) shared by all audio modules, so the
       manifest loader can check music+sfx fit BEFORE streaming anything;
-    - teardown story: release in reverse load order (LIFO). If scenes later
+    - teardown story: release in reverse load order (LIFO). If stages later
       need arbitrary unload order, upgrade sound.c's bump allocator to a free
       list — callers don't change.
-  Suggested load order per scene: SFX banks first (long-lived), music last
+  Suggested load order per stage: SFX banks first (long-lived), music last
   (swapped most often), so music_unload() can always LIFO-release cleanly.
 
 CAVEATS (v1, by design)

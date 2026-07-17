@@ -7,7 +7,7 @@
  * - Filled triangle rendering
  * - OBJ importer support
  * - Runtime scaling (debug_scale, a live fixed-point multiplier layered
- *   over every scene object's own authored scale - see draw_scene())
+ *   over every stage object's own authored scale - see draw_stage())
  * - XYZ rotation (GTE-driven)
  * - GTE perspective projection
  * - Backface culling (same winding test gte_nclip computes in hardware,
@@ -17,7 +17,7 @@
  * - GTE-rotated vertex normals for Gouraud lighting
  * - Textured polygon rendering (POLY_FT3)
  * - Multi-CLUT palette-swap textures (stacked CLUT rows in one TIM,
- *   base row is per-object scene data, live-nudged via SQUARE/CIRCLE in
+ *   base row is per-object stage data, live-nudged via SQUARE/CIRCLE in
  *   the camera control schema - hold L2, see update())
  * - GPU Ordering Table (OT_LEN buckets - see draw_object_into_ot()):
  *   every triangle from every visible object is inserted into ONE shared
@@ -34,10 +34,10 @@
  *   points) through its real composed matrix and rejects it before
  *   touching any of its triangles if it's behind the near plane or
  *   entirely outside the 320x240 screen bounds
- * - Scene loading (scenes/*_/scene.json -> generated/scene_*.c): places
+ * - Stage loading (assets/stage/*_/stage.json -> generated/stage_*.c): places
  *   named model instances with their own pos/rot/scale/palette
  * - Multiple simultaneous models (generated/model_registry.c), resolved
- *   by name per scene object instead of one hand-#include'd model
+ *   by name per stage object instead of one hand-#include'd model
  * - Double buffering
  * - Single-controller input (see update()): holding L2 switches pad 1
  *   from the debug transform schema to the camera schema
@@ -46,7 +46,7 @@
 
 // Toolchain paths (set these as env vars on your machine, not hardcoded
 // here - PATH, PSN00BPS1_TOOLS, PSN00BSDK_LIBS). See py_convert_assets.py,
-// py_convert_textures.py and py_convert_scenes.py for the asset-side
+// py_convert_textures.py and py_convert_stages.py for the asset-side
 // equivalents.
 
 #include <stdio.h>
@@ -60,14 +60,16 @@
 #include <psxpad.h>   // PadButton enums (PAD_UP, PAD_DOWN, PAD_LEFT, PAD_RIGHT)
 #include <inline_c.h> // GTE macros (gte_ldv0, gte_rtpt, gte_nclip, etc.)
 
-// SPU sound layer (sound.c): loads WIND.VAG off the CD into SPU RAM and plays
-// it as a looping ambient. sound_init() must run after ResetGraph()/InitGeom()
-// (see init()); START toggles it (see update()).
+// SPU core (sound.c): boots SPU + CD and owns the shared SPU RAM allocator.
+// sound_init() must run after ResetGraph()/InitGeom() (see init()). Playback
+// lives in sfx.c (stage-authored looping ambients, loaded per stage by
+// load_stage(); START toggles the ambience - see update()) and music.c.
 #include "sound.h"
+#include "sfx.h"
 #include "music.h"
 
 
-// Every discovered assets/<name>/<name>.obj, baked in unconditionally.
+// Every discovered assets/object/<name>/<name>.obj, baked in unconditionally.
 // Defines MODEL_TRI/MODEL_DEF (via model_common.h), each <name>_model*
 // array, and modelRegistry[]/modelRegistryCount. See py_convert_assets.py.
 #include "generated/models_all.h"
@@ -79,14 +81,14 @@
 // generated/tex_blob_table.h, shared by tex_blob_table.c and main.c.
 #include "generated/tex_blob_table.h"
 
-// Every discovered scenes/*/scene.json, baked in unconditionally. Defines
-// SCENE_OBJECT/SCENE_DEF (via scene_common.h), each scene's own
-// <name>_objects[]/<name>_objectCount, and sceneRegistry[]/
-// sceneRegistryCount. See py_convert_scenes.py. Scene objects resolve
-// model NAMES against modelRegistry[] at RUNTIME (load_scene(), below),
+// Every discovered assets/stage/*/stage.json, baked in unconditionally. Defines
+// STAGE_OBJECT/STAGE_DEF (via stage_common.h), each stage's own
+// <name>_objects[]/<name>_objectCount, and stageRegistry[]/
+// stageRegistryCount. See py_convert_stages.py. Stage objects resolve
+// model NAMES against modelRegistry[] at RUNTIME (load_stage(), below),
 // not at compile time, so there's no real build-order dependency on
 // models_all.h above.
-#include "generated/scenes_all.h"
+#include "generated/stages_all.h"
 
 // Runtime texture table - one resolved TIM_IMAGE per material name found
 // in the blob, built once in load_textures() by walking
@@ -176,16 +178,16 @@ int fov_speed = 10;
 
 // Ceiling on how many distinct models (modelRegistry[] entries) get their
 // own triangle/texture cache built at load time - see
-// build_triangle_texture_cache(). Bump if assets/ grows past this many
+// build_triangle_texture_cache(). Bump if assets/object/ grows past this many
 // distinct model folders; modelRegistryCount is clamped against it
 // rather than trusted blindly, same fail-safe pattern as MAX_TEXTURES.
 #define MAX_MODELS 16
 
-// Ceiling on how many objects a single scene can place at once (fixed-
-// size arrays, no heap on PS1). Bump if a scene needs more; scene
-// object counts are clamped against this in load_scene(), same pattern
+// Ceiling on how many objects a single stage can place at once (fixed-
+// size arrays, no heap on PS1). Bump if a stage needs more; stage
+// object counts are clamped against this in load_stage(), same pattern
 // as MAX_MODELS/MAX_TEXTURES.
-#define MAX_SCENE_OBJECTS 32
+#define MAX_STAGE_OBJECTS 32
 
 // ------------------------------------------------------------
 // GPU Ordering Table
@@ -210,7 +212,7 @@ int fov_speed = 10;
 
 // Upper bound on triangles insertable into the OT in a single frame,
 // across every visible object. primBytesRemaining enforces this as a
-// hard runtime cap - an over-budget scene drops triangles (reported via
+// hard runtime cap - an over-budget stage drops triangles (reported via
 // debug_text()'s PRIM_OVERFLOW counter) instead of overrunning the
 // primitive arena.
 #define MAX_PRIMS_PER_FRAME 4096
@@ -245,10 +247,10 @@ static char *nextpri;
 
 // Remaining bytes in primBuffer[db] this frame - checked against
 // sizeof(POLY_FT3) (the largest type) before every allocation so an
-// over-budget scene drops triangles instead of overrunning the arena.
+// over-budget stage drops triangles instead of overrunning the arena.
 static long primBytesRemaining;
 
-// Debug counters, reset once per frame in draw_scene()/main() - see
+// Debug counters, reset once per frame in draw_stage()/main() - see
 // debug_text().
 static unsigned int visibleObjectCount = 0;
 static unsigned int culledObjectCount = 0;
@@ -285,8 +287,8 @@ typedef struct
     SVECTOR rot;   // 12-bit fixed-point angles (4096 = 360 degrees), same format as model_rot
 } CAMERA;
 
-// Compiled-in fallback if sceneRegistryCount is ever 0 (e.g. scenes/ is
-// empty) - load_scene() overwrites this from the active scene's own
+// Compiled-in fallback if stageRegistryCount is ever 0 (e.g. assets/stage/ is
+// empty) - load_stage() overwrites this from the active stage's own
 // "camera" block otherwise.
 CAMERA camera = { { 0, 0, -CAMERA_DISTANCE }, { 0, 0, 0 } };
 
@@ -302,15 +304,15 @@ MATRIX camera_view_matrix;
 // Composed matrix (camera_view_matrix * world_matrix) actually fed to the
 // GTE each frame - kept separate from world_matrix so world_matrix always
 // represents only the CURRENT object's own transform (reused as scratch
-// across however many objects the scene places, one at a time).
+// across however many objects the stage places, one at a time).
 MATRIX composed_matrix;
 
 
 
 // ------------------------------------------------------------
 // Debug transform - a global offset/multiplier layered on top of EVERY
-// scene object's own authored pos/rot/scale (see draw_scene()), driven
-// by pad 1. Purely a live testing knob - e.g. spin the whole scene to
+// stage object's own authored pos/rot/scale (see draw_stage()), driven
+// by pad 1. Purely a live testing knob - e.g. spin the whole stage to
 // eyeball lighting, or nudge every object at once without reconverting.
 // ------------------------------------------------------------
 int debug_scale = 4096;                 // fixed-point multiplier, 4096 == 1.0x
@@ -321,7 +323,7 @@ const uint8_t ROT_SPEED = 22;
 // 12-bit fixed-point angle format (4096 = 360 degrees).
 SVECTOR model_rot = { 0, 0, 0 };
 
-// Debug world-position OFFSET, added to every scene object's own pos.
+// Debug world-position OFFSET, added to every stage object's own pos.
 // Zero by default (no pad control wired to it today).
 VECTOR model_pos = { 0, 0, 0 };
 
@@ -332,7 +334,7 @@ VECTOR model_pos = { 0, 0, 0 };
 MATRIX world_matrix;
 
 // Rotated face normal cache (one per triangle, post-transform), reused
-// as shared scratch across every drawn object - draw_scene() always
+// as shared scratch across every drawn object - draw_stage() always
 // fully finishes one object (rotate -> cull -> draw) before moving to
 // the next, so nothing here needs to survive past a single object's turn.
 // Index-matches a model's faceNormals/tris 1:1.
@@ -362,26 +364,26 @@ static uint32_t transformedScreenSZ[MAX_MODEL_VERTS];
 // flat/Gouraud instead of forcing POLY_FT3).
 static MODEL_TEXTURE *modelTriTextureCache[MAX_MODELS][MAX_MODEL_TRIS];
 
-// Which baked scene (sceneRegistry[]) is currently active. 0 = first
-// discovered scenes/*/scene.json (alphabetical, see py_convert_scenes.py).
-// Nothing in the render path assumes a fixed scene index, so a future
-// runtime scene switch just needs to change this.
-unsigned int activeSceneIndex = 0;
+// Which baked stage (stageRegistry[]) is currently active. 0 = first
+// discovered assets/stage/*/stage.json (alphabetical, see py_convert_stages.py).
+// Nothing in the render path assumes a fixed stage index, so a future
+// runtime stage switch just needs to change this.
+unsigned int activeStageIndex = 0;
 
-// Set by load_scene(): how many of sceneRegistry[activeSceneIndex]'s
-// objects actually get drawn (its objectCount, clamped to MAX_SCENE_OBJECTS).
-static unsigned int activeSceneObjectCount = 0;
+// Set by load_stage(): how many of stageRegistry[activeStageIndex]'s
+// objects actually get drawn (its objectCount, clamped to MAX_STAGE_OBJECTS).
+static unsigned int activeStageObjectCount = 0;
 
-// Set by load_scene(): sceneObjectModelIndex[i] is the modelRegistry[]
-// index the i'th scene object's "model" name resolved to, or -1 if no
+// Set by load_stage(): stageObjectModelIndex[i] is the modelRegistry[]
+// index the i'th stage object's "model" name resolved to, or -1 if no
 // such model exists (e.g. a typo'd or not-yet-created name) - resolved
-// ONCE at scene load, not per-frame; draw_scene() skips unresolved
+// ONCE at stage load, not per-frame; draw_stage() skips unresolved
 // objects instead of dereferencing NULL.
-static int sceneObjectModelIndex[MAX_SCENE_OBJECTS];
+static int stageObjectModelIndex[MAX_STAGE_OBJECTS];
 
-// Set by load_scene(): count of objects whose model name didn't
+// Set by load_stage(): count of objects whose model name didn't
 // resolve, surfaced via debug_text()'s UNRESOLVED readout.
-static unsigned int sceneUnresolvedCount = 0;
+static unsigned int stageUnresolvedCount = 0;
 
 
 
@@ -503,7 +505,7 @@ void build_triangle_texture_cache(void)
 
 
 // Linear scan over modelRegistry[] by name (small table, fine to do once
-// per scene object at scene load). Returns -1 if no model with that name
+// per stage object at stage load). Returns -1 if no model with that name
 // was baked in.
 static int find_model_index_by_name(const char *name)
 {
@@ -516,52 +518,68 @@ static int find_model_index_by_name(const char *name)
 }
 
 
-// Makes `index` (into sceneRegistry[]) the active scene: pulls its
+// Makes `index` (into stageRegistry[]) the active stage: pulls its
 // camera block into the live CAMERA struct, and resolves every object's
 // model-name string against modelRegistry[] ONCE. Safe to call again
-// with a different index for a runtime scene switch.
-void load_scene(unsigned int index)
+// with a different index for a runtime stage switch.
+void load_stage(unsigned int index)
 {
-    activeSceneObjectCount = 0;
-    sceneUnresolvedCount = 0;
+    activeStageObjectCount = 0;
+    stageUnresolvedCount = 0;
 
-    if (sceneRegistryCount == 0)
+    // Tear down the PREVIOUS stage's sounds before anything else: keys
+    // their voices off and gives back their SPU RAM in reverse load order
+    // (the bump allocator's LIFO contract). No-op on the first call.
+    sfx_stage_unload();
+
+    if (stageRegistryCount == 0)
     {
-        // No scenes/*/scene.json were discovered at convert time -
+        // No assets/stage/*/stage.json were discovered at convert time -
         // camera stays at its compiled-in CAMERA default above, and
-        // draw_scene() simply has zero objects to draw.
-        activeSceneIndex = 0;
+        // draw_stage() simply has zero objects to draw (and sfx has zero
+        // sounds to play - unloaded above).
+        activeStageIndex = 0;
         return;
     }
 
-    if (index >= sceneRegistryCount)
+    if (index >= stageRegistryCount)
         index = 0;
 
-    activeSceneIndex = index;
+    activeStageIndex = index;
 
-    const SCENE_DEF *scene = &sceneRegistry[activeSceneIndex];
+    const STAGE_DEF *stage = &stageRegistry[activeStageIndex];
 
-    camera.pos = scene->cameraPos;
-    camera.rot = scene->cameraRot;
+    camera.pos = stage->cameraPos;
+    camera.rot = stage->cameraRot;
 
-    unsigned int objectCount = scene->objectCount < MAX_SCENE_OBJECTS ? scene->objectCount : MAX_SCENE_OBJECTS;
+    unsigned int objectCount = stage->objectCount < MAX_STAGE_OBJECTS ? stage->objectCount : MAX_STAGE_OBJECTS;
 
     for (unsigned int i = 0; i < objectCount; i++)
     {
-        int idx = find_model_index_by_name(scene->objects[i].model);
+        int idx = find_model_index_by_name(stage->objects[i].model);
 
         // modelTriTextureCache[] only has slots for modelRegistry[0..
         // MAX_MODELS) - treat a model past that cap as "not found" so
-        // draw_scene() never indexes it out of bounds.
+        // draw_stage() never indexes it out of bounds.
         if (idx >= (int)MAX_MODELS)
             idx = -1;
 
-        sceneObjectModelIndex[i] = idx;
+        stageObjectModelIndex[i] = idx;
         if (idx < 0)
-            sceneUnresolvedCount++;
+            stageUnresolvedCount++;
     }
 
-    activeSceneObjectCount = objectCount;
+    activeStageObjectCount = objectCount;
+
+    // Load and (autoplay) start this stage's authored sounds - the CD
+    // paths were baked from stage.json's "sounds" array by
+    // py_convert_stages.py; a missing/bad file degrades to silence and
+    // shows in the debug overlay's SFX UNRESOLVED count, same philosophy
+    // as unresolved model names above. NOTE ordering at boot: init()
+    // calls sound_init() and music_load() BEFORE the first load_stage(),
+    // so stage sounds sit ABOVE the music bank in the SPU bump allocator
+    // and a runtime stage switch can release them without touching music.
+    sfx_stage_load(stage);
 }
 
 
@@ -627,28 +645,57 @@ void init(void)
     // Resolve every model's per-triangle material indices to texture
     // pointers once, now that both model data and textureTable[] are
     // loaded. Must run after load_textures(). Adding/removing a model
-    // under assets/ picks this up automatically via modelRegistry[] - no
+    // under assets/object/ picks this up automatically via modelRegistry[] - no
     // main.c edit needed.
     build_triangle_texture_cache();
 
-    // Make the first baked scene (sceneRegistry[0]) active: pulls its
-    // camera into `camera`, resolves every object's model name once.
-    load_scene(0);
-
-    // Boot the SPU + CD and stream the ambient wind loop into SPU RAM, then
-    // start it playing. Kept last in init() (after ResetGraph/InitGeom, which
-    // CdInit/SpuInit both depend on) - a missing/oversized WIND.VAG degrades
-    // to silence inside sound_init(), it won't hang the boot.
+    // Boot the SPU + CD (after ResetGraph/InitGeom, which CdInit/SpuInit
+    // both depend on). Loads nothing itself anymore - sfx.c and music.c
+    // do their own CD loads below; a drive error just leaves
+    // sound_cd_ready() false and everything degrades to silence.
     sound_init();
-    sound_wind_start();
 
-    // Music: load the VAB instrument bank + SEQ score exported by OST Studio
-    // (suite/tools/audio-ost) and start it looping. Same degrade-to-silence
-    // philosophy as the wind - a missing/oversized/malformed pair just leaves
-    // music_playing() false, visible on the debug overlay. Must run after
-    // sound_init() (SPU + CD up, SPU RAM allocator ready).
-    if (music_load("\\SONG.VAB;1", "\\SONG.SEQ;1"))
-        music_play();
+    // Music is FULLY stage-authored now: it plays if - and only if - the
+    // boot stage (stageRegistry[0]) places a mode=music sound entity,
+    // whose baked cdPath/cdPath2 name the VAB/SEQ pair (assets/sound/
+    // music/<SAMPLE>.VAB/.SEQ, shipped by py_convert_sounds.py). No
+    // entity = no music_load() at all (overlay shows MUSIC LOADED=N) -
+    // the old hardcoded \SONG fallback is gone, same arc the wind
+    // ambient followed from hardcoded to stage-driven. The entity's
+    // authored volume (baked 0..0x3fff) drives music_set_volume().
+    // Peeked directly from the registry here - NOT via sfx_stage_music()
+    // - because this must run BEFORE the first load_stage(): stage sfx
+    // must sit ABOVE the music bank in the SPU bump allocator so a
+    // runtime stage switch can LIFO-release them without clobbering
+    // music's slice. (Swapping music ON a live stage transition - with
+    // the entity's fadeOnStageEnter preference - is the future
+    // transition system's job; it'll need a music unload/reload path
+    // that respects that same LIFO order.) A missing/oversized/
+    // malformed pair just leaves music_playing() false on the overlay.
+    if (stageRegistryCount > 0)
+    {
+        const STAGE_DEF *bootStage = &stageRegistry[0];
+        for (unsigned int i = 0; i < bootStage->soundCount; i++)
+        {
+            const STAGE_SOUND *snd = &bootStage->sounds[i];
+            if (snd->mode != SFX_MODE_MUSIC)
+                continue;
+
+            if (music_load(snd->cdPath, snd->cdPath2))
+            {
+                music_set_volume(snd->volume, snd->volume);
+                if (snd->autoplay)
+                    music_play();
+            }
+            break; // first music entity wins, same rule as sfx_stage_music()
+        }
+    }
+
+    // Make the first baked stage (stageRegistry[0]) active: pulls its
+    // camera into `camera`, resolves every object's model name once, and
+    // loads + starts the stage's authored sounds (see load_stage()) -
+    // which is why this now runs LAST, after sound_init()/music_load().
+    load_stage(0);
 }
 
 
@@ -685,10 +732,10 @@ uint8_t use_vertex_light = 1;
 uint8_t use_texture = 0;
 
 // Live palette-row NUDGE, added on top of each placed object's own
-// scene-authored base palette row (SCENE_OBJECT.palette) - see
-// draw_scene(). Lets you cycle every object's palette together for
+// stage-authored base palette row (STAGE_OBJECT.palette) - see
+// draw_stage(). Lets you cycle every object's palette together for
 // testing (SQUARE/CIRCLE, camera schema - see update()) without having
-// to re-author scene.json and reconvert just to preview a different
+// to re-author stage.json and reconvert just to preview a different
 // row. draw_object_into_ot() clamps the COMBINED (object base + this
 // nudge) value per-texture against that texture's own paletteCount, so
 // this is safe to leave set higher than any given texture's row count.
@@ -724,8 +771,8 @@ void update(void)
         // ---- Debug transform schema (L2 released) ----
 
         // Debug scale - a live fixed-point MULTIPLIER (4096 == 1.0)
-        // layered on top of every scene object's own authored scale in
-        // draw_scene(). PAD_UP grows it, PAD_DOWN shrinks it.
+        // layered on top of every stage object's own authored scale in
+        // draw_stage(). PAD_UP grows it, PAD_DOWN shrinks it.
         if (!(raw & PAD_UP)) debug_scale += SCALE_SPEED;
         if (!(raw & PAD_DOWN)) debug_scale -= SCALE_SPEED;
         if (debug_scale < 64) debug_scale = 64;       // avoid degenerate near-zero/negative scale
@@ -776,7 +823,7 @@ void update(void)
         // same reasoning as the debug schema above. Still a simple,
         // direct mapping rather than a proper FPS-style look-at/analog
         // camera (that refinement is still the "Camera" roadmap item).
-        if (!(raw & PAD_UP))    camera.pos.vz += CAMERA_MOVE_SPEED; // forward (into the scene)
+        if (!(raw & PAD_UP))    camera.pos.vz += CAMERA_MOVE_SPEED; // forward (into the stage)
         if (!(raw & PAD_DOWN))  camera.pos.vz -= CAMERA_MOVE_SPEED; // backward
         if (!(raw & PAD_LEFT))  camera.pos.vx -= CAMERA_MOVE_SPEED; // strafe left
         if (!(raw & PAD_RIGHT)) camera.pos.vx += CAMERA_MOVE_SPEED; // strafe right
@@ -800,13 +847,14 @@ void update(void)
             active_palette = (active_palette - 1) & 0x0F;
     }
 
-    // START toggles the ambient wind loop on/off. Schema-independent (works
-    // whether L2 is held or not) and edge-detected against prevPadRaw, same
-    // released->pressed pattern as the TRIANGLE/SQUARE toggles above, so a
-    // held button doesn't re-toggle every frame. START is otherwise unused by
-    // either control schema.
+    // START toggles the stage's ambient sounds on/off (every looping sound
+    // the active stage authored - wind in house_demo). Schema-independent
+    // (works whether L2 is held or not) and edge-detected against
+    // prevPadRaw, same released->pressed pattern as the TRIANGLE/SQUARE
+    // toggles above, so a held button doesn't re-toggle every frame. START
+    // is otherwise unused by either control schema.
     if (!(raw & PAD_START) && (prevPadRaw & PAD_START))
-        sound_wind_toggle();
+        sfx_stage_toggle();
 
     prevPadRaw = raw;
 }
@@ -1188,7 +1236,7 @@ void draw_object_into_ot(const MODEL_DEF *model, MODEL_TEXTURE **triTextureCache
 
             // Multi-CLUT row select: tim.crect->y is row 0's VRAM Y; row
             // k lives at crect->y + k (one 16-texel, 1-pixel-tall strip
-            // per row). objectPalette is this object's scene-authored
+            // per row). objectPalette is this object's stage-authored
             // base row plus the live active_palette nudge, clamped
             // against THIS texture's own paletteCount.
             unsigned int row = objectPalette;
@@ -1279,11 +1327,11 @@ void draw_object_into_ot(const MODEL_DEF *model, MODEL_TEXTURE **triTextureCache
 }
 
 
-// Resolves the ACTUAL per-frame pos/rot/scale for scene object `i` of
-// the active scene: that object's own scene-authored transform, plus the
+// Resolves the ACTUAL per-frame pos/rot/scale for stage object `i` of
+// the active stage: that object's own stage-authored transform, plus the
 // global debug offset/multiplier (model_pos/model_rot/debug_scale) - see
 // those variables' own comments.
-static void get_object_transform(const SCENE_OBJECT *obj, VECTOR *outPos, SVECTOR *outRot, VECTOR *outScale)
+static void get_object_transform(const STAGE_OBJECT *obj, VECTOR *outPos, SVECTOR *outRot, VECTOR *outScale)
 {
     outPos->vx = obj->pos.vx + model_pos.vx;
     outPos->vy = obj->pos.vy + model_pos.vy;
@@ -1304,40 +1352,40 @@ static void get_object_transform(const SCENE_OBJECT *obj, VECTOR *outPos, SVECTO
 }
 
 
-// Resolves and draws every placed object in the active scene into the
+// Resolves and draws every placed object in the active stage into the
 // shared OT (ot[db], reset by main() before this is called each frame).
 //
 // No object-level depth sort: draw_object_into_ot() inserts every
 // triangle into ONE shared OT keyed by its own depth bucket, so the
 // GPU's DrawOTag() walk (see main()) sorts every triangle from every
 // object together - objects can be processed in any order. Per object:
-// resolve its model (done once at scene load), build its matrix,
+// resolve its model (done once at stage load), build its matrix,
 // frustum-cull it, and if visible, light + draw it.
-void draw_scene(void)
+void draw_stage(void)
 {
     visibleObjectCount = 0;
     culledObjectCount = 0;
 
-    if (activeSceneIndex >= sceneRegistryCount)
+    if (activeStageIndex >= stageRegistryCount)
         return;
 
-    const SCENE_DEF *scene = &sceneRegistry[activeSceneIndex];
-    unsigned int objectCount = activeSceneObjectCount;
+    const STAGE_DEF *stage = &stageRegistry[activeStageIndex];
+    unsigned int objectCount = activeStageObjectCount;
 
     for (unsigned int i = 0; i < objectCount; i++)
     {
-        int modelIndex = sceneObjectModelIndex[i];
+        int modelIndex = stageObjectModelIndex[i];
         if (modelIndex < 0)
         {
-            // Unresolved model name (e.g. scene references "garage" but
-            // assets/garage/garage.obj doesn't exist yet) - already
-            // counted in sceneUnresolvedCount at scene-load time; not
+            // Unresolved model name (e.g. stage references "garage" but
+            // assets/object/garage/garage.obj doesn't exist yet) - already
+            // counted in stageUnresolvedCount at stage-load time; not
             // double-counted as "culled" here.
             continue;
         }
 
         const MODEL_DEF *model = &modelRegistry[modelIndex];
-        const SCENE_OBJECT *obj = &scene->objects[i];
+        const STAGE_OBJECT *obj = &stage->objects[i];
 
         VECTOR objPos, objScale;
         SVECTOR objRot;
@@ -1370,11 +1418,11 @@ void debug_text(int counter)
     FntPrint(-1, "OBJ MODEL TEST (GTE)\n");
     FntPrint(-1, "FRAME=%d\n", counter);
 
-    FntPrint(-1, "SCENE=%s OBJECTS=%d/%d UNRESOLVED=%d\n",
-        (activeSceneIndex < sceneRegistryCount) ? sceneRegistry[activeSceneIndex].name : "(none)",
-        activeSceneObjectCount,
-        (activeSceneIndex < sceneRegistryCount) ? sceneRegistry[activeSceneIndex].objectCount : 0,
-        sceneUnresolvedCount);
+    FntPrint(-1, "STAGE=%s OBJECTS=%d/%d UNRESOLVED=%d\n",
+        (activeStageIndex < stageRegistryCount) ? stageRegistry[activeStageIndex].name : "(none)",
+        activeStageObjectCount,
+        (activeStageIndex < stageRegistryCount) ? stageRegistry[activeStageIndex].objectCount : 0,
+        stageUnresolvedCount);
     FntPrint(-1, "VISIBLE=%d CULLED=%d PRIM_OVERFLOW=%d\n",
         visibleObjectCount, culledObjectCount, primOverflowCount);
     FntPrint(-1, "MODELS_BAKED=%d\n", modelRegistryCount);
@@ -1397,10 +1445,15 @@ void debug_text(int counter)
     FntPrint(-1, "TEXTURES_LOADED=%d\n", textureTableCount);
     FntPrint(-1, "ACTIVE_PALETTE=%d\n", active_palette);
     FntPrint(-1, "SCHEMA=%s (hold L2 for CAMERA)\n", cameraSchemaActive ? "CAMERA" : "DEBUG");
-    FntPrint(-1, "WIND=%s (START toggles) LOADED=%s LOOP=%s\n",
-        sound_wind_playing() ? "ON" : "OFF",
-        sound_wind_loaded() ? "Y" : "N",
-        sound_wind_is_looped() ? "Y" : "N");
+    // Stage-authored sounds (sfx.c): how many the stage authored vs. how
+    // many actually made it off the CD into SPU RAM, the analogue of the
+    // model-name UNRESOLVED count (missing .vag on disc, bad header, SPU
+    // RAM/voice budget), and how many have latched silent via
+    // muteAfterPlay. ON/OFF is the START-toggled master ambience.
+    FntPrint(-1, "SFX=%s (START toggles) LOADED=%d/%d UNRES=%d MUTED=%d\n",
+        sfx_stage_playing() ? "ON" : "OFF",
+        sfx_stage_loaded_count(), sfx_stage_sound_count(),
+        sfx_stage_unresolved_count(), sfx_stage_muted_count());
 
     // SPU RAM budget: bytes of waveform data resident vs. the ~508 KB usable
     // (512 KB minus the reserved capture area). PCT is used*100/capacity. As
@@ -1435,7 +1488,7 @@ int main(int argc, const char *argv[])
         update();
 
         // Camera-only matrix rebuild - once per frame, shared by every
-        // object draw_scene() composes against this frame.
+        // object draw_stage() composes against this frame.
         update_camera_matrix();
 
         // Reset THIS frame's OT (ClearOTagR wires every bucket to link
@@ -1448,13 +1501,13 @@ int main(int argc, const char *argv[])
         primOverflowCount = 0;
 
         // Resolve, frustum-cull, and draw every placed object in the
-        // active scene into ot[db] - replaces the old single-model
+        // active stage into ot[db] - replaces the old single-model
         // update_matrix()+sort_model()+draw_model() trio, and no longer
         // does its own CPU depth sort (the OT does that instead).
-        draw_scene();
+        draw_stage();
 
         // Kick off the GPU's own back-to-front walk of everything
-        // draw_scene() just queued into ot[db], starting from the
+        // draw_stage() just queued into ot[db], starting from the
         // FARTHEST bucket (OT_LEN - 1) - this call itself is
         // non-blocking (just enqueues the GPU command), the actual wait
         // for it to finish happens in display()'s DrawSync(0) below.
@@ -1474,8 +1527,16 @@ int main(int argc, const char *argv[])
         // Advance the music sequencer exactly once per displayed frame -
         // display() has just synced to VBlank, which is the cadence the
         // sequencer's fixed-point tempo accumulator is calibrated against
-        // (MUSIC_VSYNC_HZ in music.h). Cheap no-op when nothing is playing.
+        // (PAL/NTSC rate auto-detected in music.c at music_load() time).
+        // Cheap no-op when nothing is playing.
         music_tick();
+
+        // Advance the stage sfx layer at the same cadence: ONCE/INTERVAL
+        // completion + re-fire timers, and the per-frame directional
+        // falloff/pan pass - which is why the live camera goes in (yaw =
+        // camera.rot.vy, the same 12-bit angle update() steers). Cheap
+        // no-op while the ambience is stopped or the stage has no sounds.
+        sfx_tick(&camera.pos, camera.rot.vy);
 
         counter++;
     }

@@ -1,7 +1,7 @@
 /*
- * scene_project.js
+ * stage_project.js
  *
- * Save/load the FULL editor session as a `.scenegen.json` project file,
+ * Save/load the FULL editor session as a `.stagegen.json` project file,
  * mirroring palette-maker's presumed `.PaletteGen` save/load pattern.
  *
  * WHY dirHandle/loaded model binary data ISN'T serialized:
@@ -24,7 +24,7 @@
 // Version 2: adds display names (instance.name), the folder tree
 // (folders array + instance.parentId), and each folder's collapsed flag.
 // Version 3: adds editor entities (entities array - triggers, spawns,
-// summons, particles, billboards; see scene_state.js's ENTITY_KINDS) and
+// summons, particles, billboards; see stage_state.js's ENTITY_KINDS) and
 // the nextSpawnId counter backing spawn/summon unique IDs.
 // No backwards-compat shims: the loader in app.js simply defaults any
 // missing newer fields (folders -> [], entities -> [], name -> null,
@@ -77,9 +77,9 @@ export function buildProjectJson(state) {
 }
 
 /**
- * Trigger a browser download of the project JSON as a `.scenegen.json`
+ * Trigger a browser download of the project JSON as a `.stagegen.json`
  * file, using the same Blob + temporary <a> click pattern as
- * scene_export.js's downloadSceneJson.
+ * stage_export.js's downloadStageJson.
  */
 export function downloadProjectFile(json, filename) {
   const text = JSON.stringify(json, null, 2);
@@ -99,7 +99,7 @@ export function downloadProjectFile(json, filename) {
 /**
  * Read and parse a project file (from a <input type="file"> selection).
  * Validates the shape loosely (just enough to catch "this isn't a
- * scene-gen project file" mistakes) and throws a descriptive Error on
+ * stage-gen project file" mistakes) and throws a descriptive Error on
  * failure so app.js can alert() it to the user.
  */
 export async function loadProjectFile(file) {
@@ -121,7 +121,7 @@ export async function loadProjectFile(file) {
     throw new Error('Project file does not contain a JSON object.');
   }
   if (!Array.isArray(parsed.instances)) {
-    throw new Error('Project file is missing an "instances" array - this may not be a scene-gen project file.');
+    throw new Error('Project file is missing an "instances" array - this may not be a stage-gen project file.');
   }
   if (!parsed.camera || typeof parsed.camera !== 'object') {
     throw new Error('Project file is missing a "camera" object.');

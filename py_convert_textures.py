@@ -23,11 +23,11 @@ from pathlib import Path
 # (clut_height is carried through as paletteCount for range-checking).
 # main.c currently picks a row via a single runtime global
 # (active_palette, cycled with pad 2 SQUARE/CIRCLE) applied to every
-# textured triangle; a future scene loader is expected to make this
+# textured triangle; a future stage loader is expected to make this
 # per-object instead - see active_palette's comment in main.c.
 #
 # This script's job:
-#   1. discover .tim files in assets/*/textures/
+#   1. discover .tim files in assets/object/*/textures/
 #   2. read clut_height from each to know how many palette rows it has
 #   3. auto-assign non-overlapping VRAM placement: ONE image rect per
 #      file (shared by all its rows) + a CLUT strip tall enough to hold
@@ -40,7 +40,7 @@ from pathlib import Path
 # ------------------------------------------------------------------
 
 ROOT_DIR = Path(__file__).resolve().parent
-ASSETS_DIR = ROOT_DIR / "assets"
+ASSETS_DIR = ROOT_DIR / "assets" / "object"
 GENERATED_DIR = ROOT_DIR / "generated"
 
 BLOB_BIN_PATH = GENERATED_DIR / "textures.bin"

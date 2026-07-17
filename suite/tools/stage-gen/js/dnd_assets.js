@@ -10,7 +10,7 @@
  * which Firefox does not implement at all (Chrome/Edge only). A polyfill
  * exists (use-strict/file-system-access) but per community reports it
  * doesn't reliably walk more than one level deep - and this tool needs
- * TWO levels (assets/<model>/textures/<file>.tim), so that polyfill is
+ * TWO levels (assets/object/<model>/textures/<file>.tim), so that polyfill is
  * not safe to rely on here.
  *
  * Firefox DOES support recursively walking a dropped folder tree via the
@@ -162,10 +162,11 @@ export function hasNativeDirectoryPicker() {
  * read into memory. `onError(err)` fires if the drop wasn't a folder or
  * reading failed.
  *
- * Note: the user must drop the ROOT assets folder itself (the one
- * containing the per-model subfolders), same expectation as the native
- * picker flow - dropping a single model folder or individual files will
- * scan zero valid models.
+ * Note: the user drops the ROOT assets folder (which contains object/,
+ * sound/, stage/) - or the object/ folder directly; scanModels() in
+ * fs_assets.js descends into object/ when present, so either works. Same
+ * expectation as the native picker flow - dropping a single model folder
+ * or individual files will scan zero valid models.
  */
 export function initDropZone(dropZoneEl, { onFolderReady, onError }) {
   const preventDefaults = (e) => {

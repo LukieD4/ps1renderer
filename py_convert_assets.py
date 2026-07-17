@@ -7,9 +7,9 @@ from pathlib import Path
 
 # Run before py_convert_textures.py!
 
-# Source/output dirs: assets (source) .obj/.mtl files go in assets/,
+# Source/output dirs: assets (source) .obj/.mtl files go in assets/object/,
 # converted .c files come out in generated/.
-ORIGIN_OBJECT_DIR = Path(__file__).resolve().parent / "assets"
+ORIGIN_OBJECT_DIR = Path(__file__).resolve().parent / "assets" / "object"
 CONVERT_OBJECT_DIR = Path(__file__).resolve().parent / "generated"
 
 FIXED_POINT_MATH_UPSCALE = 1024  # converts from decimal to int, something which the ps1 can digest.
@@ -25,7 +25,7 @@ UV_BYTE_SCALE = 255  # 256x256 image
 # 256 distinct materials per model is the hard ceiling either way.
 MAX_MATERIALS_PER_MODEL = 256
 
-# Multiple simultaneous models (scenes) means every generated .c file now
+# Multiple simultaneous models (stages) means every generated .c file now
 # gets #include'd together into ONE main.c translation unit (via
 # generated/models_all.h), instead of one at a time by hand-editing a
 # single "#include generated/house.c" line. That means every model's
@@ -42,7 +42,7 @@ def sanitize_identifier(name):
 
 # Delete old dir contents so stale .c files don't linger after a model is
 # renamed/removed from generated/. Runs first, before py_convert_textures.py
-# or py_convert_scenes.py add their own (differently-named) outputs to the
+# or py_convert_stages.py add their own (differently-named) outputs to the
 # same directory - both of those scripts are careful not to wipe generated/
 # themselves, only this one does, since this one always runs first.
 if CONVERT_OBJECT_DIR.exists():
@@ -59,14 +59,14 @@ CONVERT_OBJECT_DIR.mkdir(parents=True, exist_ok=True)
 
 # ------------------------------------------------------------------
 # Discovery: ONE .obj per model folder, following the established
-# per-object convention (assets/<name>/<name>.obj[/.mtl][/textures]) -
+# per-object convention (assets/object/<name>/<name>.obj[/.mtl][/textures]) -
 # see the README's "Asset pipeline restructure" entry. This is a
 # deliberately NARROWER walk than the old os.walk(ORIGIN_OBJECT_DIR)
 # (which recursed into every subfolder, including dev/ working-file
-# dirs - that's how assets/house/dev/_house.obj used to leak out as a
+# dirs - that's how assets/object/house/dev/_house.obj used to leak out as a
 # phantom "generated/_house.c" model). Baking every discovered model
 # into the ELF unconditionally (the "bake all models always" choice for
-# the scene system) makes an accurate discovery list matter now more
+# the stage system) makes an accurate discovery list matter now more
 # than it used to - a stray dev/ .obj would become a real, wasted
 # runtime model registry entry, not just an unused generated file.
 # ------------------------------------------------------------------
@@ -676,7 +676,7 @@ for model_name, file in discovered_models:
         # build. Skip it from the registry (with a loud warning) instead.
         if triangle_count == 0 or not split_vert_positions:
             print(f"  WARNING: '{model_name}' produced 0 triangles - excluded "
-                  f"from model_registry.c (scene objects referencing it will "
+                  f"from model_registry.c (stage objects referencing it will "
                   f"be treated as an unresolved model at runtime).")
             continue
 
@@ -709,10 +709,10 @@ header_lines.append("    unsigned short uv1;\n")
 header_lines.append("    unsigned short uv2;\n\n")
 header_lines.append("    unsigned char material;\n\n")
 header_lines.append("} MODEL_TRI;\n\n")
-header_lines.append("// One entry per discovered assets/<name>/<name>.obj. Every pointer field\n")
+header_lines.append("// One entry per discovered assets/object/<name>/<name>.obj. Every pointer field\n")
 header_lines.append("// points at that SPECIFIC model's own prefixed arrays (<name>_modelVerts,\n")
-header_lines.append("// <name>_modelTris, etc.) - main.c resolves a scene object's \"model\" name\n")
-header_lines.append("// string against modelRegistry[] once at scene load (see load_scene() /\n")
+header_lines.append("// <name>_modelTris, etc.) - main.c resolves a stage object's \"model\" name\n")
+header_lines.append("// string against modelRegistry[] once at stage load (see load_stage() /\n")
 header_lines.append("// find_model_index_by_name()), then only ever touches these pointers/\n")
 header_lines.append("// counts from there on - never the bare per-model globals directly. This\n")
 header_lines.append("// is what makes main.c's render path model-agnostic instead of hardcoding\n")
@@ -770,7 +770,7 @@ print(f"Generated: {CONVERT_OBJECT_DIR / 'model_registry.c'} ({len(model_registr
 # ------------------------------------------------------------------
 # Manifest - #include'd ONCE from main.c. Replaces the old hand-edited
 # "#include generated/house.c" + commented-out alternates - add/remove a
-# model under assets/ and this regenerates automatically, no main.c edit
+# model under assets/object/ and this regenerates automatically, no main.c edit
 # needed.
 # ------------------------------------------------------------------
 manifest_lines = []

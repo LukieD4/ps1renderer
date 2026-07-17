@@ -9,7 +9,7 @@
  * ----------------------------------------------------------------------
  * A <input type="range"> slider needs a fixed min/max, which none of
  * these fields have (position/rotation/scale are all open-ended - a
- * scene can place an object anywhere). Blender's own numeric fields solve
+ * stage can place an object anywhere). Blender's own numeric fields solve
  * this with unbounded RELATIVE drag: horizontal or vertical mouse
  * movement while the mouse button is held nudges the value up/down by an
  * amount proportional to how far you've dragged, with no fixed range,

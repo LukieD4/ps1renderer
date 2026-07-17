@@ -97,7 +97,7 @@ function toTimBasename(mapKdPath) {
  * the material could not be resolved (missing map_Kd line, missing file,
  * or a decode failure) - this is logged via console.warn but does NOT
  * throw, so one broken material doesn't prevent the rest of the model
- * (and the rest of the scene) from loading.
+ * (and the rest of the stage) from loading.
  */
 export async function resolveMaterials(dirHandle, mtlText) {
   const parsed = parseMtlText(mtlText);

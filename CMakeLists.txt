@@ -26,8 +26,8 @@ find_package(Python3 REQUIRED)
 # via a marker, so Ninja/Make actually reruns the conversion whenever any
 # .obj/.mtl changes, without requiring the generated .c files to exist yet
 # at configure time.
-file(GLOB_RECURSE SOURCE_OBJ_FILES "${CMAKE_SOURCE_DIR}/assets/*.obj")
-file(GLOB_RECURSE SOURCE_MTL_FILES "${CMAKE_SOURCE_DIR}/assets/*.mtl")
+file(GLOB_RECURSE SOURCE_OBJ_FILES "${CMAKE_SOURCE_DIR}/assets/object/*.obj")
+file(GLOB_RECURSE SOURCE_MTL_FILES "${CMAKE_SOURCE_DIR}/assets/object/*.mtl")
 
 set(ASSETS_STAMP "${CMAKE_BINARY_DIR}/generatedonverted.stamp")
 
@@ -50,7 +50,7 @@ add_custom_target(convert_assets
 # glob of generated output that may not exist yet.
 #
 # py_convert_textures.py now emits FOUR fixed-path artifacts regardless
-# of how many textures are discovered under assets/*/textures/:
+# of how many textures are discovered under assets/object/*/textures/:
 #   - generated/textures.bin      the concatenated TIM blob
 #   - generated/tex_blob.S        fixed .incbin of textures.bin (never
 #                                  changes shape as textures are added)
@@ -73,7 +73,7 @@ set(TEX_BLOB_S       "${CMAKE_SOURCE_DIR}/generated/tex_blob.S")
 set(TEX_BLOB_TABLE   "${CMAKE_SOURCE_DIR}/generated/tex_blob_table.c")
 set(TEX_BLOB_TABLE_H "${CMAKE_SOURCE_DIR}/generated/tex_blob_table.h")
 
-file(GLOB_RECURSE SOURCE_PNG_FILES "${CMAKE_SOURCE_DIR}/assets/*/textures/*.png")
+file(GLOB_RECURSE SOURCE_PNG_FILES "${CMAKE_SOURCE_DIR}/assets/object/*/textures/*.png")
 
 add_custom_command(
     OUTPUT "${TEX_BLOB_BIN}" "${TEX_BLOB_S}" "${TEX_BLOB_TABLE}" "${TEX_BLOB_TABLE_H}"
@@ -87,30 +87,30 @@ add_custom_target(convert_textures
 )
 
 # ------------------------------------------------------------
-# 1c. scene.json -> C scene data
+# 1c. stage.json -> C stage data
 # ------------------------------------------------------------
-# Same stamp-file reasoning as convert_assets above (py_convert_scenes.py's
-# outputs - scene_common.h, scene_registry.c, per-scene scene_<name>.c,
-# scenes_all.h - aren't known at CMake configure time on a clean
-# checkout). Scene objects only reference model names as plain strings,
+# Same stamp-file reasoning as convert_assets above (py_convert_stages.py's
+# outputs - stage_common.h, stage_registry.c, per-stage stage_<name>.c,
+# stages_all.h - aren't known at CMake configure time on a clean
+# checkout). Stage objects only reference model names as plain strings,
 # resolved at RUNTIME by main.c (see find_model_index_by_name()), so this
 # doesn't strictly need to run after convert_assets to produce correct
 # output - kept as a separate stage anyway (not folded into convert_assets)
-# so a scene-only edit doesn't force re-parsing every .obj in assets/.
-file(GLOB_RECURSE SOURCE_SCENE_FILES "${CMAKE_SOURCE_DIR}/scenes/*/scene.json")
+# so a stage-only edit doesn't force re-parsing every .obj in assets/object/.
+file(GLOB_RECURSE SOURCE_STAGE_FILES "${CMAKE_SOURCE_DIR}/assets/stage/*/stage.json")
 
-set(SCENES_STAMP "${CMAKE_BINARY_DIR}/scenes_converted.stamp")
+set(STAGES_STAMP "${CMAKE_BINARY_DIR}/stages_converted.stamp")
 
 add_custom_command(
-    OUTPUT "${SCENES_STAMP}"
-    COMMAND "${Python3_EXECUTABLE}" -u "${CMAKE_SOURCE_DIR}/py_convert_scenes.py"
-    COMMAND "${CMAKE_COMMAND}" -E touch "${SCENES_STAMP}"
-    DEPENDS ${SOURCE_SCENE_FILES} "${CMAKE_SOURCE_DIR}/py_convert_scenes.py"
+    OUTPUT "${STAGES_STAMP}"
+    COMMAND "${Python3_EXECUTABLE}" -u "${CMAKE_SOURCE_DIR}/py_convert_stages.py"
+    COMMAND "${CMAKE_COMMAND}" -E touch "${STAGES_STAMP}"
+    DEPENDS ${SOURCE_STAGE_FILES} "${CMAKE_SOURCE_DIR}/py_convert_stages.py"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    COMMENT "Converting scene.json files into C scene data"
+    COMMENT "Converting stage.json files into C stage data"
 )
-add_custom_target(convert_scenes
-    DEPENDS "${SCENES_STAMP}"
+add_custom_target(convert_stages
+    DEPENDS "${STAGES_STAMP}"
 )
 
 # ------------------------------------------------------------
@@ -118,11 +118,11 @@ add_custom_target(convert_scenes
 # ------------------------------------------------------------
 # Single entry point that runs every conversion pass in the correct
 # order (assets before textures, per py_convert_textures.py's own
-# "Run after py_convert_assets.py!" comment; scenes can run independently
+# "Run after py_convert_assets.py!" comment; stages can run independently
 # of both but is included here too) - lets you type one target name
 # instead of remembering which of the three to run, or in which order.
 add_custom_target(convert_everything
-    DEPENDS convert_assets convert_textures convert_scenes
+    DEPENDS convert_assets convert_textures convert_stages
 )
 
 # ------------------------------------------------------------
@@ -135,6 +135,7 @@ add_custom_target(convert_everything
 psn00bsdk_add_executable(template GPREL
     main.c
     sound.c
+    sfx.c
     music.c
     "${TEX_BLOB_S}"
     "${TEX_BLOB_TABLE}"
@@ -150,6 +151,40 @@ target_link_libraries(template PRIVATE psxspu psxcd)
 add_dependencies(template convert_everything)
 
 # ------------------------------------------------------------
+# 3b. assets/sound/*.vag -> iso.xml (sound file entries)
+# ------------------------------------------------------------
+# py_convert_sounds.py expands iso.xml.template's placeholder into one
+# <file> entry per discovered assets/sound/**/*.vag and writes iso.xml -
+# so a new sample lands on the disc by just existing (EDIT THE TEMPLATE,
+# not iso.xml). This must run at CONFIGURE time, not build time:
+# psn00bsdk_add_cd_image() reads/configures iso.xml when CMake runs, so a
+# build-time regeneration would always be one configure behind.
+#
+# CONFIGURE_DEPENDS on the glob makes Ninja/Make re-run CMake (and thus
+# this script) automatically whenever a .vag is added or removed; editing
+# the template or the script also retriggers via CMAKE_CONFIGURE_DEPENDS.
+file(GLOB_RECURSE SOURCE_VAG_FILES CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/assets/sound/*.vag" "${CMAKE_SOURCE_DIR}/assets/sound/*.VAG"
+    "${CMAKE_SOURCE_DIR}/assets/sound/music/*.vab" "${CMAKE_SOURCE_DIR}/assets/sound/music/*.VAB"
+    "${CMAKE_SOURCE_DIR}/assets/sound/music/*.seq" "${CMAKE_SOURCE_DIR}/assets/sound/music/*.SEQ"
+)
+list(REMOVE_DUPLICATES SOURCE_VAG_FILES) # case-insensitive filesystems match both patterns
+
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/iso.xml.template"
+    "${CMAKE_SOURCE_DIR}/py_convert_sounds.py"
+)
+
+execute_process(
+    COMMAND "${Python3_EXECUTABLE}" -u "${CMAKE_SOURCE_DIR}/py_convert_sounds.py"
+    WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
+    RESULT_VARIABLE CONVERT_SOUNDS_RESULT
+)
+if(NOT CONVERT_SOUNDS_RESULT EQUAL 0)
+    message(FATAL_ERROR "py_convert_sounds.py failed (bad/duplicate .vag name under assets/sound/?) - see output above")
+endif()
+
+# ------------------------------------------------------------
 # 4. Build ISO
 # ------------------------------------------------------------
 psn00bsdk_add_cd_image(
@@ -157,9 +192,7 @@ psn00bsdk_add_cd_image(
     template
     iso.xml
     DEPENDS template system.cnf
-        "${CMAKE_SOURCE_DIR}/sound/wind/WIND.VAG"
-        "${CMAKE_SOURCE_DIR}/sound/music/SONG.VAB"
-        "${CMAKE_SOURCE_DIR}/sound/music/SONG.SEQ"
+        ${SOURCE_VAG_FILES} # .vag samples AND music .vab/.seq pairs (see the glob above)
 )
 
 # ------------------------------------------------------------

@@ -1,38 +1,28 @@
 // root/sound.h
 //
-// Minimal SPU sound layer for the renderer. v1 scope: load one looping
-// SPU-ADPCM VAG (ambient wind) off the CD into SPU RAM and play it on a
-// dedicated voice. Later tiers (one-shot barks/caws, positional volume/pan,
-// XA streaming) build on this same module - see sound.c's header comment.
+// Minimal SPU core for the renderer: boots the SPU + CD drive and owns the
+// SPU RAM bump allocator every audio module shares. Actual playback lives
+// in the sibling modules - sfx.c (stage-driven looping ambients, voices
+// 0..7) and music.c (VAB/SEQ sequencer, voices 8..23) - which reserve
+// their waveform slices through sound_spu_reserve() so the debug overlay
+// sees one authoritative budget.
 //
-// This module also owns the SPU RAM bump allocator; sibling audio modules
-// (music.c now, sfx later) reserve their waveform slices through
-// sound_spu_reserve() so the debug overlay sees one authoritative budget.
+// (v1 of this module also owned a hardcoded WIND.VAG ambient on voice 0;
+// that moved to sfx.c when sounds became stage-authored - wind is now just
+// a sound entity placed in stage-gen like any other.)
 #pragma once
 
 #include <stdint.h>
 
 // Call once, from init(), AFTER ResetGraph()/InitGeom() (CdInit and SpuInit
-// both require the reset to have happened). Boots the SPU + CD, loads
-// WIND.VAG from the disc into SPU RAM, and sets sensible master/CD volumes.
-// Does NOT start playback - call sound_wind_start() for that.
+// both require the reset to have happened). Boots the SPU + CD and sets
+// sensible master/CD volumes. Loads nothing itself - sfx.c/music.c do their
+// own CD loads afterwards.
 void sound_init(void);
 
-// Key the wind voice on (starts the loop) / off (release then silence).
-void sound_wind_start(void);
-void sound_wind_stop(void);
-void sound_wind_toggle(void);
-
-// 1 while the wind voice is keyed on, 0 otherwise (our own state flag, not
-// read back from the SPU). Used by debug_text().
-int  sound_wind_playing(void);
-
-// Diagnostics for the debug overlay: did WIND.VAG load off the CD and upload
-// to SPU RAM (sound_wind_loaded), and does it carry loop flags
-// (sound_wind_is_looped)? These make a silent boot self-explanatory - if
-// LOADED=N the CD/file path failed; if LOOP=N a one-shot VAG was shipped.
-int  sound_wind_loaded(void);
-int  sound_wind_is_looped(void);
+// 1 if CdInit() succeeded at boot. sfx.c/music.c check this before
+// attempting CD reads so a missing disc degrades to silence, not a hang.
+int sound_cd_ready(void);
 
 // SPU RAM allocator, shared by every audio module.
 //   sound_spu_reserve - claim `bytes` of SPU RAM (8-byte aligned); returns
@@ -40,7 +30,7 @@ int  sound_wind_is_looped(void);
 //                       caller that gets 0 must skip its upload.
 //   sound_spu_release - give back the MOST RECENT `bytes` reserved (LIFO
 //                       rewind of the bump cursor; same rounding as reserve).
-//                       Correct scene teardown = release in reverse order of
+//                       Correct stage teardown = release in reverse order of
 //                       reserve. A real free list can replace this later
 //                       without changing callers.
 uint32_t sound_spu_reserve(uint32_t bytes);
@@ -57,8 +47,3 @@ void     sound_spu_release(uint32_t bytes);
 uint32_t sound_spu_used(void);
 uint32_t sound_spu_capacity(void);
 uint32_t sound_spu_free(void);
-
-// Live volume for the wind voice, 0..0x3fff per channel. Kept as a setter so
-// the future positional-audio hook (distance -> volume, screen-X -> L/R pan)
-// can drive it straight from draw_scene() without touching this module's guts.
-void sound_wind_set_volume(int left, int right);

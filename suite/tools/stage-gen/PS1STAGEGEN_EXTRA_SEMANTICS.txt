@@ -1,0 +1,299 @@
+PS1STAGEGEN EXTRA SEMANTICS
+Editor-native entities: Billboard, Trigger, Spawn, Summon, Sound
+================================================================
+
+Companion to PS1AUDIO_SEMANTICS / PS1TIM_SEMANTICS / PS1CUSTOM_MUSIC_
+SEMANTICS. Covers the stage-gen tool's ENTITY system - the object kinds
+that can be placed in a stage WITHOUT a model asset backing them - and,
+where one exists, the PS1-runtime semantics behind each. Source of truth
+for the schemas is ENTITY_KINDS in suite/tools/stage-gen/js/stage_state.js;
+this document explains what the code enforces and why.
+
+
+1. THE ENTITY SYSTEM (shared plumbing)
+--------------------------------------
+
+Entities are game-logic markers, not renderable geometry. They live in
+the same Instances tree as model instances and share ONE id sequence
+with instances and folders (so a parentId can never be ambiguous), the
+same selection / TransformControls gizmo / rename / Ctrl+D duplication /
+undo paths, and the same folder organization.
+
+They are deliberately EXEMPT from systems where a marker must not act
+like world geometry (viewer.js flags them isEntity):
+  - freecam walking never stands on them,
+  - seam-snap ignores them as neighbors,
+  - surface-snap raycasts pass through them (a dragged crate can never
+    come to rest ON a trigger volume or spawn cone).
+
+Each kind declares an ordered `props` schema the Properties panel
+renders from. Prop types: bool (checkbox), int / number (numeric field),
+string (text field), select (dropdown with { value, label } options).
+A prop may carry `showIf: (props) => bool` - the field is hidden while
+the predicate is false (e.g. interval bounds only exist in Random
+Interval mode); committing a select re-renders the section so dependent
+fields appear/disappear immediately.
+
+PERSISTENCE vs EXPORT - the critical distinction:
+  - ALL entity kinds persist in the .StageGen project file (format v3),
+    so authoring can start before a runtime exists. Unknown kinds from a
+    future format version are dropped on load; missing props are filled
+    from schema defaults.
+  - Only SOUND currently graduates into the exported stage.json (a
+    dedicated "sounds" array) and therefore into the baked C stage data
+    the PS1 runtime loads. Billboard / Trigger / Spawn / Summon are
+    editor-and-project-file only until main.c grows loaders for them;
+    stage_export.js flattens them away.
+
+Coordinate note (applies to entity placement like any instance):
+positions are authored in viewport units (1 unit == 1 Blender/OBJ unit)
+and remapped at EXPORT time via remapPos - renderer_X = x,
+renderer_Y = -y (renderer Y decreases upward), renderer_Z = -z - then
+upscaled *1024 to engine fixed-point. See stage_export.js's header for
+why placement uses a sign-flip, not the per-vertex model converter's
+axis SWAP - they are different transforms on purpose.
+
+Viewport marker colors are declared twice by design: CSS string in
+ENTITY_KINDS (tree row dot) and Three.js hex in viewer.js's
+ENTITY_COLORS (3D helper). Change both or they drift.
+
+
+2. TRIGGER  (color #ff8c42, orange)
+-----------------------------------
+
+Volume that fires an event when entered. Runtime: NOT EXPORTED YET.
+
+Params:
+  event : string, default ""   - name of the event to fire.
+  once  : bool,   default true - fire a single time vs. every entry.
+
+Technicality:
+  - The viewport helper is a unit cube (translucent fill + edge lines);
+    the entity's SCALE is the volume's size, so the regular scale gizmo
+    resizes the trigger region directly. There is no separate "extent"
+    param - scale IS the extent.
+  - Planned runtime pairing: the Sound system already reserves a future
+    "trigger" field on sounds (a trigger's event name keying a one-shot
+    sample), and unpinned SFX voices are kept for exactly that tier.
+
+
+3. SPAWN  (color #5dd06a, green)
+--------------------------------
+
+Player/actor spawn point. Runtime: NOT EXPORTED YET.
+
+Params:
+  spawnId : int, default 0 - UNIQUE across all spawn-like entities.
+
+Technicality:
+  - spawnId is marked uniqueSpawnId in the schema. Uniqueness is
+    SOFT-validated (warning styling + toast, not a block) because the
+    author may be mid-renumber; Spawns and Summons share one id
+    namespace and one auto-increment sequence (dense small integers).
+  - Ctrl+D duplication assigns a fresh unique spawn ID instead of
+    copying the old one.
+  - Viewport helper: base disc + cone + a FORWARD POINTER showing which
+    way the spawned actor will face (-Z, the same "forward" convention
+    as the exported camera). Rotating the entity swings the pointer -
+    rotation is meaningful data here, not decoration.
+
+
+4. SUMMON  (color #b06ee0, purple)
+----------------------------------
+
+NPC spawn with behavior parameters. Runtime: NOT EXPORTED YET.
+
+Params:
+  spawnId          : int,    default 0     - same unique namespace as Spawn.
+  isFriendly       : bool,   default false
+  patrolRadius     : number, default 3     - viewport units.
+  health           : int,    default 100
+  canSeeThroughWalls : bool, default false
+
+Technicality:
+  - Same cone/disc/pointer marker as Spawn, plus a ground-plane ring
+    (LineLoop) visualizing patrolRadius; the ring re-builds live as the
+    prop is edited (viewer.updateEntityProps -> applyEntityPropsToMeshes).
+  - patrolRadius is authored in viewport units; like all distances it
+    would be *1024 at export when this kind graduates.
+
+
+5. BILLBOARD  (color #3ec6dc, cyan)
+-----------------------------------
+
+Camera-facing flat sprite plane. Runtime: NOT EXPORTED YET.
+
+Params:
+  trackCamera     : bool,   default true  - yaw-follow the camera.
+  pivotAngle      : number, default 0     - degrees.
+  seeThroughWalls : bool,   default false - draw on top of geometry.
+
+Technicality:
+  - trackCamera is LIVE-PREVIEWED in the editor: any billboard with it
+    enabled yaw-follows the edit camera every frame (Y-axis
+    billboarding, the intended runtime behavior).
+  - seeThroughWalls is also previewed: it disables depthTest on the
+    helper's materials so the marker renders on top - exactly what the
+    runtime flag will mean.
+  - Runtime plan: a camera-facing textured quad (POLY_FT4) whose yaw is
+    derived per frame from camera position; pivotAngle offsets the rest
+    orientation when trackCamera is off.
+
+
+6. SOUND  (color #e05d8a, pink)  - THE ONLY KIND WITH A RUNTIME
+---------------------------------------------------------------
+
+Ambient / one-shot / music audio emitter. FULLY EXPORTED and loaded by
+the PS1 runtime (sfx.c / music.c). This is the reference case for how an
+entity kind "graduates".
+
+6.1 Params
+  sample          : string, default ""
+      Free-text base name, e.g. "WIND" - NOT "WIND.VAG". Resolved late
+      (see 6.3); typos degrade to silence + an UNRES count on the debug
+      overlay, same philosophy as stage-object model names.
+  volume          : number 0-1, default 0.5
+      Human float; converter scales to the SPU's 0..0x3fff per-voice
+      volume (0.5 -> 0x2000, the old hardcoded wind level).
+  mode            : select, default 'loop'
+      loop / once / interval / music - see 6.4.
+  fadeOnStageEnter: bool, default true      [shown only for mode=music]
+      Cross-fade this stage's track in on a live stage transition vs. a
+      hard cut. Baked now; consumed by the FUTURE transition system.
+  delay           : number seconds, default 0  [hidden for music]
+      Time before the sound's FIRST activity in every mode. Loop/Once
+      key on when it elapses; Interval starts scheduling then. Replayed
+      on a START-toggle re-arm.
+  intervalMin/Max : number seconds, defaults 2/8  [shown only for interval]
+      Bounds of the random silence between plays. Exporter sanitizes
+      swapped/negative bounds; converter bakes to VSync frames (x60),
+      uint16 (~18 min max).
+  directional     : bool, default false     [hidden for music]
+      Per-frame distance falloff + stereo pan from the camera. Off =
+      constant volume everywhere.
+  radius          : number, default 0       [hidden for music]
+      Directional falloff radius in viewport units (*1024 at export).
+      0 = NO distance falloff (pan still applies when directional).
+  muteAfterPlay   : bool, default false     [hidden for music]
+      After ONE completed playthrough, force silent and never retrigger
+      for the rest of the stage. Nothing is freed (sample + voice stay
+      resident - the LIFO SPU allocator cannot reclaim mid-stack), so a
+      future trigger can re-arm it. Loop mode ignores this (a loop never
+      "finishes" - the software re-key does not count as finishing).
+  autoplay        : bool, default true
+      Start as soon as the stage loads (for music: play after load).
+
+  Viewport helper: core sphere + two wireframe emission shells + a
+  ground-plane radius ring that live-tracks `radius` (hidden at 0).
+
+6.2 Export shape (stage.json "sounds" array)
+  { sample, pos [remapPos * 1024], volume (0-1 float), radius (*1024),
+    mode, delay, intervalMin, intervalMax, directional, muteAfterPlay,
+    fadeOnStageEnter, autoplay }
+  Entities with an empty sample name are skipped at export. Backward
+  compat: the earliest format's bare `loop: true/false` still converts
+  (true -> loop, false -> once).
+
+6.3 Pipeline / name resolution
+  sample "CAW1" -> py_convert_stages.py validates it as an 8.3 base name
+  (1-8 chars, A-Z 0-9 _ after uppercasing; convert FAILS loudly on an
+  impossible name) and bakes the full CD path "\CAW1.VAG;1" into
+  STAGE_SOUND.cdPath. Whether the file is ON the disc resolves at
+  RUNTIME (CdSearchFile) - missing file = silence + UNRES on overlay.
+
+  Disc shipping is automatic: py_convert_sounds.py (run at CMake
+  configure, CONFIGURE_DEPENDS-triggered) expands iso.xml.template's
+  placeholders with every assets/sound/**/*.vag (instruments/ and music/
+  excluded) plus every assets/sound/music/*.vab/.seq pair. Non-8.3 .vag
+  names fail the configure; non-8.3 music names WARN + SKIP (WIP OST
+  Studio exports shouldn't break the build). Audit any time with
+  check_content_compatability_ISO9660_8.3.py.
+
+  STAGE_SOUND (generated/stage_common.h) is the baked struct: cdPath,
+  cdPath2 (music SEQ, else NULL), pos, volume (0..0x3fff), radius, mode,
+  directional, muteAfterPlay, autoplay, fadeOnStageEnter, delayFrames,
+  intervalMin/MaxFrames. Mode byte values match sfx.h's SFX_MODE_*.
+
+6.4 Runtime semantics (sfx.c, per mode)
+  Voices: sfx owns hardware voices 0..7, music.c owns 8..23. Every stage
+  sound pins one voice; SFX_MAX_STAGE_SOUNDS == the pool size (8).
+  Loading: at load_stage(), each sound's VAG is CD-read, header-parsed,
+  and uploaded into SPU RAM via sound.c's shared bump allocator (budget
+  visible on the overlay's SPU RAM line). Two emitters naming the same
+  sample SHARE one upload (dedupe) but keep separate voices. Stage
+  switch releases everything in reverse load order - the allocator is
+  LIFO, which is also why music (global) loads BEFORE the first stage's
+  sfx at boot.
+
+  LOOP     Continuous. If the VAG carries a REAL musical loop (a
+           loop-START flagged block strictly BEFORE the loop-end block -
+           WIND.VAG's layout), the SPU hardware-loops it seamlessly.
+           Otherwise sfx re-keys the sample from the top each
+           playthrough (software loop, ~166 ms end-pad gap). IMPORTANT:
+           one-shot encodes typically end with a single all-zero
+           TERMINATOR block flagged 0x07 (start+end+repeat on the same
+           silent block) - that is loop FLAGS without a musical loop,
+           and it is exactly why detection must be positional. Loop mode
+           therefore ALWAYS loops, regardless of how the sample was
+           encoded; encode real loop flags only when you need a
+           seamless ambient.
+  ONCE     Single playthrough, then keyed off by timer. Completion is a
+           frame countdown from the sample's true length
+           (bodyBytes/16*28 samples at the header's rate; the SPU has no
+           cheap "voice finished" read-back). Replays on a START-toggle
+           re-arm unless muteAfterPlay latched it.
+  INTERVAL Fires, completes, then waits a random delay in [min,max]
+           frames and fires again. The FIRST fire after delay is also
+           randomized so co-located interval sounds don't chorus at t=0.
+  MUSIC    Not an sfx voice at all: the entity is a stage-level marker
+           whose sample maps to assets/sound/music/<NAME>.VAB + .SEQ for
+           music.c. cdPath/cdPath2 carry both paths; sfx records the
+           first music entity per stage (sfx_stage_music()) and skips it
+           (no voice, excluded from LOADED/UNRES counts). TODAY: main.c
+           reads the boot stage's music entity to pick which pair
+           music_load() gets, falling back to \SONG.VAB;1 + \SONG.SEQ;1.
+           FUTURE: live stage transitions consume fadeOnStageEnter.
+           First music entity wins if a stage authors several.
+
+  Directional pass (sfx_tick, once per displayed frame, VSync cadence):
+  horizontal (X/Z) only. Linear attenuation inside `radius`; beyond it,
+  silent; radius 0 skips falloff. Pan rotates the emitter offset into
+  view space by camera yaw (12-bit angle), pan = viewX/dist = sine of
+  azimuth, applied as "attenuate the far ear" (center = full on both
+  channels, hard side = far ear silent). Skipped within 64 world units
+  (direction undefined at the listener). The isin/icos sign convention
+  is derived from the view matrix, not yet ear-verified on hardware - a
+  marked one-sign flip in sfx_update_directional() fixes a mirrored pan.
+
+  START button: master ambience toggle. Stop keys all voices off and
+  cancels pending delay/interval timers; start re-arms everything as at
+  stage load (including delays) - EXCEPT muteAfterPlay-latched slots,
+  which stay silent until a stage reload.
+
+  Debug overlay: "SFX=ON/OFF LOADED=n/m UNRES=x MUTED=y" plus the shared
+  SPU RAM budget line. Music entities are excluded from n/m so it can
+  actually reach n == m.
+
+6.5 Budget cheat-sheet
+  SPU RAM for waveforms: ~508 KB (512 KB minus capture area), shared
+  with music's bank. Per-sound ceiling 128 KB (sfx.c load buffer).
+  Voices: 8 for sfx, 16 for music. Sounds per stage: 8 (== voice pool).
+  A sound that misses any budget (RAM, voice, file) counts UNRES and
+  plays nothing - the stage still runs.
+
+
+7. GRADUATING ANOTHER KIND (the recipe Sound proved)
+----------------------------------------------------
+
+ 1. stage_export.js: emit a dedicated array for the kind (remapPos +
+    *1024 upscale; skip obviously-invalid entries).
+ 2. py_convert_stages.py: parse + validate, bake a struct into
+    generated/stage_common.h and per-stage arrays (NULL/0 when absent so
+    older stage.json keeps converting).
+ 3. Runtime module: load in load_stage(), release LIFO on stage switch,
+    tick beside music_tick()/sfx_tick() if per-frame work is needed.
+ 4. Debug overlay line with loaded/unresolved counts - silence must be
+    self-diagnosing.
+ 5. If it references disc files: extend py_convert_sounds.py (or a
+    sibling) so shipping stays automatic, and keep 8.3 validation at
+    convert time.

@@ -39,7 +39,7 @@
  * A single .tim can contain multiple stacked CLUT rows (clutHeight = N);
  * each row is an alternate palette for the same indexed pixel data. This
  * is how this toolchain implements "PS1 palette swaps" per object
- * instance (the `palette` field in scene.json selects which row to use).
+ * instance (the `palette` field in stage.json selects which row to use).
  */
 
 /**

@@ -1,13 +1,13 @@
 /*
  * history.js
  *
- * Snapshot-based undo/redo for scene-gen's editor state.
+ * Snapshot-based undo/redo for stage-gen's editor state.
  *
  * ----------------------------------------------------------------------
  * WHY SNAPSHOTS, NOT COMMAND OBJECTS
  * ----------------------------------------------------------------------
  * A "command pattern" undo stack (each action pushes a {do, undo} pair)
- * is more memory-efficient, but scene_state.js's SceneState is already
+ * is more memory-efficient, but stage_state.js's StageState is already
  * fully JSON-serializable plain data (instances, camera, nextId,
  * selectedInstanceId - see its own header comment: no live handles or
  * Three.js objects live on state itself, those stay in viewer.js). That
@@ -15,14 +15,14 @@
  * mutation automatically gets undo support for free just by wrapping it
  * in pushHistory()/no code changes needed elsewhere, rather than having
  * to hand-write a paired inverse for every single state-mutating action
- * (easy to forget one and silently break undo for it). Scene sizes in
+ * (easy to forget one and silently break undo for it). Stage sizes in
  * this tool (tens of instances, not thousands) make the extra memory of
  * full snapshots a non-issue.
  *
- * The one thing snapshots do NOT cover is viewer.js's live Three.js scene
+ * The one thing snapshots do NOT cover is viewer.js's live Three.js stage
  * graph (Object3D instances, materials, textures) - that's not
  * serializable and doesn't need to be, since app.js already has a proven
- * pattern for resyncing the viewport FROM a plain SceneState snapshot:
+ * pattern for resyncing the viewport FROM a plain StageState snapshot:
  * the project-load handler (see app.js's fileLoadProject listener) does
  * exactly that. applyHistorySnapshot() below reuses that same resync
  * approach: clear every current instance from the viewport, then re-add
@@ -44,7 +44,7 @@ let redoStack = [];
 let isRestoring = false;
 
 /**
- * Deep-clone a SceneState's serializable fields into a plain snapshot
+ * Deep-clone a StageState's serializable fields into a plain snapshot
  * object. Deliberately does NOT use structuredClone/JSON round-trip on
  * the whole `state` object, since state.models is a Map of large,
  * non-serializable data (dirHandle, decoded .tim Uint8Arrays) that must

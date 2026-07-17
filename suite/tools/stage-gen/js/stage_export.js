@@ -1,13 +1,13 @@
 /*
- * scene_export.js
+ * stage_export.js
  *
- * Builds the final scene.json output and triggers its download.
+ * Builds the final stage.json output and triggers its download.
  *
  * ----------------------------------------------------------------------
  * WHY THE COORDINATE REMAP EXISTS - AND WHY THE OLD FORMULA WAS WRONG
  * ----------------------------------------------------------------------
  * Artists author models in Blender (Forward=-Z, Up=Y) and export .obj
- * files in that same space. The scene-gen viewport loads those .obj files
+ * files in that same space. The stage-gen viewport loads those .obj files
  * AS-IS via OBJLoader (no remap) so the viewport visually matches what the
  * artist saw in Blender - WYSIWYG editing. Three.js/OBJLoader do zero axis
  * conversion, so viewport pos.x/y/z here genuinely IS raw OBJ-file X/Y/Z.
@@ -36,7 +36,7 @@
  * authoring convention (verified via the arrow.obj dual-tip test against
  * how an individual model's shape should orient), whereas placement needs
  * to preserve the artist's own "up is up, forward is forward" intuition
- * from the viewport into the exported scene. The correct placement remap:
+ * from the viewport into the exported stage. The correct placement remap:
  *
  *   renderer_X =  viewport_X
  *   renderer_Y = -viewport_Y   (viewport Y is up; main.c's Y decreases upward)
@@ -79,7 +79,7 @@ export function remapRot(rot) {
 }
 
 /**
- * Build the full scene.json object from editor state.
+ * Build the full stage.json object from editor state.
  *
  * Hand-traced example (verify against the code below):
  *   viewport authored pos = (1, 2, 3)   (2 = up, 3 = backward-from-camera)
@@ -97,11 +97,11 @@ export function remapRot(rot) {
  * change (which left both instances at the same renderer Y and instead
  * pushed one backward in depth - the exact symptom reported).
  */
-export function buildSceneJson(state) {
+export function buildStageJson(state) {
   const camRemappedPos = remapPos(state.camera.pos);
   const camRemappedRot = remapRot(state.camera.rot);
 
-  const scene = {
+  const stage = {
     camera: {
       pos: [
         Math.round(camRemappedPos.x * UPSCALE),
@@ -135,7 +135,52 @@ export function buildSceneJson(state) {
     }),
   };
 
-  return scene;
+  // Sound entities are the FIRST editor entity kind to graduate into
+  // stage.json (see ENTITY_KINDS' note in stage_state.js - every other
+  // kind is still project-file-only because the PS1 runtime has no
+  // loader for them). Placement uses the same remapPos + *1024 upscale
+  // as object placement above; volume stays a human 0-1 float (the same
+  // "human multiplier" convention as object scale - py_convert_stages.py
+  // scales it to the SPU's 0..0x3fff range); radius is a distance, so it
+  // gets the same *1024 world-unit upscale as positions. Entities with
+  // an empty sample name are skipped rather than exported as
+  // unresolvable entries.
+  const soundEntities = (state.entities || []).filter(
+    (ent) => ent.kind === 'sound' && (ent.props.sample || '').trim() !== ''
+  );
+  if (soundEntities.length > 0) {
+    stage.sounds = soundEntities.map((ent) => {
+      const remappedPos = remapPos(ent.pos);
+      // Interval bounds: exported in SECONDS (human units, converted to
+      // frames by py_convert_stages.py), sanitized so the runtime never
+      // sees min > max or negatives regardless of what was typed.
+      let intervalMin = Math.max(0, ent.props.intervalMin ?? 2);
+      let intervalMax = Math.max(0, ent.props.intervalMax ?? 8);
+      if (intervalMax < intervalMin) [intervalMin, intervalMax] = [intervalMax, intervalMin];
+      return {
+        sample: ent.props.sample.trim(),
+        pos: [
+          Math.round(remappedPos.x * UPSCALE),
+          Math.round(remappedPos.y * UPSCALE),
+          Math.round(remappedPos.z * UPSCALE),
+        ],
+        volume: ent.props.volume,
+        radius: Math.round(Math.max(0, ent.props.radius || 0) * UPSCALE),
+        mode: ent.props.mode || 'loop', // 'loop' | 'once' | 'interval' | 'music'
+        delay: Math.max(0, ent.props.delay || 0), // seconds before the FIRST play (non-music modes)
+        // Music only (harmless true default elsewhere): cross-fade this
+        // stage's track in on a live stage transition vs. a hard cut.
+        fadeOnStageEnter: ent.props.fadeOnStageEnter !== false,
+        intervalMin,
+        intervalMax,
+        directional: !!ent.props.directional,
+        muteAfterPlay: !!ent.props.muteAfterPlay,
+        autoplay: !!ent.props.autoplay,
+      };
+    });
+  }
+
+  return stage;
 }
 
 /**
@@ -143,7 +188,7 @@ export function buildSceneJson(state) {
  * via a Blob + temporary <a> click - same pattern as palette-maker's
  * presumed export helper (no server round-trip, everything client-side).
  */
-export function downloadSceneJson(json, filename) {
+export function downloadStageJson(json, filename) {
   const text = JSON.stringify(json, null, 2);
   const blob = new Blob([text], { type: 'application/json' });
   const url = URL.createObjectURL(blob);
