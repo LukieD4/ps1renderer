@@ -21,10 +21,11 @@ from pathlib import Path
 # Row SELECTION is not this script's job and is not encoded in the
 # material name - one blob entry covers every row a file has
 # (clut_height is carried through as paletteCount for range-checking).
-# main.c currently picks a row via a single runtime global
-# (active_palette, cycled with pad 2 SQUARE/CIRCLE) applied to every
-# textured triangle; a future scene loader is expected to make this
-# per-object instead - see active_palette's comment in main.c.
+# main.c picks a row PER PLACED OBJECT: each scene object's authored
+# base row (SCENE_OBJECT.palette, from scene.json) plus a live global
+# nudge (active_palette, cycled with SQUARE/CIRCLE in the camera schema
+# - hold L2 on pad 1), clamped per-texture against paletteCount - see
+# active_palette's comment in main.c.
 #
 # This script's job:
 #   1. discover .tim files in assets/*/textures/

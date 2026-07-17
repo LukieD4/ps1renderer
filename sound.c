@@ -213,7 +213,6 @@ void sound_init(void)
 // ------------------------------------------------------------
 void sound_wind_start(void)
 {
-    // return; // returns early so I can hear the music properly 
     if (!wind_loaded)
         return;
 
