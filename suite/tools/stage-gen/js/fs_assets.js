@@ -4,18 +4,23 @@
  * Wraps the browser File System Access API (FSA API) for stage-gen.
  * We use `window.showDirectoryPicker()` instead of a plain <input type="file">
  * because the tool needs to walk a whole assets folder tree (model subfolders,
- * their .obj/.mtl, and their textures/ subfolder full of .tim files) and
- * re-resolve relative paths found inside .mtl files (map_Kd lines) against
- * that same tree. A single <input> file picker cannot give us directory
- * handles or relative-path resolution, only flat file lists.
+ * their .glb, and their textures/ subfolder full of .tim files) and resolve
+ * relative texture paths against that same tree. A single <input> file picker
+ * cannot give us directory handles or relative-path resolution, only flat
+ * file lists.
  *
- * Folder-naming convention (mirrors the Python OBJ/TIM export pipeline):
- *   assets/object/<model_name>/<model_name>.obj
- *   assets/object/<model_name>/<model_name>.mtl
+ * Folder-naming convention (mirrors the Python glTF/TIM export pipeline):
+ *   assets/object/<model_name>/<model_name>.glb   (or .gltf)
  *   assets/object/<model_name>/textures/<MaterialName>.tim
- * i.e. the model's folder name and its .obj/.mtl base filename are always
- * identical. This lets scanModels() find a model's files without parsing
- * any manifest - it just checks for <dirname>/<dirname>.obj and .mtl.
+ * i.e. the model's folder name and its .glb base filename are always
+ * identical. This lets scanModels() find a model's file without parsing any
+ * manifest - it just checks for <dirname>/<dirname>.glb (then .gltf).
+ *
+ * FORMAT NOTE: the toolchain moved off OBJ/MTL entirely - glTF carries
+ * geometry, UVs and (crucially) MATERIAL NAMES in one file, so there is no
+ * separate .mtl to parse. Textures are still PS1-native .tim, resolved from
+ * textures/<materialName>.tim by the glTF material name (see texture
+ * resolution in mtl_resolver.js).
  */
 
 /**
@@ -37,8 +42,8 @@ export async function pickAssetsFolder() {
 
 /**
  * Walk the immediate subdirectories of `rootDirHandle` looking for model
- * folders that follow the <name>/<name>.obj + <name>/<name>.mtl convention.
- * Subdirectories missing either file are skipped (with a console.warn) so
+ * folders that follow the <name>/<name>.glb (or .gltf) convention.
+ * Subdirectories with no glTF file are skipped (with a console.warn) so
  * that unrelated folders (e.g. a stray textures-only folder) don't break
  * the scan.
  *
@@ -49,7 +54,7 @@ export async function pickAssetsFolder() {
  * assets/ folder (which also contains sound/ and stage/) works just as
  * well as dropping assets/object/ itself.
  *
- * Returns: Array<{name, dirHandle, objHandle, mtlHandle}>
+ * Returns: Array<{name, dirHandle, glbHandle}>
  */
 export async function scanModels(rootDirHandle) {
   const results = [];
@@ -68,28 +73,28 @@ export async function scanModels(rootDirHandle) {
     if (entryHandle.kind !== 'directory') continue;
 
     const modelName = entryName;
-    let objHandle = null;
-    let mtlHandle = null;
 
-    try {
-      objHandle = await entryHandle.getFileHandle(`${modelName}.obj`);
-    } catch (err) {
-      console.warn(`scanModels: skipping "${modelName}" - missing ${modelName}.obj`);
-      continue;
+    // Prefer <name>.glb (self-contained binary glTF), fall back to
+    // <name>.gltf. Either carries geometry + UVs + material names.
+    let glbHandle = null;
+    for (const candidate of [`${modelName}.glb`, `${modelName}.gltf`]) {
+      try {
+        glbHandle = await entryHandle.getFileHandle(candidate);
+        break;
+      } catch (err) {
+        // try the next extension
+      }
     }
 
-    try {
-      mtlHandle = await entryHandle.getFileHandle(`${modelName}.mtl`);
-    } catch (err) {
-      console.warn(`scanModels: skipping "${modelName}" - missing ${modelName}.mtl`);
+    if (!glbHandle) {
+      console.warn(`scanModels: skipping "${modelName}" - missing ${modelName}.glb/.gltf`);
       continue;
     }
 
     results.push({
       name: modelName,
       dirHandle: entryHandle,
-      objHandle,
-      mtlHandle,
+      glbHandle,
     });
   }
 
@@ -97,10 +102,11 @@ export async function scanModels(rootDirHandle) {
 }
 
 /**
- * Resolve a relative path (e.g. "textures/Grass0.tim", possibly with
- * backslashes from a Windows-authored .mtl) against a given directory
- * handle by walking each path segment: all but the last segment are
- * directories, the last is the target file.
+ * Resolve a relative path (e.g. "textures/Grass0.tim") against a given
+ * directory handle by walking each path segment: all but the last segment
+ * are directories, the last is the target file. Backslashes are normalized
+ * to forward slashes defensively, though the texture paths built today
+ * (textures/<materialName>.tim) already use forward slashes.
  *
  * Returns the FileSystemFileHandle, or null (with console.warn) if any
  * segment along the way is missing.

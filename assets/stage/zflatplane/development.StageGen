@@ -1,0 +1,104 @@
+{
+  "version": 3,
+  "camera": {
+    "pos": {
+      "x": 0,
+      "y": 2,
+      "z": 8
+    },
+    "rot": {
+      "x": 0,
+      "y": 0,
+      "z": 0
+    }
+  },
+  "modelNames": [
+    "plane",
+    "arrow"
+  ],
+  "folders": [],
+  "instances": [
+    {
+      "id": 1,
+      "model": "plane",
+      "palette": 0,
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      }
+    },
+    {
+      "id": 2,
+      "model": "arrow",
+      "palette": 0,
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": -9.173,
+        "y": 0.716,
+        "z": -3.441
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      }
+    }
+  ],
+  "entities": [
+    {
+      "id": 3,
+      "kind": "sound",
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": -1.625,
+        "y": 0.19,
+        "z": 5.926
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "sample": "LAVENDAR",
+        "volume": 0.5,
+        "mode": "music",
+        "fadeOnStageEnter": true,
+        "delay": 0,
+        "intervalMin": 2,
+        "intervalMax": 8,
+        "directional": false,
+        "radius": 0,
+        "muteAfterPlay": false,
+        "autoplay": true
+      }
+    }
+  ],
+  "nextId": 4,
+  "nextSpawnId": 0
+}

@@ -224,7 +224,7 @@ export class StageState {
 
   /**
    * Register a loaded model's data (called after fs_assets + mtl_resolver
-   * have finished loading & decoding a model's .obj/.mtl/.tim files).
+   * have finished loading & decoding a model's .glb + .tim files).
    */
   addModel(name, data) {
     this.models.set(name, data);

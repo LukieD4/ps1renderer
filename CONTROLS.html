@@ -1,0 +1,114 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>PS1 Renderer — Control Sheet</title>
+<style>
+  :root{
+    --ink:#1a1a1c; --muted:#6b6b72; --line:#e2e2e6; --bg:#fafafa;
+    --play:#2f6f4f; --camera:#2f5a8f; --debug:#8a5a1f; --global:#5a4a7a;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;padding:32px;background:var(--bg);color:var(--ink);
+    font:15px/1.5 -apple-system,Segoe UI,Roboto,Helvetica,Arial,sans-serif}
+  header{max-width:960px;margin:0 auto 24px}
+  h1{font-size:24px;margin:0 0 4px}
+  .sub{color:var(--muted);margin:0}
+  .wrap{max-width:960px;margin:0 auto}
+  .cycle{display:flex;align-items:center;gap:10px;flex-wrap:wrap;
+    background:#fff;border:1px solid var(--line);border-radius:10px;
+    padding:14px 16px;margin:0 0 20px}
+  .cycle b{font-weight:600}
+  .pill{display:inline-block;padding:3px 10px;border-radius:999px;
+    font-weight:600;font-size:13px;color:#fff}
+  .pill.play{background:var(--play)} .pill.camera{background:var(--camera)}
+  .pill.debug{background:var(--debug)}
+  .arrow{color:var(--muted);font-size:18px}
+  .grid{display:grid;grid-template-columns:1fr 1fr;gap:18px}
+  @media(max-width:720px){.grid{grid-template-columns:1fr}}
+  .card{background:#fff;border:1px solid var(--line);border-radius:10px;overflow:hidden}
+  .card h2{margin:0;padding:12px 16px;font-size:15px;color:#fff;display:flex;
+    justify-content:space-between;align-items:center}
+  .card h2 span{font-weight:400;opacity:.85;font-size:12px}
+  .card.play h2{background:var(--play)} .card.camera h2{background:var(--camera)}
+  .card.debug h2{background:var(--debug)} .card.global h2{background:var(--global)}
+  table{width:100%;border-collapse:collapse}
+  td{padding:8px 16px;border-top:1px solid var(--line);vertical-align:top}
+  td.btn{white-space:nowrap;font-weight:600;width:42%}
+  td.act{color:#333}
+  .note{color:var(--muted);font-size:12px;padding:10px 16px;border-top:1px solid var(--line)}
+  footer{max-width:960px;margin:22px auto 0;color:var(--muted);font-size:12px}
+  kbd{font:inherit;font-weight:600;background:#f0f0f3;border:1px solid var(--line);
+    border-radius:5px;padding:1px 6px}
+  @media print{body{background:#fff;padding:0}.card,.cycle{border-color:#ccc}}
+</style>
+</head>
+<body>
+<header class="wrap">
+  <h1>PS1 Renderer — Control Sheet</h1>
+  <p class="sub">Digital controller · latched modes · nothing held. Current mode shows top-left on the debug overlay.</p>
+</header>
+
+<div class="wrap">
+  <div class="cycle">
+    <b>Switch mode:</b> <kbd>SELECT</kbd> cycles
+    <span class="pill play">PLAY</span><span class="arrow">→</span>
+    <span class="pill camera">CAMERA</span><span class="arrow">→</span>
+    <span class="pill debug">DEBUG</span><span class="arrow">→</span>
+    <span class="pill play">PLAY</span>
+  </div>
+
+  <div class="grid">
+
+    <div class="card play">
+      <h2>PLAY <span>the game · default on boot</span></h2>
+      <table>
+        <tr><td class="btn">D-pad</td><td class="act">Move (camera-relative)</td></tr>
+        <tr><td class="btn">L1 / R1</td><td class="act">Orbit camera left / right (yaw)</td></tr>
+        <tr><td class="btn">L2 / R2</td><td class="act">Look up / down (pitch)</td></tr>
+        <tr><td class="btn">□ △ ○ ✕</td><td class="act">Reserved for player actions</td></tr>
+      </table>
+      <div class="note">Move and look are independent — orbit with the shoulders while you walk.</div>
+    </div>
+
+    <div class="card camera">
+      <h2>CAMERA <span>free-fly dev cam</span></h2>
+      <table>
+        <tr><td class="btn">D-pad</td><td class="act">Translate on X/Z (forward/back/strafe)</td></tr>
+        <tr><td class="btn">L1 / R1</td><td class="act">Move up / down</td></tr>
+        <tr><td class="btn">L2 / R2</td><td class="act">Yaw left / right</td></tr>
+        <tr><td class="btn">△ / ✕</td><td class="act">Pitch up / down</td></tr>
+        <tr><td class="btn">□ / ○</td><td class="act">Palette row +1 / −1</td></tr>
+      </table>
+      <div class="note">Snaps to a level view (ROT 0,0,0) each time you enter.</div>
+    </div>
+
+    <div class="card debug">
+      <h2>DEBUG <span>model / render inspector</span></h2>
+      <table>
+        <tr><td class="btn">D-pad ←→</td><td class="act">Model yaw</td></tr>
+        <tr><td class="btn">D-pad ↑↓</td><td class="act">Model pitch</td></tr>
+        <tr><td class="btn">L1 / R1</td><td class="act">Model roll</td></tr>
+        <tr><td class="btn">✕ / ○</td><td class="act">FOV widen / narrow</td></tr>
+        <tr><td class="btn">△</td><td class="act">Toggle vertex lighting</td></tr>
+        <tr><td class="btn">□</td><td class="act">Toggle texturing</td></tr>
+      </table>
+    </div>
+
+    <div class="card global">
+      <h2>ALL MODES <span>mode-independent</span></h2>
+      <table>
+        <tr><td class="btn">SELECT</td><td class="act">Cycle control mode</td></tr>
+        <tr><td class="btn">START</td><td class="act">Toggle stage ambience</td></tr>
+        <tr><td class="btn">L3 (click)</td><td class="act">Cycle debug overlay page</td></tr>
+      </table>
+      <div class="note">L3 is a stick click — only fires on a DualShock in analog mode. There's one overlay page today, so a digital pad loses nothing.</div>
+    </div>
+
+  </div>
+</div>
+
+<footer class="wrap">Generated for ps1renderer · reflects the latched-mode schema in <code>main.c</code> <code>update()</code>.</footer>
+</body>
+</html>

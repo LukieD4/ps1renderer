@@ -3,20 +3,22 @@
 
 import os, re, shutil
 import math
+import json, struct, base64
 from pathlib import Path
 
 # Run before py_convert_textures.py!
 
-# Source/output dirs: assets (source) .obj/.mtl files go in assets/object/,
+# Source/output dirs: assets (source) model files go in assets/object/,
 # converted .c files come out in generated/.
 ORIGIN_OBJECT_DIR = Path(__file__).resolve().parent / "assets" / "object"
 CONVERT_OBJECT_DIR = Path(__file__).resolve().parent / "generated"
+PROJECT_ROOT = Path(__file__).resolve().parent
 
 FIXED_POINT_MATH_UPSCALE = 1024  # converts from decimal to int, something which the ps1 can digest.
 
 # PS1 GPU texture coordinates are 0-255 (one byte per axis), regardless of
 # the actual texture's pixel dimensions - the TPAGE/CLUT setup elsewhere
-# maps that 0-255 range onto the real texture page. OBJ 'vt' data is
+# maps that 0-255 range onto the real texture page. Source UV data is
 # normalized 0.0-1.0 UV, so this is just that scaled into a byte.
 UV_BYTE_SCALE = 255  # 256x256 image
 
@@ -25,14 +27,24 @@ UV_BYTE_SCALE = 255  # 256x256 image
 # 256 distinct materials per model is still the hard ceiling here.
 MAX_MATERIALS_PER_MODEL = 256
 
-# Multiple simultaneous models (stages) means every generated .c file now
-# gets #include'd together into ONE main.c translation unit (via
-# generated/models_all.h), instead of one at a time by hand-editing a
-# single "#include generated/house.c" line. That means every model's
-# top-level symbols (modelTris, modelVerts, etc.) MUST be unique per
-# model - this prefix is what makes that safe. Sanitized so a folder
-# name that isn't already a valid C identifier fragment (starts with a
-# digit, has spaces/dashes, etc.) still produces something legal.
+# ------------------------------------------------------------------
+# SOURCE FORMAT: glTF (.glb / .gltf)
+# ------------------------------------------------------------------
+# The renderer consumes the baked C arrays in generated/*.c, NOT the source
+# mesh format - so the source format is purely a build-time concern. The
+# front-end reader (read_gltf) emits an intermediate representation (an "IR"
+# dict) and the back-end (emit_model_c) writes the .c from that IR. Adding a
+# new format later is a matter of writing another front-end to the SAME IR;
+# the C emitter and the renderer never move.
+#
+# The project migrated fully off OBJ/MTL: glTF carries geometry, UVs, material
+# names AND cameras in one file, which OBJ could not. Discovery takes
+# <name>.glb (then <name>.gltf) per model folder - nothing else.
+#
+# glTF coordinate/UV handling is documented inline in read_gltf().
+# ------------------------------------------------------------------
+
+
 def sanitize_identifier(name):
     ident = re.sub(r"[^0-9A-Za-z_]", "_", name)
     if not ident or ident[0].isdigit():
@@ -42,9 +54,7 @@ def sanitize_identifier(name):
 
 # Delete old dir contents so stale .c files don't linger after a model is
 # renamed/removed from generated/. Runs first, before py_convert_textures.py
-# or py_convert_stages.py add their own (differently-named) outputs to the
-# same directory - both of those scripts are careful not to wipe generated/
-# themselves, only this one does, since this one always runs first.
+# or py_convert_stages.py add their own (differently-named) outputs.
 if CONVERT_OBJECT_DIR.exists():
     for item in CONVERT_OBJECT_DIR.iterdir():
         if item.is_dir():
@@ -57,645 +67,586 @@ else:
 CONVERT_OBJECT_DIR.mkdir(parents=True, exist_ok=True)
 
 
-# ------------------------------------------------------------------
-# Discovery: ONE .obj per model folder, following the established
-# per-object convention (assets/object/<name>/<name>.obj[/.mtl][/textures]) -
-# see the README's "Asset pipeline restructure" entry. This is a
-# deliberately NARROWER walk than the old os.walk(ORIGIN_OBJECT_DIR)
-# (which recursed into every subfolder, including dev/ working-file
-# dirs - that's how assets/object/house/dev/_house.obj used to leak out as a
-# phantom "generated/_house.c" model). Baking every discovered model
-# into the ELF unconditionally (the "bake all models always" choice for
-# the stage system) makes an accurate discovery list matter now more
-# than it used to - a stray dev/ .obj would become a real, wasted
-# runtime model registry entry, not just an unused generated file.
-# ------------------------------------------------------------------
-discovered_models = []  # list of (folder_name, obj_path)
+# ==================================================================
+# Coordinate remap - the SINGLE correction point, shared by both readers.
+# ==================================================================
+# Blender's exporters (OBJ with Forward=-Z/Up=Y, and glTF with its default
+# +Y-up) BOTH emit vertex data in the same Y-up space:
+#     export_X =  Blender_X
+#     export_Y =  Blender_Z
+#     export_Z = -Blender_Y
+# The renderer wants (verified on-screen via the arrow asset's dual-tip test):
+#     renderer_X =  export_X
+#     renderer_Y = -export_Y
+#     renderer_Z = -export_Z
+# i.e. a 180-degree rotation about X (determinant +1, so winding/handedness
+# is preserved - no triangle re-order needed). DO NOT re-derive this without
+# re-checking the arrow test asset.
+def remap_pos(x, y, z):
+    return (x, -y, -z)
+
+def remap_dir(x, y, z):
+    return (x, -y, -z)
+
+
+# ==================================================================
+# Back-end: emit ONE model's .c file from the shared IR.
+# ==================================================================
+# IR dict keys:
+#   split_positions : [(x,y,z) float]      renderer space, pre-fixed-point
+#   split_normals   : [(nx,ny,nz)|None]    renderer space
+#   split_uvs       : [(u,v)|None]         PS1 convention (v=0 at TOP)
+#   faces           : [(i0,i1,i2)]         indices into split_* arrays
+#   face_materials  : [int]                per-triangle material index
+#   material_names  : [str]                index -> material name
+#   camera          : {pos:(x,y,z), rot:(rx,ry,rz)} | None
+#   src_rel         : str                  source path for the file header
+#   raw_v_count     : int                  for the debug print
+#   missing_vt      : bool
+# Returns a registry entry dict (with has_camera) or None if the model has 0
+# triangles and must be excluded.
+def emit_model_c(model_name, ident, ir):
+    split_vert_positions = ir["split_positions"]
+    split_vert_normals   = ir["split_normals"]
+    split_vert_uvs       = ir["split_uvs"]
+    face_index_lists     = ir["faces"]
+    face_material_indices= ir["face_materials"]
+    material_index_to_name = ir["material_names"]
+    triangle_count       = len(face_index_lists)
+    camera               = ir.get("camera")
+
+    output = []
+    output.append(f"/* Auto-generated from {ir['src_rel']}.\n")
+    output.append("* Do not edit manually.*/\n\n")
+    output.append('#include "model_common.h"\n\n')
+
+    # modelTris - built from the IR face list (emitted only when there ARE
+    # triangles; a 0-tri model is excluded from the registry below anyway).
+    if triangle_count > 0:
+        output.append(f"MODEL_TRI {ident}_modelTris[] = {{\n")
+        for (i0, i1, i2), material_index in zip(face_index_lists, face_material_indices):
+            output.append(
+                f"    {{ {i0}, {i1}, {i2}, "
+                f"0, 0, 0, "
+                f"{i0}, {i1}, {i2}, "
+                f"{material_index} }},\n"
+            )
+        output.append("};\n\n")
+
+    # Material name table.
+    output.append(f"const unsigned int {ident}_modelMaterialCount = {len(material_index_to_name)};\n")
+    output.append(f"const char *{ident}_modelMaterialNames[] = {{\n")
+    for name in material_index_to_name:
+        escaped = name.replace("\\", "\\\\").replace('"', '\\"')
+        output.append(f'    "{escaped}",\n')
+    output.append("};\n\n")
+
+    # Vertices (from the SPLIT array).
+    if split_vert_positions:
+        output.append(f"SVECTOR {ident}_modelVerts[] = {{\n" + "// be sure to #include <psxgte.h> in main.c\n")
+        for (xf, yf, zf) in split_vert_positions:
+            xi = int(xf * FIXED_POINT_MATH_UPSCALE)
+            yi = int(yf * FIXED_POINT_MATH_UPSCALE)
+            zi = int(zf * FIXED_POINT_MATH_UPSCALE)
+            output.append(f"    {{ {xi}, {yi}, {zi} }},\n")
+        output.append("};\n\n")
+
+    # Face normals - one per triangle, flat shading.
+    if face_index_lists and split_vert_positions:
+        output.append(f"SVECTOR {ident}_modelFaceNormals[] = {{\n")
+        for (i0, i1, i2) in face_index_lists:
+            v0 = split_vert_positions[i0]
+            v1 = split_vert_positions[i1]
+            v2 = split_vert_positions[i2]
+            ax, ay, az = (v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2])
+            bx, by, bz = (v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2])
+            nx = (ay * bz) - (az * by)
+            ny = (az * bx) - (ax * bz)
+            nz = (ax * by) - (ay * bx)
+            length = math.sqrt(nx * nx + ny * ny + nz * nz)
+            if length == 0.0:
+                unx, uny, unz = 0.0, 0.0, 0.0
+            else:
+                unx, uny, unz = nx / length, ny / length, nz / length
+            output.append(
+                f"    {{ {int(unx * FIXED_POINT_MATH_UPSCALE)}, "
+                f"{int(uny * FIXED_POINT_MATH_UPSCALE)}, "
+                f"{int(unz * FIXED_POINT_MATH_UPSCALE)} }},\n"
+            )
+        output.append("};\n\n")
+
+    # Vertex normals - one per SPLIT vertex.
+    if split_vert_positions:
+        if None in split_vert_normals:
+            fallback_by_index = {}
+            for tri_idx, (i0, i1, i2) in enumerate(face_index_lists):
+                for idx in (i0, i1, i2):
+                    if split_vert_normals[idx] is None and idx not in fallback_by_index:
+                        v0 = split_vert_positions[i0]
+                        v1 = split_vert_positions[i1]
+                        v2 = split_vert_positions[i2]
+                        ax, ay, az = (v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2])
+                        bx, by, bz = (v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2])
+                        nx = (ay*bz) - (az*by)
+                        ny = (az*bx) - (ax*bz)
+                        nz = (ax*by) - (ay*bx)
+                        fallback_by_index[idx] = (nx, ny, nz)
+            for idx, normal in fallback_by_index.items():
+                split_vert_normals[idx] = normal
+            print(f"  WARNING: {model_name} - filled {len(fallback_by_index)} "
+                  f"vertex normal(s) missing normal data with flat-normal fallback.")
+
+        output.append(f"SVECTOR {ident}_modelVertNormals[] = {{\n")
+        for normal in split_vert_normals:
+            if normal is None:
+                output.append("    { 0, 0, 0 }, // unreferenced vertex\n")
+                continue
+            nx, ny, nz = normal
+            length = math.sqrt(nx * nx + ny * ny + nz * nz)
+            if length == 0.0:
+                unx, uny, unz = 0.0, 0.0, 0.0
+            else:
+                unx, uny, unz = nx / length, ny / length, nz / length
+            output.append(
+                f"    {{ {int(unx * FIXED_POINT_MATH_UPSCALE)}, "
+                f"{int(uny * FIXED_POINT_MATH_UPSCALE)}, "
+                f"{int(unz * FIXED_POINT_MATH_UPSCALE)} }},\n"
+            )
+        output.append("};\n\n")
+
+    # UVs - one per SPLIT vertex, byte-scaled (0-255).
+    if split_vert_positions:
+        output.append(f"unsigned char {ident}_modelUVs[][2] = {{\n")
+        missing_uv_count = 0
+        for uv in split_vert_uvs:
+            if uv is None:
+                output.append("    { 0, 0 }, // missing vt data\n")
+                missing_uv_count += 1
+                continue
+            u, v = uv
+            u = 0.0 if u < 0.0 else (1.0 if u > 1.0 else u)
+            v = 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
+            output.append(f"    {{ {int(u * UV_BYTE_SCALE)}, {int(v * UV_BYTE_SCALE)} }},\n")
+        output.append("};\n\n")
+        if missing_uv_count:
+            print(f"  NOTE: {model_name} - {missing_uv_count} split vertex(es) "
+                  f"have no UV data (placeholder {{0,0}} emitted).")
+
+    # Bounding box + sphere.
+    if split_vert_positions:
+        min_x = min(v[0] for v in split_vert_positions)
+        min_y = min(v[1] for v in split_vert_positions)
+        min_z = min(v[2] for v in split_vert_positions)
+        max_x = max(v[0] for v in split_vert_positions)
+        max_y = max(v[1] for v in split_vert_positions)
+        max_z = max(v[2] for v in split_vert_positions)
+
+        output.append(f"SVECTOR {ident}_modelBBoxMin = {{\n")
+        output.append(
+            f"    {int(min_x * FIXED_POINT_MATH_UPSCALE)}, "
+            f"{int(min_y * FIXED_POINT_MATH_UPSCALE)}, "
+            f"{int(min_z * FIXED_POINT_MATH_UPSCALE)}\n"
+        )
+        output.append("};\n\n")
+
+        output.append(f"SVECTOR {ident}_modelBBoxMax = {{\n")
+        output.append(
+            f"    {int(max_x * FIXED_POINT_MATH_UPSCALE)}, "
+            f"{int(max_y * FIXED_POINT_MATH_UPSCALE)}, "
+            f"{int(max_z * FIXED_POINT_MATH_UPSCALE)}\n"
+        )
+        output.append("};\n\n")
+
+        center_x = (min_x + max_x) / 2.0
+        center_y = (min_y + max_y) / 2.0
+        center_z = (min_z + max_z) / 2.0
+
+        radius = 0.0
+        for (vx, vy, vz) in split_vert_positions:
+            dx = vx - center_x
+            dy = vy - center_y
+            dz = vz - center_z
+            dist = math.sqrt(dx * dx + dy * dy + dz * dz)
+            if dist > radius:
+                radius = dist
+
+        output.append(f"SVECTOR {ident}_modelBSphereCenter = {{\n")
+        output.append(
+            f"    {int(center_x * FIXED_POINT_MATH_UPSCALE)}, "
+            f"{int(center_y * FIXED_POINT_MATH_UPSCALE)}, "
+            f"{int(center_z * FIXED_POINT_MATH_UPSCALE)}\n"
+        )
+        output.append("};\n\n")
+
+        output.append(
+            f"const int {ident}_modelBSphereRadius = {int(radius * FIXED_POINT_MATH_UPSCALE)};\n\n"
+        )
+
+    # Camera (glTF only) - baked as data; main.c's follow-cam does not yet
+    # consume it (that wiring waits on the rest-pose-vs-fixed-rig decision).
+    # cameraRot uses the engine's 12-bit angle format but its exact euler
+    # convention is PROVISIONAL until the follow-cam is wired - re-verify
+    # against the on-screen result then.
+    has_camera = camera is not None
+    if has_camera:
+        cx, cy, cz = camera["pos"]
+        rx, ry, rz = camera["rot"]
+        output.append(
+            f"VECTOR {ident}_modelCameraPos = {{ "
+            f"{int(cx * FIXED_POINT_MATH_UPSCALE)}, "
+            f"{int(cy * FIXED_POINT_MATH_UPSCALE)}, "
+            f"{int(cz * FIXED_POINT_MATH_UPSCALE)} }};\n"
+        )
+        output.append(f"SVECTOR {ident}_modelCameraRot = {{ {rx}, {ry}, {rz} }};\n")
+        output.append(f"const int {ident}_modelHasCamera = 1;\n\n")
+
+    # Counts.
+    vertex_count = len(split_vert_positions)
+    output.append(f"const unsigned int {ident}_modelVertCount = {vertex_count};\n")
+    output.append(f"const unsigned int {ident}_modelTriCount = {triangle_count};\n")
+
+    file_output = CONVERT_OBJECT_DIR / f"{model_name}.c"
+    with open(file_output, "w", newline="\n") as generated:
+        generated.writelines(output)
+
+    print(f"Generated: {file_output}")
+    print(f"  Split vertex count: {vertex_count} (vs raw source vertex count: {ir['raw_v_count']})")
+    print(f"  Materials: {len(material_index_to_name)}")
+    if has_camera:
+        print(f"  Camera baked: pos={camera['pos']} rot(12-bit,provisional)={camera['rot']}")
+
+    if triangle_count == 0 or not split_vert_positions:
+        print(f"  WARNING: '{model_name}' produced 0 triangles - excluded "
+              f"from model_registry.c (stage objects referencing it will "
+              f"be treated as an unresolved model at runtime).")
+        return None
+
+    return {"name": model_name, "ident": ident, "has_camera": has_camera}
+
+
+# ==================================================================
+# Front-end: glTF (.glb / .gltf) reader -> IR   (no external deps)
+# ==================================================================
+_GLTF_COMP = {
+    5120: ("b", 1), 5121: ("B", 1), 5122: ("h", 2),
+    5123: ("H", 2), 5125: ("I", 4), 5126: ("f", 4),
+}
+_GLTF_NCOMP = {"SCALAR": 1, "VEC2": 2, "VEC3": 3, "VEC4": 4, "MAT2": 4, "MAT3": 9, "MAT4": 16}
+
+
+def _gltf_load(path):
+    """Return (gltf_dict, glb_bin_chunk_or_None, base_dir)."""
+    raw = path.read_bytes()
+    if raw[:4] == b"glTF":  # binary .glb container
+        magic, version, total = struct.unpack_from("<III", raw, 0)
+        off = 12
+        json_chunk = bin_chunk = None
+        while off < total:
+            clen, ctype = struct.unpack_from("<II", raw, off)
+            off += 8
+            chunk = raw[off:off + clen]
+            off += clen
+            if ctype == 0x4E4F534A:      # "JSON"
+                json_chunk = chunk
+            elif ctype == 0x004E4942:    # "BIN\0"
+                bin_chunk = chunk
+        return json.loads(json_chunk.decode("utf-8")), bin_chunk, path.parent
+    return json.loads(raw.decode("utf-8")), None, path.parent
+
+
+def _mat_identity():
+    return [[1.0 if i == j else 0.0 for j in range(4)] for i in range(4)]
+
+
+def _mat_mul(a, b):
+    return [[sum(a[i][k] * b[k][j] for k in range(4)) for j in range(4)] for i in range(4)]
+
+
+def _mat_from_colmajor(m):
+    # glTF node.matrix is 16 floats, column-major.
+    return [[m[c * 4 + r] for c in range(4)] for r in range(4)]
+
+
+def _quat_to_mat(qx, qy, qz, qw):
+    n = math.sqrt(qx*qx + qy*qy + qz*qz + qw*qw) or 1.0
+    qx, qy, qz, qw = qx/n, qy/n, qz/n, qw/n
+    return [
+        [1-2*(qy*qy+qz*qz), 2*(qx*qy-qz*qw),   2*(qx*qz+qy*qw),   0.0],
+        [2*(qx*qy+qz*qw),   1-2*(qx*qx+qz*qz), 2*(qy*qz-qx*qw),   0.0],
+        [2*(qx*qz-qy*qw),   2*(qy*qz+qx*qw),   1-2*(qx*qx+qy*qy), 0.0],
+        [0.0, 0.0, 0.0, 1.0],
+    ]
+
+
+def _node_local_matrix(node):
+    if "matrix" in node:
+        return _mat_from_colmajor(node["matrix"])
+    t = node.get("translation", [0.0, 0.0, 0.0])
+    r = node.get("rotation", [0.0, 0.0, 0.0, 1.0])  # quaternion x,y,z,w
+    s = node.get("scale", [1.0, 1.0, 1.0])
+    m = _quat_to_mat(*r)
+    for i in range(3):          # apply scale (columns) then translation
+        for j in range(3):
+            m[i][j] *= s[j]
+    m[0][3], m[1][3], m[2][3] = t[0], t[1], t[2]
+    return m
+
+
+def _mat_point(m, p):
+    return (
+        m[0][0]*p[0] + m[0][1]*p[1] + m[0][2]*p[2] + m[0][3],
+        m[1][0]*p[0] + m[1][1]*p[1] + m[1][2]*p[2] + m[1][3],
+        m[2][0]*p[0] + m[2][1]*p[1] + m[2][2]*p[2] + m[2][3],
+    )
+
+
+def _mat_dir(m, d):
+    return (
+        m[0][0]*d[0] + m[0][1]*d[1] + m[0][2]*d[2],
+        m[1][0]*d[0] + m[1][1]*d[1] + m[1][2]*d[2],
+        m[2][0]*d[0] + m[2][1]*d[1] + m[2][2]*d[2],
+    )
+
+
+def _rad_to_12bit(a):
+    return int(round(a / (2.0 * math.pi) * 4096.0)) & 4095
+
+
+def read_gltf(model_name, file):
+    gltf, glb_bin, base_dir = _gltf_load(file)
+
+    _buf_cache = {}
+    def buffer_bytes(bi):
+        if bi in _buf_cache:
+            return _buf_cache[bi]
+        buf = gltf["buffers"][bi]
+        uri = buf.get("uri")
+        if uri is None:
+            b = glb_bin
+        elif uri.startswith("data:"):
+            b = base64.b64decode(uri.split(",", 1)[1])
+        else:
+            b = (base_dir / uri).read_bytes()
+        _buf_cache[bi] = b
+        return b
+
+    def read_accessor(acc_index):
+        acc = gltf["accessors"][acc_index]
+        bv = gltf["bufferViews"][acc["bufferView"]]
+        fmt, comp_size = _GLTF_COMP[acc["componentType"]]
+        ncomp = _GLTF_NCOMP[acc["type"]]
+        count = acc["count"]
+        buf = buffer_bytes(bv["buffer"])
+        base = bv.get("byteOffset", 0) + acc.get("byteOffset", 0)
+        stride = bv.get("byteStride") or (comp_size * ncomp)
+        normalized = acc.get("normalized", False)
+        norm_div = 1.0
+        if normalized:
+            norm_div = {5120: 127.0, 5121: 255.0, 5122: 32767.0, 5123: 65535.0}.get(
+                acc["componentType"], 1.0)
+        out = []
+        for i in range(count):
+            vals = struct.unpack_from("<" + fmt * ncomp, buf, base + i * stride)
+            if normalized:
+                vals = tuple(v / norm_div for v in vals)
+            out.append(vals[0] if ncomp == 1 else vals)
+        return out
+
+    # Walk the scene graph to get each node's world matrix (only meshes and
+    # cameras matter). glTF may omit "scenes"; fall back to all nodes as roots.
+    nodes = gltf.get("nodes", [])
+    world_of = {}
+
+    def visit(ni, parent):
+        m = _mat_mul(parent, _node_local_matrix(nodes[ni]))
+        world_of[ni] = m
+        for c in nodes[ni].get("children", []):
+            visit(c, m)
+
+    if "scenes" in gltf and gltf.get("scene") is not None:
+        roots = gltf["scenes"][gltf["scene"]].get("nodes", list(range(len(nodes))))
+    elif "scenes" in gltf and gltf["scenes"]:
+        roots = gltf["scenes"][0].get("nodes", list(range(len(nodes))))
+    else:
+        roots = list(range(len(nodes)))
+    # Only visit nodes that are not children of another node (true roots).
+    child_set = set()
+    for n in nodes:
+        for c in n.get("children", []):
+            child_set.add(c)
+    for ni in range(len(nodes)):
+        if ni not in child_set and ni not in world_of:
+            visit(ni, _mat_identity())
+    # Ensure declared roots are visited too (covers explicit scene lists).
+    for ni in roots:
+        if ni not in world_of:
+            visit(ni, _mat_identity())
+
+    materials = gltf.get("materials", [])
+
+    def material_name(prim):
+        mi = prim.get("material")
+        if mi is None:
+            return "(none)"
+        return materials[mi].get("name") or f"material_{mi}"
+
+    material_name_to_index = {}
+    material_index_to_name = []
+
+    def get_material_index(name):
+        if name in material_name_to_index:
+            return material_name_to_index[name]
+        idx = len(material_index_to_name)
+        if idx >= MAX_MATERIALS_PER_MODEL:
+            raise SystemExit(f"{file.name}: exceeded MAX_MATERIALS_PER_MODEL.")
+        material_name_to_index[name] = idx
+        material_index_to_name.append(name)
+        return idx
+
+    split_key_to_index = {}
+    split_positions = []
+    split_normals = []
+    split_uvs = []
+    face_index_lists = []
+    face_material_indices = []
+    raw_vertex_count = 0
+    missing_vt = False
+
+    def get_split_vertex(pos, nrm, uv):
+        key = (pos, nrm, uv)
+        if key in split_key_to_index:
+            return split_key_to_index[key]
+        idx = len(split_positions)
+        split_key_to_index[key] = idx
+        split_positions.append(pos)
+        split_normals.append(nrm)
+        split_uvs.append(uv)
+        return idx
+
+    # Collect (node, mesh) pairs so mesh vertices get their node's world xform.
+    mesh_instances = []
+    for ni, node in enumerate(nodes):
+        if "mesh" in node and ni in world_of:
+            mesh_instances.append((world_of[ni], node["mesh"]))
+    # Meshes not referenced by any node (rare) - bake at identity.
+    referenced = {mi for _, mi in mesh_instances}
+    for mi in range(len(gltf.get("meshes", []))):
+        if mi not in referenced:
+            mesh_instances.append((_mat_identity(), mi))
+
+    for world, mesh_index in mesh_instances:
+        mesh = gltf["meshes"][mesh_index]
+        for prim in mesh.get("primitives", []):
+            if prim.get("mode", 4) != 4:
+                print(f"  WARNING: {file.name} mesh {mesh_index} primitive mode "
+                      f"{prim.get('mode')} is not TRIANGLES - skipped.")
+                continue
+            attrs = prim["attributes"]
+            positions = read_accessor(attrs["POSITION"])
+            normals = read_accessor(attrs["NORMAL"]) if "NORMAL" in attrs else None
+            uvs = read_accessor(attrs["TEXCOORD_0"]) if "TEXCOORD_0" in attrs else None
+            if "indices" in prim:
+                indices = read_accessor(prim["indices"])
+            else:
+                indices = list(range(len(positions)))
+            raw_vertex_count += len(positions)
+            mat_index = get_material_index(material_name(prim))
+
+            corner_slots = []
+            for vi in indices:
+                wp = _mat_point(world, positions[vi])
+                pos = remap_pos(*wp)
+                if normals is not None:
+                    wn = _mat_dir(world, normals[vi])
+                    nrm = remap_dir(*wn)
+                else:
+                    nrm = None
+                if uvs is not None:
+                    u, v = uvs[vi][0], uvs[vi][1]
+                    # glTF UV origin is already TOP-left (PS1 convention) - no flip.
+                    uv = (u, v)
+                else:
+                    uv = None
+                    missing_vt = True
+                corner_slots.append(get_split_vertex(pos, nrm, uv))
+
+            for t in range(0, len(corner_slots) - 2, 3):
+                face_index_lists.append((corner_slots[t], corner_slots[t+1], corner_slots[t+2]))
+                face_material_indices.append(mat_index)
+
+    # Camera: first node that references a camera. Its world position + the
+    # -Z look axis (glTF camera convention) -> engine space.
+    camera = None
+    for ni, node in enumerate(nodes):
+        if "camera" in node and ni in world_of:
+            m = world_of[ni]
+            pos = remap_pos(m[0][3], m[1][3], m[2][3])
+            fwd_gltf = _mat_dir(m, (0.0, 0.0, -1.0))
+            fx, fy, fz = remap_dir(*fwd_gltf)
+            yaw = _rad_to_12bit(math.atan2(fx, fz))
+            horiz = math.sqrt(fx*fx + fz*fz)
+            pitch = _rad_to_12bit(math.atan2(fy, horiz))
+            camera = {"pos": pos, "rot": (pitch, yaw, 0)}
+            print(f"  glTF camera node {ni} ('{node.get('name','')}') "
+                  f"-> pos {pos}, look ({fx:.3f},{fy:.3f},{fz:.3f})")
+            break
+
+    if missing_vt:
+        print(f"  WARNING: {file.name} has vertices with no TEXCOORD_0 ({{0,0}} placeholders).")
+
+    print(f"\nParsed {file.name} (model '{model_name}', glTF)")
+    print(f"materials: {len(material_index_to_name)} distinct -> {material_index_to_name}")
+
+    return {
+        "split_positions": split_positions,
+        "split_normals": split_normals,
+        "split_uvs": split_uvs,
+        "faces": face_index_lists,
+        "face_materials": face_material_indices,
+        "material_names": material_index_to_name,
+        "camera": camera,
+        "src_rel": file.relative_to(PROJECT_ROOT).as_posix(),
+        "raw_v_count": raw_vertex_count,
+    }
+
+
+# ==================================================================
+# Discovery: per assets/object/<name>/, take <name>.glb (then <name>.gltf).
+# ==================================================================
+discovered_models = []  # (folder_name, path, reader)
 
 for folder in sorted(ORIGIN_OBJECT_DIR.iterdir()):
     if not folder.is_dir():
         continue
-
-    obj_path = folder / f"{folder.name}.obj"
-    if not obj_path.exists():
-        print(f"NOTE: {folder.name}/ has no {folder.name}.obj (per-object naming "
-              f"convention) - skipped. Anything else in this folder (dev/ files, "
-              f"stray .obj with a different name, etc.) is intentionally ignored.")
-        continue
-
-    discovered_models.append((folder.name, obj_path))
-
-
-# Collected across the loop below, used to emit model_registry.c /
-# models_all.h once every model has been converted.
-model_registry_entries = []  # list of dicts: name, ident, has_data
-
-
-#
-# Phase 1: parse each .obj into a dict of raw line data
-#
-for model_name, file in discovered_models:
-        filename = file.name
-        ident = sanitize_identifier(model_name)
-
-        data = {}
-
-        # Tracked separately because they're context markers, not float/index data
-        object_names = []      # 'o' lines
-        group_names = []       # 'g' lines
-        smoothing_groups = []  # 's' lines
-
-        # material_uses is now built as a list of (line_index_in_f_order, name)
-        # is NOT quite right either - usemtl can appear anywhere between 'f'
-        # lines, so what we actually need is "which material applies to each
-        # 'f' line in file order". We build that directly below by walking
-        # the file a second way: instead of only bucketing 'f' lines into
-        # data["f"], we also record, in the SAME order, which material name
-        # was active (the most recent 'usemtl' seen) for that specific face.
-        # This list is index-matched 1:1 with data["f"] once that's built.
-        face_material_names = []   # index-matched with data["f"], one name per face line
-        current_material_name = None
-
-        with open(file, "r", newline="") as content:
-            for line in content:
-                line = line.rstrip("\r\n")  # remove newlines
-                if not line: continue
-
-                stripped = line.lstrip()
-                if stripped.startswith("#"): continue  # skip comments
-
-                content_data = stripped.split(" ", 1)  # split into type + remaining data
-                if len(content_data) < 2: continue
-
-                content_suffix, content_value = content_data
-
-                # Route named/context lines into their own lists rather than
-                # the generic numeric-data dict, since they don't get a C
-                # array of their own (yet) - we just keep them so the parser
-                # doesn't silently drop info from the source .obj.
-                if content_suffix == "o":
-                    object_names.append(content_value)
-                    continue
-                if content_suffix == "g":
-                    group_names.append(content_value)
-                    continue
-                if content_suffix == "s":
-                    smoothing_groups.append(content_value)
-                    continue
-                if content_suffix == "usemtl":
-                    # Track the currently-active material by name. This
-                    # stays active for every subsequent 'f' line until the
-                    # next 'usemtl' (or EOF) - standard OBJ semantics.
-                    current_material_name = content_value.strip()
-                    continue
-
-                # 'f' lines get their active material recorded alongside them,
-                # in the same order they're appended to data["f"] below, so
-                # face_material_names[i] always corresponds to data["f"][i].
-                if content_suffix == "f":
-                    face_material_names.append(current_material_name)
-
-                # Store multiple entries of the same type
-                if content_suffix not in data:
-                    data[content_suffix] = []
-
-                data[content_suffix].append(content_value)
-
-        #
-        # Build the material name -> index map, in first-seen order.
-        # A face with no 'usemtl' at all (current_material_name is None)
-        # gets bucketed into a synthetic "(none)" material at whatever
-        # index it first appears - this keeps every triangle's material
-        # field well-defined instead of leaving a gap or crashing on None.
-        #
-        material_name_to_index = {}
-        material_index_to_name = []
-
-        def get_material_index(name):
-            key = name if name is not None else "(none)"
-            if key in material_name_to_index:
-                return material_name_to_index[key]
-            new_index = len(material_index_to_name)
-            if new_index >= MAX_MATERIALS_PER_MODEL:
-                raise SystemExit(
-                    f"{filename}: exceeded MAX_MATERIALS_PER_MODEL "
-                    f"({MAX_MATERIALS_PER_MODEL}) distinct materials - "
-                    f"material index no longer fits in unsigned char / "
-                    f"MAX_MODEL_TRIS assumptions."
-                )
-            material_name_to_index[key] = new_index
-            material_index_to_name.append(key)
-            return new_index
-
-        # Pre-populate the map now (in first-seen order across the whole
-        # file) so indices are stable and match the order usemtl lines
-        # actually appeared in the source .obj, regardless of which face
-        # we assign indices to first below.
-        for name in face_material_names:
-            get_material_index(name)
-
-        #
-        # Debug output
-        #
-        print(f"\nParsed {filename} (model '{model_name}' -> prefix '{ident}_')\n")
-        for key, values in data.items():
-            print(f"{key}: {len(values)} entries")
-        if object_names: print(f"o: {len(object_names)} entries")
-        if group_names: print(f"g: {len(group_names)} entries")
-        if smoothing_groups: print(f"s: {len(smoothing_groups)} entries")
-        if material_index_to_name:
-            print(f"materials: {len(material_index_to_name)} distinct -> {material_index_to_name}")
-
-        #
-        # Phase 2: emit a .c file from the parsed data
-        #
-        file_output = CONVERT_OBJECT_DIR / f"{model_name}.c"
-
-        # MODEL_TRI is now defined ONCE in generated/model_common.h (emitted
-        # below, after this loop) instead of being re-emitted verbatim into
-        # every single generated/<model>.c file. That inline re-definition
-        # was harmless back when only one generated .c was ever #include'd
-        # into main.c at a time, but multiple models now share one
-        # translation unit (see generated/models_all.h) - redefining the
-        # same typedef N times in one TU is exactly the kind of drift this
-        # project has already been bitten by once (see tex_blob_table.h's
-        # own comment about the same lesson on the texture side).
-        #
-        # uv0/uv1/uv2 are consumed by main.c's draw_object() textured path
-        # (POLY_FT3 + setUV3()), reading the same split-vertex index space
-        # as v0/v1/v2.
-        #
-        # material is populated per-triangle (see get_material_index above)
-        # instead of always being 0 - it indexes into THIS model's own
-        # <ident>_modelMaterialNames[] table below, which main.c's texture
-        # table lookup resolves against the texture blob's own name table at
-        # load time (see py_convert_textures.py / tex_blob.c). This
-        # indirection is what lets material index 0 mean different textures
-        # in different models safely.
-
-        output = []
-
-        output.append(f"/* Auto-generated from {file.relative_to(Path(__file__).resolve().parent).as_posix()}.\n")
-        output.append("* Do not edit manually.*/\n\n")
-        output.append('#include "model_common.h"\n\n')
-
-        #
-        # Raw OBJ data, parsed but NOT yet split. verts_float/vert_normals_float
-        # are indexed exactly as the OBJ file indexes 'v'/'vn' - independently
-        # of each other. Faces below are what actually pair a v with a vn (and
-        # a vt) per face-corner; that pairing is what Option B splits on.
-        #
-        verts_float = []         # OBJ 'v' index -> (x, y, z) float tuple
-        vert_normals_float = []  # OBJ 'vn' index -> (nx, ny, nz) float tuple
-        vert_uvs_float = []      # OBJ 'vt' index -> (u, v) float tuple
-
-        if "v" in data:
-            for vertex in data["v"]:
-                x, y, z = vertex.split()
-                verts_float.append((float(x), float(y), float(z)))
-
-        if "vn" in data:
-            for normal in data["vn"]:
-                nx, ny, nz = normal.split()
-                vert_normals_float.append((float(nx), float(ny), float(nz)))
-
-        if "vt" in data:
-            for uv in data["vt"]:
-                # OBJ 'vt' lines are "u v" or "u v w" (w is rare, for 3D
-                # textures - ignore it, PS1 only does 2D UV).
-                parts = uv.split()
-                u, v = parts[0], parts[1]
-                vert_uvs_float.append((float(u), float(v)))
-
-        #
-        # Faces - Option B: split vertices at seams.
-        #
-        # Build a dedup map keyed by (v_index, vn_index, vt_index). Every
-        # face corner looks up/creates a slot in this map; modelTris ends up
-        # indexing into the resulting split-vertex arrays below, NOT the raw
-        # OBJ 'v' index. A position shared by faces that all use the same vn
-        # AND vt collapses to one slot (smooth, unseamed UV regions); a
-        # position used with a different vn or vt per face (normal seams,
-        # OR a UV island boundary - e.g. where a texture wraps and the UV
-        # has to jump) gets a separate slot per distinct (vn, vt) pair, so
-        # each side of either kind of seam keeps its own sharp normal/UV
-        # instead of being blended into a soft average.
-        #
-        split_vert_key_to_index = {}   # (v_index, vn_index_or_None, vt_index_or_None) -> output index
-        split_vert_positions = []      # output index -> (x, y, z) float tuple
-        split_vert_normals = []        # output index -> (nx, ny, nz) float tuple, or None if no vn was given
-        split_vert_uvs = []            # output index -> (u, v) float tuple, or None if no vt was given
-
-        def get_split_vertex(v_index, vn_index, vt_index):
-            key = (v_index, vn_index, vt_index)
-            if key in split_vert_key_to_index:
-                return split_vert_key_to_index[key]
-
-            new_index = len(split_vert_positions)
-            split_vert_key_to_index[key] = new_index
-
-            # ============================================================
-            # COORDINATE SYSTEM - FINALIZED (v4, verified via arrow.obj dual-tip test)
-            # ============================================================
-            # This project's OBJ export (Forward=-Z, Up=Y) emits:
-            #   OBJ_X =  Blender_X
-            #   OBJ_Y =  Blender_Z
-            #   OBJ_Z = -Blender_Y
-            #
-            # Renderer requires (confirmed correct on-screen):
-            #   renderer_X =  Blender_X  =  OBJ_X
-            #   renderer_Y = -Blender_Z  = -OBJ_Y
-            #   renderer_Z = -Blender_Y  = -OBJ_Z
-            #
-            # DO NOT re-derive or re-flip this again - re-verify with the
-            # arrow.obj test object before touching this block.
-            bx, by, bz = verts_float[v_index]
-            split_vert_positions.append((bx, -by, -bz))
-
-            if vn_index is not None and vn_index < len(vert_normals_float):
-                bnx, bny, bnz = vert_normals_float[vn_index]
-                split_vert_normals.append((bnx, -bny, -bnz))
-            else:
-                split_vert_normals.append(None)
-
-            if vt_index is not None and vt_index < len(vert_uvs_float):
-                u, v = vert_uvs_float[vt_index]
-                # OBJ UV convention has v=0 at the BOTTOM of the texture; the PS1
-                # GPU (and most raster image formats) have v=0 at the TOP. Flip
-                # here at the source for the same "one correction point" reason
-                # as the position remap above.
-                split_vert_uvs.append((u, 1.0 - v))
-            else:
-                # No vt for this corner. Left as None (no sensible default UV to
-                # fall back to, unlike normals which can borrow the face normal)
-                # - emitted as a {0,0} placeholder below, with a warning printed
-                # if this happens.
-                split_vert_uvs.append(None)
-
-            return new_index
-
-        face_index_lists = []    # list of (v0,v1,v2) post-triangulation, indices into split_vert_positions
-        face_material_indices = []  # index-matched with face_index_lists, one material index per triangle
-        triangle_count = 0
-        missing_vn_used = False
-        missing_vt_used = False
-
-        if "f" in data:
-
-            output.append(f"MODEL_TRI {ident}_modelTris[] = {{\n")
-
-            for face_line_index, face in enumerate(data["f"]):
-
-                verts = face.split()
-
-                # Resolve this face's material index once per face line
-                # (every triangle produced by triangulating this face -
-                # relevant for quads/ngons below - shares the same material,
-                # since OBJ 'usemtl' applies at the face level, not per-corner).
-                face_material_name = face_material_names[face_line_index]
-                material_index = get_material_index(face_material_name)
-
-                corner_split_indices = []
-
-                for vert in verts:
-
-                    parts = vert.split("/")
-
-                    v_index = int(parts[0]) - 1
-
-                    # parts: v, vt (may be empty string in "1//1"), vn
-                    vt_index = None
-                    if len(parts) >= 2 and parts[1] != "":
-                        vt_index = int(parts[1]) - 1
-                    else:
-                        missing_vt_used = True
-
-                    vn_index = None
-                    if len(parts) >= 3 and parts[2] != "":
-                        vn_index = int(parts[2]) - 1
-                    else:
-                        missing_vn_used = True
-
-                    corner_split_indices.append(get_split_vertex(v_index, vn_index, vt_index))
-
-                #
-                # Triangle
-                #
-                if len(corner_split_indices) == 3:
-
-                    output.append(
-                        f"    {{ {corner_split_indices[0]}, {corner_split_indices[1]}, {corner_split_indices[2]}, "
-                        f"0, 0, 0, "
-                        f"{corner_split_indices[0]}, {corner_split_indices[1]}, {corner_split_indices[2]}, "
-                        f"{material_index} }},\n"
-                    )
-
-                    face_index_lists.append(
-                        (corner_split_indices[0], corner_split_indices[1], corner_split_indices[2])
-                    )
-                    face_material_indices.append(material_index)
-
-                    triangle_count += 1
-
-                #
-                # Quad / ngon fan triangulation
-                #
-                elif len(corner_split_indices) > 3:
-
-                    for n in range(1, len(corner_split_indices) - 1):
-
-                        output.append(
-                            f"    {{ {corner_split_indices[0]}, {corner_split_indices[n]}, {corner_split_indices[n + 1]}, "
-                            f"0, 0, 0, "
-                            f"{corner_split_indices[0]}, {corner_split_indices[n]}, {corner_split_indices[n + 1]}, "
-                            f"{material_index} }},\n"
-                        )
-
-                        face_index_lists.append(
-                            (corner_split_indices[0], corner_split_indices[n], corner_split_indices[n + 1])
-                        )
-                        face_material_indices.append(material_index)
-
-                        triangle_count += 1
-
-            output.append("};\n\n")
-
-        if missing_vn_used:
-            print(f"  WARNING: {filename} has face corners with no vn data; "
-                  f"those corners were NOT deduplicated against matching-vn corners.")
-
-        if missing_vt_used:
-            print(f"  WARNING: {filename} has face corners with no vt data; "
-                  f"modelUVs for those corners will be emitted as {{0, 0}} placeholders.")
-
-        #
-        # Material name table - <ident>_modelMaterialNames[] - one C string
-        # per distinct material index, in the same order as
-        # get_material_index assigned them (first-seen order in the .obj).
-        # main.c's texture table lookup matches these names against the
-        # texture blob's own name table (see py_convert_textures.py) to
-        # resolve tri->material to an actual TPAGE/CLUT at runtime.
-        #
-        output.append(f"const unsigned int {ident}_modelMaterialCount = {len(material_index_to_name)};\n")
-        output.append(f"const char *{ident}_modelMaterialNames[] = {{\n")
-        for name in material_index_to_name:
-            escaped = name.replace("\\", "\\\\").replace('"', '\\"')
-            output.append(f'    "{escaped}",\n')
-        output.append("};\n\n")
-
-        #
-        # Vertices (modelVerts) - emitted from the SPLIT array, not the raw
-        # OBJ 'v' list. modelVerts may contain more entries than the OBJ
-        # had 'v' lines, since seam positions (and UV-island boundaries)
-        # get duplicated into multiple slots above.
-        #
-        if split_vert_positions:
-
-            output.append(f"SVECTOR {ident}_modelVerts[] = {{\n" + "// be sure to #include <psxgte.h> in main.c\n")
-
-            for (xf, yf, zf) in split_vert_positions:
-
-                xi = int(xf * FIXED_POINT_MATH_UPSCALE)
-                yi = int(yf * FIXED_POINT_MATH_UPSCALE)
-                zi = int(zf * FIXED_POINT_MATH_UPSCALE)
-
-                output.append(
-                    f"    {{ {xi}, {yi}, {zi} }},\n"
-                )
-
-            output.append("};\n\n")
-
-        #
-        # Face normals (modelFaceNormals) - one per triangle, flat shading.
-        # Reads from split_vert_positions (via face_index_lists) since
-        # face_index_lists already points into the split array.
-        #
-        if face_index_lists and split_vert_positions:
-
-            output.append(f"SVECTOR {ident}_modelFaceNormals[] = {{\n")
-
-            for (i0, i1, i2) in face_index_lists:
-
-                v0 = split_vert_positions[i0]
-                v1 = split_vert_positions[i1]
-                v2 = split_vert_positions[i2]
-
-                ax, ay, az = (v1[0] - v0[0], v1[1] - v0[1], v1[2] - v0[2])
-                bx, by, bz = (v2[0] - v0[0], v2[1] - v0[1], v2[2] - v0[2])
-
-                nx = (ay * bz) - (az * by)
-                ny = (az * bx) - (ax * bz)
-                nz = (ax * by) - (ay * bx)
-
-                length = math.sqrt(nx * nx + ny * ny + nz * nz)
-
-                if length == 0.0:
-                    unx, uny, unz = 0.0, 0.0, 0.0
-                else:
-                    unx, uny, unz = nx / length, ny / length, nz / length
-
-                fnx = int(unx * FIXED_POINT_MATH_UPSCALE)
-                fny = int(uny * FIXED_POINT_MATH_UPSCALE)
-                fnz = int(unz * FIXED_POINT_MATH_UPSCALE)
-
-                output.append(
-                    f"    {{ {fnx}, {fny}, {fnz} }},\n"
-                )
-
-            output.append("};\n\n")
-
-        #
-        # Vertex normals (modelVertNormals) - one per SPLIT vertex, taken
-        # directly from the OBJ's own vn data.
-        #
-        if split_vert_positions:
-
-            if None in split_vert_normals:
-                fallback_by_index = {}
-                for tri_idx, (i0, i1, i2) in enumerate(face_index_lists):
-                    for idx in (i0, i1, i2):
-                        if split_vert_normals[idx] is None and idx not in fallback_by_index:
-                            v0 = split_vert_positions[i0]
-                            v1 = split_vert_positions[i1]
-                            v2 = split_vert_positions[i2]
-                            ax, ay, az = (v1[0]-v0[0], v1[1]-v0[1], v1[2]-v0[2])
-                            bx, by, bz = (v2[0]-v0[0], v2[1]-v0[1], v2[2]-v0[2])
-                            nx = (ay*bz) - (az*by)
-                            ny = (az*bx) - (ax*bz)
-                            nz = (ax*by) - (ay*bx)
-                            fallback_by_index[idx] = (nx, ny, nz)
-
-                for idx, normal in fallback_by_index.items():
-                    split_vert_normals[idx] = normal
-
-                print(f"  WARNING: {filename} - filled {len(fallback_by_index)} "
-                      f"vertex normal(s) missing vn data with flat-normal fallback.")
-
-            output.append(f"SVECTOR {ident}_modelVertNormals[] = {{\n")
-
-            for normal in split_vert_normals:
-
-                if normal is None:
-                    output.append("    { 0, 0, 0 }, // unreferenced vertex\n")
-                    continue
-
-                nx, ny, nz = normal
-                length = math.sqrt(nx * nx + ny * ny + nz * nz)
-
-                if length == 0.0:
-                    unx, uny, unz = 0.0, 0.0, 0.0
-                else:
-                    unx, uny, unz = nx / length, ny / length, nz / length
-
-                fnx = int(unx * FIXED_POINT_MATH_UPSCALE)
-                fny = int(uny * FIXED_POINT_MATH_UPSCALE)
-                fnz = int(unz * FIXED_POINT_MATH_UPSCALE)
-
-                output.append(
-                    f"    {{ {fnx}, {fny}, {fnz} }},\n"
-                )
-
-            output.append("};\n\n")
-
-        #
-        # UVs (modelUVs) - one per SPLIT vertex, byte-scaled (0-255) PS1
-        # GPU texture coordinates.
-        #
-        if split_vert_positions:
-
-            output.append(f"unsigned char {ident}_modelUVs[][2] = {{\n")
-
-            missing_uv_count = 0
-
-            for uv in split_vert_uvs:
-
-                if uv is None:
-                    output.append("    { 0, 0 }, // missing vt data\n")
-                    missing_uv_count += 1
-                    continue
-
-                u, v = uv
-
-                u = 0.0 if u < 0.0 else (1.0 if u > 1.0 else u)
-                v = 0.0 if v < 0.0 else (1.0 if v > 1.0 else v)
-
-                ub = int(u * UV_BYTE_SCALE)
-                vb = int(v * UV_BYTE_SCALE)
-
-                output.append(
-                    f"    {{ {ub}, {vb} }},\n"
-                )
-
-            output.append("};\n\n")
-
-            if missing_uv_count:
-                print(f"  NOTE: {filename} - {missing_uv_count} split vertex(es) "
-                      f"have no UV data (placeholder {{0,0}} emitted).")
-
-        #
-        # Bounding box (min/max corners, fixed-point, same space as modelVerts)
-        #
-        if split_vert_positions:
-
-            min_x = min(v[0] for v in split_vert_positions)
-            min_y = min(v[1] for v in split_vert_positions)
-            min_z = min(v[2] for v in split_vert_positions)
-
-            max_x = max(v[0] for v in split_vert_positions)
-            max_y = max(v[1] for v in split_vert_positions)
-            max_z = max(v[2] for v in split_vert_positions)
-
-            output.append(f"SVECTOR {ident}_modelBBoxMin = {{\n")
-            output.append(
-                f"    {int(min_x * FIXED_POINT_MATH_UPSCALE)}, "
-                f"{int(min_y * FIXED_POINT_MATH_UPSCALE)}, "
-                f"{int(min_z * FIXED_POINT_MATH_UPSCALE)}\n"
-            )
-            output.append("};\n\n")
-
-            output.append(f"SVECTOR {ident}_modelBBoxMax = {{\n")
-            output.append(
-                f"    {int(max_x * FIXED_POINT_MATH_UPSCALE)}, "
-                f"{int(max_y * FIXED_POINT_MATH_UPSCALE)}, "
-                f"{int(max_z * FIXED_POINT_MATH_UPSCALE)}\n"
-            )
-            output.append("};\n\n")
-
-            center_x = (min_x + max_x) / 2.0
-            center_y = (min_y + max_y) / 2.0
-            center_z = (min_z + max_z) / 2.0
-
-            radius = 0.0
-            for (vx, vy, vz) in split_vert_positions:
-                dx = vx - center_x
-                dy = vy - center_y
-                dz = vz - center_z
-                dist = math.sqrt(dx * dx + dy * dy + dz * dz)
-                if dist > radius:
-                    radius = dist
-
-            output.append(f"SVECTOR {ident}_modelBSphereCenter = {{\n")
-            output.append(
-                f"    {int(center_x * FIXED_POINT_MATH_UPSCALE)}, "
-                f"{int(center_y * FIXED_POINT_MATH_UPSCALE)}, "
-                f"{int(center_z * FIXED_POINT_MATH_UPSCALE)}\n"
-            )
-            output.append("};\n\n")
-
-            output.append(
-                f"const int {ident}_modelBSphereRadius = {int(radius * FIXED_POINT_MATH_UPSCALE)};\n\n"
-            )
-
-        #
-        # Useful counts for rendering.
-        #
-        vertex_count = len(split_vert_positions)
-
-        output.append(
-            f"const unsigned int {ident}_modelVertCount = {vertex_count};\n"
-        )
-
-        output.append(
-            f"const unsigned int {ident}_modelTriCount = {triangle_count};\n"
-        )
-
-        #
-        # Write generated file
-        #
-        with open(file_output, "w", newline="\n") as generated:
-            generated.writelines(output)
-
-        print(f"Generated: {file_output}")
-        print(f"  Split vertex count: {vertex_count} (vs raw OBJ 'v' count: {len(verts_float)})")
-        print(f"  Materials: {len(material_index_to_name)}")
-
-        # A model with zero triangles (empty/degenerate .obj) has no
-        # modelVerts/modelTris/etc. arrays emitted above (all guarded by
-        # `if split_vert_positions:` / `if "f" in data:`) - registering it
-        # anyway would reference symbols that don't exist and fail the
-        # build. Skip it from the registry (with a loud warning) instead.
-        if triangle_count == 0 or not split_vert_positions:
-            print(f"  WARNING: '{model_name}' produced 0 triangles - excluded "
-                  f"from model_registry.c (stage objects referencing it will "
-                  f"be treated as an unresolved model at runtime).")
-            continue
-
-        model_registry_entries.append({"name": model_name, "ident": ident})
+    name = folder.name
+    glb = folder / f"{name}.glb"
+    gltf = folder / f"{name}.gltf"
+    if glb.exists():
+        discovered_models.append((name, glb, read_gltf))
+    elif gltf.exists():
+        discovered_models.append((name, gltf, read_gltf))
+    else:
+        print(f"NOTE: {name}/ has no {name}.glb/.gltf (per-object naming "
+              f"convention) - skipped.")
+
+
+model_registry_entries = []
+
+for model_name, file, reader in discovered_models:
+    ident = sanitize_identifier(model_name)
+    ir = reader(model_name, file)
+    entry = emit_model_c(model_name, ident, ir)
+    if entry is not None:
+        model_registry_entries.append(entry)
 
 
 # ------------------------------------------------------------------
-# Shared header - MODEL_TRI + MODEL_DEF struct definitions, ONE place
-# only. #include'd by every generated/<model>.c file (added above),
-# generated/model_registry.c, and main.c. Field types intentionally
-# match each per-model array's actual declared type exactly (no const
-# added at the pointer level) so assigning them into a MODEL_DEF literal
-# below never trips a qualifier-mismatch warning on the MIPS toolchain.
+# Shared header - MODEL_TRI + MODEL_DEF struct definitions.
 # ------------------------------------------------------------------
 header_lines = []
 header_lines.append("/* Auto-generated by py_convert_assets.py. Do not edit manually.\n")
 header_lines.append(" * Included by every generated/<model>.c file, generated/model_registry.c,\n")
-header_lines.append(" * and main.c - keep this the ONLY place MODEL_TRI/MODEL_DEF are defined,\n")
-header_lines.append(" * the same lesson tex_blob_table.h already applied on the texture side. */\n\n")
+header_lines.append(" * and main.c - keep this the ONLY place MODEL_TRI/MODEL_DEF are defined. */\n\n")
 header_lines.append("#ifndef MODEL_COMMON_H\n#define MODEL_COMMON_H\n\n")
 header_lines.append("typedef struct\n{\n")
 header_lines.append("    unsigned short v0;\n")
@@ -709,14 +660,14 @@ header_lines.append("    unsigned short uv1;\n")
 header_lines.append("    unsigned short uv2;\n\n")
 header_lines.append("    unsigned char material;\n\n")
 header_lines.append("} MODEL_TRI;\n\n")
-header_lines.append("// One entry per discovered assets/object/<name>/<name>.obj. Every pointer field\n")
-header_lines.append("// points at that SPECIFIC model's own prefixed arrays (<name>_modelVerts,\n")
-header_lines.append("// <name>_modelTris, etc.) - main.c resolves a stage object's \"model\" name\n")
-header_lines.append("// string against modelRegistry[] once at stage load (see load_stage() /\n")
-header_lines.append("// find_model_index_by_name()), then only ever touches these pointers/\n")
-header_lines.append("// counts from there on - never the bare per-model globals directly. This\n")
-header_lines.append("// is what makes main.c's render path model-agnostic instead of hardcoding\n")
-header_lines.append("// one #include'd model.\n")
+header_lines.append("// One entry per discovered model. Pointer fields point at that model's own\n")
+header_lines.append("// prefixed arrays (<name>_modelVerts, <name>_modelTris, etc.); main.c resolves\n")
+header_lines.append("// a stage object's \"model\" name against modelRegistry[] once at stage load.\n")
+header_lines.append("//\n")
+header_lines.append("// hasCamera/cameraPos/cameraRot carry an OPTIONAL authored camera (glTF only;\n")
+header_lines.append("// OBJ never has one). Baked as data now; the follow-cam does not consume it\n")
+header_lines.append("// yet. cameraRot is in the 12-bit angle format but its euler convention is\n")
+header_lines.append("// PROVISIONAL until the follow-cam is wired to it.\n")
 header_lines.append("typedef struct\n{\n")
 header_lines.append("    const char *name;\n\n")
 header_lines.append("    SVECTOR *verts;\n")
@@ -731,7 +682,10 @@ header_lines.append("    unsigned int materialCount;\n\n")
 header_lines.append("    SVECTOR *bboxMin;\n")
 header_lines.append("    SVECTOR *bboxMax;\n")
 header_lines.append("    SVECTOR *bsphereCenter;\n")
-header_lines.append("    int bsphereRadius;\n")
+header_lines.append("    int bsphereRadius;\n\n")
+header_lines.append("    int hasCamera;\n")
+header_lines.append("    VECTOR *cameraPos;\n")
+header_lines.append("    SVECTOR *cameraRot;\n")
 header_lines.append("} MODEL_DEF;\n\n")
 header_lines.append("extern const unsigned int modelRegistryCount;\n")
 header_lines.append("extern const MODEL_DEF modelRegistry[];\n\n")
@@ -752,6 +706,10 @@ registry_lines.append("const MODEL_DEF modelRegistry[] = {\n")
 for entry in model_registry_entries:
     ident = entry["ident"]
     escaped_name = entry["name"].replace("\\", "\\\\").replace('"', '\\"')
+    if entry["has_camera"]:
+        cam = f"1, &{ident}_modelCameraPos, &{ident}_modelCameraRot"
+    else:
+        cam = "0, 0, 0"
     registry_lines.append(
         f'    {{ "{escaped_name}", '
         f"{ident}_modelVerts, {ident}_modelVertCount, "
@@ -759,7 +717,8 @@ for entry in model_registry_entries:
         f"{ident}_modelFaceNormals, {ident}_modelVertNormals, {ident}_modelUVs, "
         f"{ident}_modelMaterialNames, {ident}_modelMaterialCount, "
         f"&{ident}_modelBBoxMin, &{ident}_modelBBoxMax, "
-        f"&{ident}_modelBSphereCenter, {ident}_modelBSphereRadius }},\n"
+        f"&{ident}_modelBSphereCenter, {ident}_modelBSphereRadius, "
+        f"{cam} }},\n"
     )
 registry_lines.append("};\n")
 
@@ -768,10 +727,7 @@ print(f"Generated: {CONVERT_OBJECT_DIR / 'model_registry.c'} ({len(model_registr
 
 
 # ------------------------------------------------------------------
-# Manifest - #include'd ONCE from main.c. Replaces the old hand-edited
-# "#include generated/house.c" + commented-out alternates - add/remove a
-# model under assets/object/ and this regenerates automatically, no main.c edit
-# needed.
+# Manifest - #include'd ONCE from main.c.
 # ------------------------------------------------------------------
 manifest_lines = []
 manifest_lines.append("/* Auto-generated by py_convert_assets.py. Do not edit manually.\n")

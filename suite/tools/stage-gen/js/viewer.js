@@ -8,7 +8,7 @@
  * app.js to consume than threading a viewer instance through everything.
  *
  * COORDINATE SPACE NOTE: everything in this module operates in "viewport
- * space", which is the SAME space the source .obj files were authored in
+ * space", which is the SAME space the source glTF models were authored in
  * (Blender: Forward=-Z, Up=Y). Three.js's default world orientation is
  * already Y-up, so no special camera/stage rotation is needed to make the
  * viewport "feel like Blender" - we just don't apply the renderer-space
@@ -17,7 +17,7 @@
  */
 
 import * as THREE from 'three';
-import { OBJLoader } from 'three/addons/loaders/OBJLoader.js';
+import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { TransformControls } from 'three/addons/controls/TransformControls.js';
 
@@ -77,46 +77,36 @@ let suppressNextClick = false;
  * PS1's blocky, unfiltered look rather than smoothing texels together.
  *
  * ----------------------------------------------------------------------
- * flipY - traced end-to-end against py_convert_assets.py (the ONLY other
- * place in this whole toolchain that touches V), not guessed:
+ * flipY = FALSE - the glTF era flips the convention vs the old OBJ path.
+ * Traced end-to-end against py_convert_assets.py (the only other place in
+ * the toolchain that touches V), not guessed:
  * ----------------------------------------------------------------------
- *   1. OBJLoader.parse() (used in loadModelIntoStage() below) loads 'vt'
- *      lines completely RAW, with zero modification. Raw OBJ V uses the
- *      OBJ/Blender convention: v=0 is the BOTTOM of the texture as the
- *      artist sees it in their image editor.
- *   2. py_convert_assets.py's get_split_vertex() (the PS1-side model
- *      converter - the only authority on what "the .tim's pixel rows"
- *      are supposed to mean) explicitly flips every UV it emits:
- *          split_vert_uvs.append((u, 1.0 - v))
- *      with the comment "OBJ UV convention has v=0 at the BOTTOM ...
- *      the PS1 GPU has v=0 at the TOP". So row 0 of the .tim's pixel
- *      data (and tim_reader.js's decodeTim(), which reads rows in the
- *      file's own top-to-bottom order) corresponds to v=1 in RAW OBJ UV
- *      space, not v=0.
- *   3. Therefore: raw OBJ v=0 (bottom of the artist's image, and what
- *      OBJLoader's untouched UVs actually carry) must sample the LAST
- *      row of the decoded .tim buffer, and v=1 must sample row 0 - i.e.
- *      the geometry's UV space and the .tim's pixel-row space are
- *      OPPOSITE conventions, one full vertical flip apart.
- *   4. THREE.Texture's default (flipY = true) is exactly that flip: it
- *      samples v=0 from the LAST row of the raw pixel buffer and v=1
- *      from row 0. That is the correct behavior here, matching step 3 -
- *      NOT an unwanted double-flip. (An earlier fix in this file set
- *      flipY = false believing decodeTim()'s already-top-down row order
- *      meant no further flip was needed; that reasoning skipped step 2 -
- *      the Python converter's OWN flip - which is what actually governs
- *      what "row 0" means relative to the geometry's raw UVs. flipY must
- *      stay at Three's default of true.)
+ *   1. GLTFLoader reads the TEXCOORD_0 accessor RAW into the mesh's `uv`
+ *      attribute. glTF's UV origin is the TOP-left, i.e. v=0 is the TOP of
+ *      the texture - the OPPOSITE of raw OBJ, where v=0 was the bottom.
+ *   2. py_convert_assets.py's glTF reader stores UVs UNCHANGED - `(u, v)`
+ *      with no 1-v flip (the OBJ reader flipped to `(u, 1-v)`; glTF is
+ *      already top-left, so it must not). So on the PS1 side, glTF v=0
+ *      samples .tim row 0.
+ *   3. decodeTim() yields pixel rows in the file's own top-to-bottom order,
+ *      so row 0 IS the top of the texture. We want mesh v=0 (glTF top) to
+ *      sample .tim row 0 (top) - the SAME orientation, zero flips apart.
+ *   4. THREE.DataTexture with flipY = false uploads the buffer as-is, so
+ *      uv (0,0) maps to data row 0. That gives mesh v=0 -> .tim row 0,
+ *      matching step 3. (This is also exactly how GLTFLoader treats a
+ *      glTF's OWN embedded textures - flipY=false - so our .tim swap-in
+ *      stays consistent with everything else GLTFLoader produces.)
  *
- * DataTexture does not flip by default in older Three versions the way
- * regular image-loaded textures do, so flipY is set explicitly to true
- * here rather than left implicit, to make this correct-by-construction
- * regardless of Three.js version defaults.
+ * The old OBJ path used flipY = true because raw OBJ v=0 was the BOTTOM and
+ * the Python converter applied its own (u, 1-v). Both of those flipped in
+ * the glTF migration, so this flipped too. DataTexture defaults to
+ * flipY=false anyway, but it is set explicitly here to make the reasoning
+ * above correct-by-construction regardless of Three.js version defaults.
  */
 function buildDataTexture(decodedTim, row) {
   const rgba = decodedTim.getRGBATextureForRow(row);
   const texture = new THREE.DataTexture(rgba, decodedTim.width, decodedTim.height, THREE.RGBAFormat);
-  texture.flipY = true;
+  texture.flipY = false;
   texture.magFilter = THREE.NearestFilter;
   texture.minFilter = THREE.NearestFilter;
   texture.needsUpdate = true;
@@ -361,6 +351,19 @@ function renderLoop() {
       THREE.MathUtils.degToRad(inst.props.pivotAngle || 0);
   }
 
+  // Keep custom OBJ markers a fixed world size by counter-scaling them
+  // against their entity's transform, so a large trigger volume or patrol
+  // radius doesn't inflate its clickable marker (the finicky-selection fix).
+  for (const inst of instances.values()) {
+    if (!inst.customMarker) continue;
+    const s = inst.object3D.scale;
+    inst.customMarker.scale.set(
+      s.x ? 1 / s.x : 1,
+      s.y ? 1 / s.y : 1,
+      s.z ? 1 / s.z : 1
+    );
+  }
+
   renderer.render(stage, editCamera);
   renderAxisGizmo();
 }
@@ -596,14 +599,23 @@ function onCanvasClick(event) {
   }
 
   const hits = raycaster.intersectObjects(targets, true);
-  if (hits.length === 0) {
+
+  // Entity markers (triggers, spawns, summons, billboards, sounds) draw
+  // large translucent volumes / radius rings whose raycast footprint is
+  // far bigger than their real "marker". Meshes tagged userData.noPick are
+  // those volumes - they must never win a click, or you'd select an entity
+  // just by clicking empty space inside its volume (the reported bug).
+  // Skip them so selection falls through to the first PICKABLE hit (the
+  // entity's own solid core / wireframe outline, or whatever's behind it).
+  const firstPickable = hits.find((h) => !h.object.userData.noPick);
+  if (!firstPickable) {
     if (selectionChangeCallback) selectionChangeCallback(null);
     return;
   }
 
   // Walk up from the hit mesh to find which top-level tracked object it
   // belongs to (instance root or the camera gizmo itself).
-  let hitObject = hits[0].object;
+  let hitObject = firstPickable.object;
   let matchedId = null;
   while (hitObject) {
     if (idByObject.has(hitObject)) {
@@ -890,69 +902,60 @@ export function placeInstanceAtViewCenter(id) {
 }
 
 /**
- * Parse an .obj's text and materialsMap into a reusable template Object3D,
- * stored keyed by modelName. The template itself is never added to the
- * stage - addInstance() clones it per placed instance.
+ * Parse a model's .glb (binary glTF) ArrayBuffer into a reusable template
+ * Object3D, resolve its textures, and store it keyed by modelName. The
+ * template itself is never added to the stage - addInstance() clones it per
+ * placed instance.
+ *
+ * `resolveByNames(names[])` is an async callback (supplied by app.js, closed
+ * over the model's own dirHandle) that maps glTF material names to decoded
+ * .tim data - see resolveMaterialsByNames() in mtl_resolver.js. It's injected
+ * rather than imported here so viewer.js stays free of filesystem concerns.
+ *
+ * Returns the resolved Map<materialName, decodedTim|null> so app.js can keep
+ * it on state.models (addInstance needs it for per-instance palette rows).
  */
-export function loadModelIntoStage(modelName, objText, materialsMap) {
-  // ------------------------------------------------------------------
-  // STRAY EDGE/POINT SANITIZATION (confirmed root cause of the "faces
-  // not filled / wireframe only / falling through the grass in walk
-  // mode" bug, reproduced with honda.obj vs honda_broke.obj):
-  //
-  // A stray edge in Blender (an edge not part of any face - often left
-  // behind by a stray vertex pair) exports as an OBJ 'l' (line) element.
-  // OBJLoader's addLineGeometry() sets the WHOLE object's geometry type
-  // to 'Line', and parse() then builds the entire 'o' block as
-  // THREE.LineSegments instead of a Mesh - every face in the object is
-  // discarded, it renders as wireframe only, and walk-mode's ground
-  // raycast (which only collects isMesh objects) finds nothing to stand
-  // on. ONE stray edge poisons the whole object.
-  //
-  // 'l' and 'p' (point) elements only ever REFERENCE vertices - removing
-  // these lines shifts no v/vt/vn indices - so stripping them is safe.
-  // The stray vertices themselves remain in the file but are harmless
-  // (unreferenced). The count is returned so the caller can warn the
-  // artist that the source asset should be cleaned (Blender: Select All
-  // -> Mesh > Clean Up > Delete Loose).
-  // ------------------------------------------------------------------
-  const strayElements = objText.match(/^[lp][ \t]/gm);
-  const strayElementCount = strayElements ? strayElements.length : 0;
-  if (strayElementCount > 0) {
-    objText = objText.replace(/^[lp][ \t].*$/gm, '');
-  }
+export async function loadModelIntoStage(modelName, glbArrayBuffer, resolveByNames) {
+  // GLTFLoader.parse is callback-based; wrap it in a Promise. path is '' -
+  // a .glb is self-contained, and its OWN embedded textures are ignored
+  // (we swap in PS1 .tim data below), so no external resource base is needed.
+  const loader = new GLTFLoader();
+  const gltf = await new Promise((resolve, reject) => {
+    loader.parse(glbArrayBuffer, '', resolve, reject);
+  });
+  const group = gltf.scene;
 
-  const loader = new OBJLoader();
-  const group = loader.parse(objText);
+  // Collect every material name the parsed model references. In glTF each
+  // primitive has exactly ONE material and GLTFLoader makes one mesh per
+  // primitive, so a multi-material Blender object arrives as several
+  // single-material meshes - simpler than OBJLoader's material arrays. An
+  // untextured primitive's material has an empty name; bucket those as
+  // '(none)' to match the PS1 converter's synthetic material.
+  const materialNames = [];
+  group.traverse((child) => {
+    if (!child.isMesh || !child.material) return;
+    const mats = Array.isArray(child.material) ? child.material : [child.material];
+    for (const m of mats) materialNames.push(m.name || '(none)');
+  });
+
+  // Resolve names -> decoded .tim BEFORE building viewer materials, because
+  // buildViewerMaterial() looks each one up in the resolved map.
+  const materialsMap = await resolveByNames(materialNames);
 
   // Build the viewer-side replacement material for ONE source material.
   //
-  // MeshBasicMaterial chosen over MeshStandardMaterial: PS1-era assets
-  // have no PBR workflow (no roughness/metalness maps), and Basic
-  // avoids any lighting-driven color shifts that would make the
-  // viewport preview diverge from the flat-shaded PS1 look - it just
-  // shows the decoded texture as-is.
+  // MeshBasicMaterial (not MeshStandardMaterial): PS1-era assets have no PBR
+  // workflow, and Basic avoids lighting-driven color shifts so the viewport
+  // matches the flat-shaded PS1 look - it just shows the decoded texture.
   //
-  // side: THREE.DoubleSide - Three defaults to FrontSide (backface
-  // culled), which silently makes a mesh invisible-but-present if its
-  // authored winding order comes out "backward" from Three's
-  // perspective (confirmed root cause of a reported "grass texture
-  // doesn't load" bug: the .tim decoded as 100% opaque, correct pixel
-  // data, but the ground mesh's triangles were being culled entirely,
-  // reading as transparent). main.c's own PS1 renderer does its OWN
-  // software backface cull at runtime (see draw_object_into_ot()'s
-  // cross-product winding test) using whatever winding the export
-  // pipeline actually produces, so stage-gen showing both sides here is
-  // purely an editing-time convenience - it doesn't need to match the
-  // PS1 runtime's culling 1:1, and erring toward "always visible while
-  // authoring" is much less confusing than a mesh silently vanishing.
+  // side: THREE.DoubleSide - Three defaults to backface culling, which would
+  // silently hide a mesh whose authored winding comes out "backward" from
+  // Three's view. main.c's PS1 renderer does its OWN software winding cull at
+  // runtime, so showing both sides here is purely an authoring convenience.
   //
-  // material.name is COPIED from the source material - this is load-
-  // bearing, not cosmetic: updateInstancePaletteRow() looks materials up
-  // in materialTimData BY NAME to rebuild textures for a different CLUT
-  // row. The previous version of this code dropped the name (a fresh
-  // MeshBasicMaterial's name is ''), which made palette-row switching
-  // silently no-op on every instance.
+  // material.name is COPIED - load-bearing, not cosmetic:
+  // updateInstancePaletteRow() looks materials up BY NAME to rebuild textures
+  // for a different CLUT row, so a nameless material breaks palette switching.
   function buildViewerMaterial(sourceMaterial) {
     const matName = sourceMaterial && sourceMaterial.name ? sourceMaterial.name : null;
     const decodedTim = matName ? materialsMap.get(matName) : null;
@@ -962,12 +965,8 @@ export function loadModelIntoStage(modelName, objText, materialsMap) {
 
     if (decodedTim) {
       material.map = buildDataTexture(decodedTim, 0);
-      // PS1 "black = transparent" texels decode with alpha=0 (see
-      // tim_reader.js's decodeColor16). Without alphaTest those texels
-      // render as opaque black in the viewport (Basic materials ignore
-      // texture alpha unless transparent/alphaTest is set); alphaTest
-      // discards them without the depth-sorting headaches of
-      // transparent=true.
+      // PS1 "black = transparent" texels decode with alpha=0. alphaTest
+      // discards them without the depth-sorting headaches of transparent=true.
       material.alphaTest = 0.5;
     } else {
       material.color.set(0xff00ff); // magenta = "texture missing" flag color
@@ -978,18 +977,6 @@ export function loadModelIntoStage(modelName, objText, materialsMap) {
 
   group.traverse((child) => {
     if (!child.isMesh) return;
-
-    // MULTI-MATERIAL MESHES: OBJLoader emits child.material as an ARRAY
-    // (not a single Material) whenever one OBJ object uses more than one
-    // usemtl - which is exactly what Blender's default export produces
-    // for a model like House (House0 faces + Grass0 faces in one "o"
-    // block). The geometry carries .groups mapping triangle ranges to
-    // material indices. The previous code assumed a single material:
-    // reading `.name` off the array yielded undefined, and replacing the
-    // array with ONE unnamed material discarded the per-group material
-    // assignment entirely - the second material's (Grass0's) triangle
-    // group effectively lost its faces. Mapping the array 1:1 keeps the
-    // geometry groups' materialIndex references valid.
     child.material = Array.isArray(child.material)
       ? child.material.map(buildViewerMaterial)
       : buildViewerMaterial(child.material);
@@ -1010,9 +997,7 @@ export function loadModelIntoStage(modelName, objText, materialsMap) {
   });
   modelTriCounts.set(modelName, Math.round(triCount));
 
-  // Number of stray 'l'/'p' elements that had to be stripped (see the
-  // sanitization block at the top) - callers use this to warn the artist.
-  return strayElementCount;
+  return materialsMap;
 }
 
 /**
@@ -1167,6 +1152,7 @@ function buildSpawnMarker(group, color) {
   const disc = new THREE.Mesh(new THREE.CircleGeometry(0.35, 24), discMat);
   disc.rotation.x = -Math.PI / 2;
   disc.position.y = 0.01; // sit just above the ground plane to avoid z-fighting the grid
+  disc.userData.noPick = true; // ground disc is a visual footprint, not a click target
   group.add(disc);
 
   const cone = new THREE.Mesh(new THREE.ConeGeometry(0.22, 0.6, 12), mat);
@@ -1192,6 +1178,7 @@ function buildEntityMeshes(group, kind, color, props) {
           color, transparent: true, opacity: 0.12, side: THREE.DoubleSide, depthWrite: false,
         })
       );
+      fill.userData.noPick = true; // huge translucent volume - select via the wireframe edges instead
       group.add(fill);
       const edges = new THREE.LineSegments(
         new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
@@ -1211,6 +1198,7 @@ function buildEntityMeshes(group, kind, color, props) {
       );
       ring.name = 'patrolRing';
       ring.position.y = 0.02;
+      ring.userData.noPick = true; // patrol radius ring can be huge - not a click target
       group.add(ring);
       break;
     }
@@ -1226,6 +1214,7 @@ function buildEntityMeshes(group, kind, color, props) {
         new THREE.MeshBasicMaterial({ color, wireframe: true, transparent: true, opacity: 0.35 })
       );
       halo.position.y = 0.25;
+      halo.userData.noPick = true; // wireframe halo is decorative - pick the solid core
       group.add(halo);
       break;
     }
@@ -1237,6 +1226,7 @@ function buildEntityMeshes(group, kind, color, props) {
         })
       );
       plane.position.y = 0.4;
+      plane.userData.noPick = true; // billboard quad - select via its wireframe frame
       group.add(plane);
       const frame = new THREE.LineSegments(
         new THREE.EdgesGeometry(new THREE.PlaneGeometry(1.2, 0.8)),
@@ -1264,6 +1254,7 @@ function buildEntityMeshes(group, kind, color, props) {
           new THREE.MeshBasicMaterial({ color, wireframe: true, transparent: true, opacity: 0.3 })
         );
         shell.position.y = 0.25;
+        shell.userData.noPick = true; // emission shells are decorative - pick the solid core
         group.add(shell);
       }
       const ring = new THREE.LineLoop(
@@ -1272,6 +1263,7 @@ function buildEntityMeshes(group, kind, color, props) {
       );
       ring.name = 'soundRadiusRing';
       ring.position.y = 0.02;
+      ring.userData.noPick = true; // falloff radius ring can be huge - not a click target
       ring.visible = (props.radius || 0) > 0;
       group.add(ring);
       break;
@@ -1284,6 +1276,67 @@ function buildEntityMeshes(group, kind, color, props) {
       group.add(fallback);
     }
   }
+}
+
+// --------------------------------------------------------------------------
+// Optional custom marker shapes (special/<kind>.glb)
+// --------------------------------------------------------------------------
+//
+// If a .glb sits in stage-gen/special named after an entity kind
+// (trigger.glb, spawn.glb, summon.glb, billboard.glb, particle.glb,
+// sound.glb), it becomes that entity's PICKABLE marker: rendered translucent
+// in the kind's existing ENTITY_COLORS tint, and kept a fixed compact size
+// (counter-scaled against the entity's transform every frame - see the
+// render loop) so selection stays reliable no matter how big the entity's
+// volume/radius is. The original large volume visuals (trigger fill box,
+// patrol/falloff rings, billboard quad) stay on-screen as non-pickable
+// context; only the custom marker grabs clicks. Missing files fall back to
+// the built-in markers with zero fuss.
+const _customMarkerCache = new Map(); // kind -> Promise<THREE.Object3D | null>
+const _markerLoader = new GLTFLoader();
+
+function loadCustomMarkerTemplate(kind) {
+  if (_customMarkerCache.has(kind)) return _customMarkerCache.get(kind);
+  const p = new Promise((resolve) => {
+    _markerLoader.load(
+      `special/${kind}.glb`,
+      (gltf) => resolve(gltf.scene), // GLTFLoader hands back { scene, ... }
+      undefined,
+      () => resolve(null) // absent/unreadable file -> keep built-in marker
+    );
+  });
+  _customMarkerCache.set(kind, p);
+  return p;
+}
+
+function attachCustomMarker(inst) {
+  loadCustomMarkerTemplate(inst.kind).then((template) => {
+    if (!template || !instances.has(inst.id)) return; // gone/removed while loading
+    const group = inst.object3D;
+    const color = ENTITY_COLORS[inst.kind] || 0xffffff;
+
+    // Everything already in the group becomes non-pickable; the solid
+    // placeholder cores (Meshes that WERE pickable) are hidden since the
+    // custom shape replaces them. Volume outlines / rings stay visible.
+    for (const child of [...group.children]) {
+      const wasPickable = !child.userData.noPick;
+      child.userData.noPick = true;
+      if (wasPickable && child.isMesh) child.visible = false;
+    }
+
+    const markerMat = new THREE.MeshBasicMaterial({
+      color, transparent: true, opacity: 0.5, side: THREE.DoubleSide, depthWrite: false,
+    });
+    const wrapper = new THREE.Group();
+    wrapper.name = 'customMarker';
+    const marker = template.clone(true);
+    marker.traverse((o) => {
+      if (o.isMesh) { o.material = markerMat; o.userData.noPick = false; }
+    });
+    wrapper.add(marker);
+    group.add(wrapper);
+    inst.customMarker = wrapper; // frame loop keeps this a fixed world size
+  });
 }
 
 export function addEntityHelper(id, kind, initialTransform = {}, props = {}) {
@@ -1306,6 +1359,7 @@ export function addEntityHelper(id, kind, initialTransform = {}, props = {}) {
   // materialTimData/currentPaletteRow exist so shared instance-map code
   // paths (palette refresh etc.) treat this entry as a harmless no-op.
   instances.set(id, {
+    id,
     object3D: group,
     modelName: `__entity__${kind}`,
     materialTimData: new Map(),
@@ -1314,7 +1368,9 @@ export function addEntityHelper(id, kind, initialTransform = {}, props = {}) {
     kind,
     props: { ...props },
   });
-  applyEntityPropsToMeshes(instances.get(id));
+  const inst = instances.get(id);
+  applyEntityPropsToMeshes(inst);
+  attachCustomMarker(inst);
   return group;
 }
 

@@ -1,0 +1,74 @@
+{
+  "camera": {
+    "pos": [
+      0,
+      -2048,
+      -8192
+    ],
+    "rot": [
+      0,
+      0,
+      0
+    ]
+  },
+  "objects": [
+    {
+      "model": "plane",
+      "palette": 0,
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "model": "arrow",
+      "palette": 0,
+      "pos": [
+        -9393,
+        -733,
+        3524
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
+    }
+  ],
+  "sounds": [
+    {
+      "sample": "LAVENDAR",
+      "pos": [
+        -1664,
+        -195,
+        -6068
+      ],
+      "volume": 0.5,
+      "radius": 0,
+      "mode": "music",
+      "delay": 0,
+      "fadeOnStageEnter": true,
+      "intervalMin": 2,
+      "intervalMax": 8,
+      "directional": false,
+      "muteAfterPlay": false,
+      "autoplay": true
+    }
+  ]
+}

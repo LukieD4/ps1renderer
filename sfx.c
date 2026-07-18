@@ -83,7 +83,9 @@ static unsigned int mutedCount = 0;     // latched by muteAfterPlay
 static unsigned int musicCount = 0;     // mode==MUSIC entries (excluded from the sfx counts)
 static int stagePlaying = 0;            // master ambience on/off flag
 
-// The active stage's authored music entity (first mode==MUSIC sound) -
+// The active stage's authored music entity (first mode==MUSIC sound
+// with autoplay set - autoplay is the ENABLE toggle for music, so a
+// stage can author several tracks and tick the one it wants) -
 // recorded by sfx_stage_load(), consumed via sfx_stage_music() by the
 // (future) stage-transition system; main.c reads stage 0's directly at
 // boot to pick music_load()'s VAB/SEQ pair.
@@ -373,13 +375,15 @@ void sfx_stage_load(const STAGE_DEF *stage)
         slot->def   = &stage->sounds[i];
         slot->voice = -1;
 
-        // Music entities aren't sfx voices at all: record the first one
-        // for sfx_stage_music() (its cdPath/cdPath2 name the VAB/SEQ
-        // pair music.c plays) and leave the slot inert - no .VAG lookup
+        // Music entities aren't sfx voices at all: record the first
+        // ENABLED one (autoplay is music's enable toggle - unticked
+        // tracks are authored-but-disabled and never win the slot) for
+        // sfx_stage_music() (its cdPath/cdPath2 name the VAB/SEQ pair
+        // music.c plays) and leave the slot inert - no .VAG lookup
         // (there is none to find), no voice, not counted unresolved.
         if (slot->def->mode == SFX_MODE_MUSIC)
         {
-            if (stageMusic == 0)
+            if (stageMusic == 0 && slot->def->autoplay)
                 stageMusic = slot->def;
             musicCount++;
             continue;

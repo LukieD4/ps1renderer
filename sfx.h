@@ -110,9 +110,11 @@ int sfx_stage_unresolved_count(void);
 int sfx_stage_muted_count(void);
 
 // The active stage's authored music entity (first mode==SFX_MODE_MUSIC
-// sound), or NULL if the stage authors none. cdPath/cdPath2 are the
-// VAB/SEQ CD paths and fadeOnStageEnter the authored transition
-// preference - consumed by the (future) live stage-transition system;
-// at BOOT main.c reads stage 0's entry directly to pick which pair
-// music_load() gets (falling back to \SONG.VAB;1 + \SONG.SEQ;1).
+// sound WITH autoplay set - autoplay is music's enable toggle, so a
+// stage may author several tracks and tick exactly one; unticked tracks
+// never win the slot), or NULL if the stage authors/enables none.
+// cdPath/cdPath2 are the VAB/SEQ CD paths and fadeOnStageEnter the
+// authored transition preference - consumed by the (future) live
+// stage-transition system; at BOOT main.c reads stage 0's entry
+// directly to pick which pair music_load() gets (no entity = no music).
 const STAGE_SOUND *sfx_stage_music(void);

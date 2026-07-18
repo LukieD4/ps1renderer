@@ -181,7 +181,11 @@ entity kind "graduates".
       future trigger can re-arm it. Loop mode ignores this (a loop never
       "finishes" - the software re-key does not count as finishing).
   autoplay        : bool, default true
-      Start as soon as the stage loads (for music: play after load).
+      Start as soon as the stage loads. For MUSIC it is the ENABLE
+      toggle: a stage may author several music entities and tick the
+      one it wants - unticked music is skipped entirely (not loaded,
+      never blocks a later track). The first ENABLED music entity wins;
+      the export button warns if more than one is enabled.
 
   Viewport helper: core sphere + two wireframe emission shells + a
   ground-plane radius ring that live-tracks `radius` (hidden at 0).
@@ -248,12 +252,15 @@ entity kind "graduates".
   MUSIC    Not an sfx voice at all: the entity is a stage-level marker
            whose sample maps to assets/sound/music/<NAME>.VAB + .SEQ for
            music.c. cdPath/cdPath2 carry both paths; sfx records the
-           first music entity per stage (sfx_stage_music()) and skips it
-           (no voice, excluded from LOADED/UNRES counts). TODAY: main.c
-           reads the boot stage's music entity to pick which pair
-           music_load() gets, falling back to \SONG.VAB;1 + \SONG.SEQ;1.
-           FUTURE: live stage transitions consume fadeOnStageEnter.
-           First music entity wins if a stage authors several.
+           first ENABLED (autoplay ticked) music entity per stage
+           (sfx_stage_music()) and skips the rest (no voice, excluded
+           from LOADED/UNRES counts). TODAY: main.c reads the boot
+           stage's first enabled music entity to pick which pair
+           music_load() gets (no enabled entity = no music). FUTURE:
+           live stage transitions consume fadeOnStageEnter.
+           First ENABLED music entity wins if a stage authors several;
+           autoplay=false music is authored-but-disabled and never
+           blocks a later track.
 
   Directional pass (sfx_tick, once per displayed frame, VSync cadence):
   horizontal (X/Z) only. Linear attenuation inside `radius`; beyond it,

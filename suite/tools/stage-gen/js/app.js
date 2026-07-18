@@ -12,7 +12,7 @@
  * order. stage-gen deviates from that here: every JS file (including
  * viewer.js and app.js) is a proper ES module using `export`, and
  * index.html loads ONLY this file via <script type="module" src="js/app.js">.
- * This is necessary because the Three.js addons (OBJLoader, OrbitControls,
+ * This is necessary because the Three.js addons (GLTFLoader, OrbitControls,
  * TransformControls) are only published as ES modules and are consumed
  * here via an import map - mixing that with global-namespace IIFEs for
  * the rest of the app would mean maintaining two different loading
@@ -24,7 +24,7 @@
 
 import { pickAssetsFolder, scanModels } from './fs_assets.js';
 import { hasNativeDirectoryPicker, initDropZone } from './dnd_assets.js';
-import { resolveMaterials } from './mtl_resolver.js';
+import { resolveMaterialsByNames } from './mtl_resolver.js';
 import { StageState, ENTITY_KINDS } from './stage_state.js';
 import { buildStageJson, downloadStageJson } from './stage_export.js';
 import { buildProjectJson, downloadProjectFile, loadProjectFile } from './stage_project.js';
@@ -230,12 +230,12 @@ async function handleRootFolderHandle(rootHandle) {
   }
 
   if (found.length === 0) {
-    showWarning('No valid models found. Each model needs a subfolder containing <name>.obj and <name>.mtl with matching names.');
+    showWarning('No valid models found. Each model needs a subfolder containing a matching <name>.glb (or <name>.gltf).');
     return;
   }
 
   // Store the discovered handles for on-demand loading when the user
-  // clicks a model in the list (avoids loading every model's .obj/.mtl/
+  // clicks a model in the list (avoids loading every model's .glb +
   // .tim data up front, which could be slow for a large assets folder).
   window.__stageGenDiscoveredModels = found;
 
@@ -302,7 +302,7 @@ if (hasNativeDirectoryPicker()) {
 }
 
 /**
- * Read + resolve one model's .obj/.mtl/.tim data and register it into
+ * Read one model's .glb + resolve its .tim textures, and register it into
  * both state.models and the viewer's template cache. Returns true on
  * success, false on failure (with a toast already shown). A no-op (still
  * returns true) if the model is already loaded.
@@ -316,37 +316,33 @@ if (hasNativeDirectoryPicker()) {
 async function loadModelData(modelEntry) {
   if (state.models.has(modelEntry.name)) return true;
 
-  let objText;
-  let mtlText;
+  let glbBuffer;
   try {
-    objText = await (await modelEntry.objHandle.getFile()).text();
-    mtlText = await (await modelEntry.mtlHandle.getFile()).text();
+    glbBuffer = await (await modelEntry.glbHandle.getFile()).arrayBuffer();
   } catch (err) {
     showError(`Failed to read model "${modelEntry.name}": ${err.message}`);
     return false;
   }
 
-  const materialsMap = await resolveMaterials(modelEntry.dirHandle, mtlText);
+  // The viewer parses the .glb, then calls back with the material names it
+  // found so we can resolve textures/<name>.tim against THIS model's folder.
+  // It returns the resolved map, which we store for per-instance palette rows.
+  let materialsMap;
+  try {
+    materialsMap = await viewer.loadModelIntoStage(
+      modelEntry.name,
+      glbBuffer,
+      (names) => resolveMaterialsByNames(modelEntry.dirHandle, names)
+    );
+  } catch (err) {
+    showError(`Failed to load model "${modelEntry.name}": ${err.message}`);
+    return false;
+  }
 
   state.addModel(modelEntry.name, {
-    objText,
-    mtlText,
     materialsMap,
     dirHandle: modelEntry.dirHandle,
   });
-
-  const strayCount = viewer.loadModelIntoStage(modelEntry.name, objText, materialsMap);
-  if (strayCount > 0) {
-    // Stray edges/points would otherwise silently turn the whole object
-    // into a wireframe (see loadModelIntoStage's sanitization comment).
-    // The viewer already stripped them; this warning is so the artist
-    // knows to clean the source asset (Blender: Mesh > Clean Up >
-    // Delete Loose) rather than shipping strays to the PS1 converter.
-    showWarning(
-      `Model "${modelEntry.name}": ignored ${strayCount} stray edge/point element(s) in the .obj. ` +
-      `Faces still load here, but clean the asset in Blender (Mesh > Clean Up > Delete Loose) before converting.`
-    );
-  }
 
   // This is the fix for "load a project, THEN load assets - instances
   // never appear": resyncViewportFromState() was previously only called
@@ -1403,7 +1399,7 @@ fileLoadProject.addEventListener('change', async () => {
   // manually click each model name in the sidebar list one at a time
   // after loading a project, even when the exact folder those models
   // live in was already open and fully scanned - loadModelData() already
-  // does the real work (parse .obj/.mtl, decode .tim textures, register
+  // does the real work (parse .glb, decode .tim textures, register
   // the template), this just calls it automatically for every name the
   // project actually needs instead of waiting for a click per model.
   const referencedModelNames = new Set(state.instances.map((inst) => inst.model));
@@ -1435,6 +1431,27 @@ btnExportStage.addEventListener('click', () => {
     // output at all during iterative work. The warnings are surfaced via
     // updateUI()'s field styling and this toast.
     showWarning(`Palette warnings:\n${warnings.map((w) => w.message).join('\n')}`);
+  }
+
+  // Music slot check: the runtime plays the FIRST music entity with
+  // Autoplay ticked (Autoplay is music's enable toggle - unticked
+  // tracks are authored-but-disabled). More than one enabled track
+  // means later ones will be silently ignored, so surface it here at
+  // author time instead of letting it fail silently on hardware. Warn,
+  // don't block - same policy as palette warnings above.
+  const enabledMusic = (state.entities || []).filter(
+    (ent) =>
+      ent.kind === 'sound' &&
+      ent.props.mode === 'music' &&
+      ent.props.autoplay !== false &&
+      (ent.props.sample || '').trim() !== ''
+  );
+  if (enabledMusic.length > 1) {
+    showWarning(
+      `Multiple music entities have Autoplay enabled (${enabledMusic
+        .map((e) => e.name || e.props.sample.trim())
+        .join(', ')}). Only the first will play - untick Autoplay on the others to disable them.`
+    );
   }
 
   const json = buildStageJson(state);

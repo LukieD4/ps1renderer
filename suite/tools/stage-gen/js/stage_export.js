@@ -6,11 +6,13 @@
  * ----------------------------------------------------------------------
  * WHY THE COORDINATE REMAP EXISTS - AND WHY THE OLD FORMULA WAS WRONG
  * ----------------------------------------------------------------------
- * Artists author models in Blender (Forward=-Z, Up=Y) and export .obj
- * files in that same space. The stage-gen viewport loads those .obj files
- * AS-IS via OBJLoader (no remap) so the viewport visually matches what the
- * artist saw in Blender - WYSIWYG editing. Three.js/OBJLoader do zero axis
- * conversion, so viewport pos.x/y/z here genuinely IS raw OBJ-file X/Y/Z.
+ * Artists author models in Blender (Forward=-Z, Up=Y) and export .glb
+ * (glTF) files. The stage-gen viewport loads those via GLTFLoader with no
+ * remap, so the viewport visually matches what the artist saw in Blender -
+ * WYSIWYG editing. glTF's +Y-up space matches BOTH Blender's export
+ * orientation and Three.js's world, so a model's viewport coordinates are
+ * the same Blender-export space the old .obj path produced - this placement
+ * remap is therefore unchanged by the OBJ->glTF migration.
  *
  * py_convert_assets.py (the PS1-side model converter) applies this
  * PER-VERTEX remap to raw OBJ x/y/z when baking a model's geometry:
@@ -33,7 +35,7 @@
  *
  * Per-vertex model geometry and whole-object placement offsets are NOT
  * interchangeable here: the per-vertex formula encodes a specific model
- * authoring convention (verified via the arrow.obj dual-tip test against
+ * authoring convention (verified via the arrow asset's dual-tip test against
  * how an individual model's shape should orient), whereas placement needs
  * to preserve the artist's own "up is up, forward is forward" intuition
  * from the viewport into the exported stage. The correct placement remap:

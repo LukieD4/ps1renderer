@@ -77,9 +77,9 @@
       "name": null,
       "parentId": null,
       "pos": {
-        "x": 1.181,
-        "y": 0.341,
-        "z": 2.331
+        "x": 1.087,
+        "y": 0.002,
+        "z": 2.483
       },
       "rot": {
         "x": 0,
@@ -195,9 +195,9 @@
       "name": null,
       "parentId": null,
       "pos": {
-        "x": -2.549,
-        "y": -0.217,
-        "z": 5.043
+        "x": -5.981,
+        "y": 0,
+        "z": 2.132
       },
       "rot": {
         "x": 0,
@@ -219,9 +219,9 @@
       "name": null,
       "parentId": null,
       "pos": {
-        "x": -6.045,
+        "x": -6.04,
         "y": 0,
-        "z": 8.257
+        "z": 6.415
       },
       "rot": {
         "x": 0,
@@ -342,8 +342,42 @@
         "muteAfterPlay": false,
         "autoplay": true
       }
+    },
+    {
+      "id": 17,
+      "kind": "sound",
+      "name": "Music - Testing",
+      "parentId": null,
+      "pos": {
+        "x": -1.615,
+        "y": 0.36,
+        "z": 2.067
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "sample": "TESTING",
+        "volume": 0.5,
+        "mode": "music",
+        "fadeOnStageEnter": true,
+        "delay": 0,
+        "intervalMin": 2,
+        "intervalMax": 8,
+        "directional": false,
+        "radius": 0,
+        "muteAfterPlay": false,
+        "autoplay": false
+      }
     }
   ],
-  "nextId": 17,
+  "nextId": 18,
   "nextSpawnId": 5
 }

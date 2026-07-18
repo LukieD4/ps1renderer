@@ -44,8 +44,8 @@ find_package(Python3 REQUIRED)
 # py_convert_textures.py's header) - the old glob watched *.png only,
 # so re-exporting a .tim never retriggered conversion. Both are watched
 # now (.png kept since PaletteGen's source art lives alongside).
-file(GLOB_RECURSE SOURCE_OBJ_FILES   CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/object/*.obj")
-file(GLOB_RECURSE SOURCE_MTL_FILES   CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/object/*.mtl")
+file(GLOB_RECURSE SOURCE_OBJ_FILES   CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/object/*.glb")
+# file(GLOB_RECURSE SOURCE_MTL_FILES   CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/object/*.mtl")
 file(GLOB_RECURSE SOURCE_TIM_FILES   CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/object/*/textures/*.tim")
 file(GLOB_RECURSE SOURCE_PNG_FILES   CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/object/*/textures/*.png")
 file(GLOB_RECURSE SOURCE_STAGE_FILES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/stage/*/stage.json")

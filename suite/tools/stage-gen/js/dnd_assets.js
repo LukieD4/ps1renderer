@@ -22,7 +22,7 @@
  * .getFile() returning a File-like object with .text()/.arrayBuffer().
  *
  * Because scanModels()/resolveRelativePath() in fs_assets.js, and
- * resolveMaterials() in mtl_resolver.js, only ever call THOSE methods -
+ * resolveMaterialsByNames() in mtl_resolver.js, only ever call THOSE methods -
  * never anything native-FSA-specific - they work completely unmodified
  * against a shimmed handle from a drag-and-drop folder just as well as
  * against a real FileSystemDirectoryHandle from showDirectoryPicker().

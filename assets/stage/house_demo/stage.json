@@ -54,9 +54,9 @@
       "model": "honda",
       "palette": 0,
       "pos": [
-        1209,
-        -349,
-        -2387
+        1113,
+        -2,
+        -2543
       ],
       "rot": [
         0,
@@ -162,6 +162,24 @@
       "directional": false,
       "muteAfterPlay": false,
       "autoplay": true
+    },
+    {
+      "sample": "TESTING",
+      "pos": [
+        -1654,
+        -369,
+        -2117
+      ],
+      "volume": 0.5,
+      "radius": 0,
+      "mode": "music",
+      "delay": 0,
+      "fadeOnStageEnter": true,
+      "intervalMin": 2,
+      "intervalMax": 8,
+      "directional": false,
+      "muteAfterPlay": false,
+      "autoplay": false
     }
   ]
 }

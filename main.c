@@ -268,10 +268,20 @@ static unsigned char padbuf[2][34];
 // single frame (60x/sec) - only the released->pressed transition fires.
 unsigned short prevPadRaw = 0xFFFF; // all-released, matches BIOS idle state
 
-// Which control schema is currently selected (L2 held = camera schema,
-// released = debug transform schema) - set in update(), read by
-// debug_text() so the active schema is visible on screen.
-static int cameraSchemaActive = 0;
+// Latched control mode, cycled by the SELECT click (edge-detected in
+// update()). Replaces the old hold-L2/hold-R2 modifier schemas: nothing is
+// held any more, so each mode owns the whole pad. PLAY is the boot default
+// (the actual game); CAMERA and DEBUG are dev tooling you tab into. Cycle
+// order is PLAY -> CAMERA -> DEBUG -> PLAY. debug_text() reads control_mode
+// to show the active mode on screen.
+enum { MODE_PLAY = 0, MODE_CAMERA, MODE_DEBUG, MODE_COUNT };
+static int control_mode = MODE_PLAY;
+
+// Which debug overlay page is shown, cycled by the L3 click (edge-detected
+// in update(); requires the DualShock in analog mode). debug_text() reads
+// this to pick which block of readouts to print.
+static int debug_page = 0;
+#define DEBUG_PAGE_COUNT 1
 
 
 
@@ -308,6 +318,58 @@ MATRIX camera_view_matrix;
 // represents only the CURRENT object's own transform (reused as scratch
 // across however many objects the stage places, one at a time).
 MATRIX composed_matrix;
+
+
+
+// ------------------------------------------------------------
+// Player (third-person schema, R2 held). NOT a stage-authored object -
+// summoned at runtime the first time the R2 schema is entered, drawn by
+// draw_player() through the same compose/cull/draw pipeline as stage
+// objects. Confined to a flat plane (XZ) with NO gravity - vy is pinned
+// to PLAYER_GROUND_Y every frame - and followed by an orbiting
+// third-person camera (update_player_follow_camera()).
+// ------------------------------------------------------------
+static int playerModelIndex = -1;         // resolved from "player" in init(); -1 = not baked yet
+static int playerSpawned = 0;             // set once the R2 schema summons it
+static VECTOR player_pos = { 0, 0, 0 };   // world-space; vy re-pinned to ground each frame
+static SVECTOR player_rot = { 0, 0, 0 };  // faces the direction of travel (see update())
+static int player_cam_yaw = 0;            // 12-bit follow-cam yaw, orbited via L1/R1 in PLAY
+static int player_cam_pitch = 128;        // follow-cam view pitch, nudged by L2/R2 in PLAY
+
+#define PLAYER_GROUND_Y     0             // the flat plane the player is confined to (no gravity)
+#define PLAYER_MOVE_SPEED   28            // world units/frame at full D-pad deflection
+#define PLAYER_CAM_DIST     2200          // how far BEHIND the player the follow-cam sits
+#define PLAYER_CAM_HEIGHT   900           // how far ABOVE the player the follow-cam sits
+#define PLAYER_CAM_YAW_SPEED 22           // follow-cam yaw units/frame while L1/R1 held (orbit)
+#define PLAYER_CAM_PITCH_SPEED 12         // follow-cam pitch units/frame while L2/R2 held
+#define PLAYER_CAM_PITCH_MIN (-300)       // clamp so the view can't flip past straight up
+#define PLAYER_CAM_PITCH_MAX 700          // clamp so the view can't flip past straight down
+
+
+// 12-bit fixed-point atan2 (returns 0..4095, the engine's angle format;
+// 0 = +forward, increasing clockwise when used as a yaw). psxgte.h ships
+// isin/icos but no inverse, so this uses the classic octant-folded
+// approximation a ~ 1024*y/(x+y) - worst-case error under ~4 degrees,
+// plenty for pointing a character model down its travel direction.
+static int fp_atan2(int y, int x)
+{
+    if (x == 0 && y == 0)
+        return 0;
+
+    int ax = x < 0 ? -x : x;
+    int ay = y < 0 ? -y : y;
+    int a;
+
+    if (ax >= ay)
+        a = (ay * 1024) / (ax + ay);            // 0..512 within the octant
+    else
+        a = 1024 - (ax * 1024) / (ax + ay);     // fold across the 45-degree line
+
+    if (x < 0) a = 2048 - a;                    // fold across the Y axis
+    if (y < 0) a = -a;                          // fold across the X axis
+
+    return a & 4095;
+}
 
 
 
@@ -674,22 +736,28 @@ void init(void)
     // transition system's job; it'll need a music unload/reload path
     // that respects that same LIFO order.) A missing/oversized/
     // malformed pair just leaves music_playing() false on the overlay.
+    //
+    // For MUSIC entities, Autoplay is the ENABLE toggle: a stage may
+    // author several music entities and tick exactly the one it wants -
+    // unticked ones are skipped entirely (not loaded, not blocking).
+    // First ENABLED music entity wins, same rule as sfx_stage_music().
+    // (Previously the first music entity won regardless of autoplay, so
+    // a disabled first entity silently starved every later one.)
     if (stageRegistryCount > 0)
     {
         const STAGE_DEF *bootStage = &stageRegistry[0];
         for (unsigned int i = 0; i < bootStage->soundCount; i++)
         {
             const STAGE_SOUND *snd = &bootStage->sounds[i];
-            if (snd->mode != SFX_MODE_MUSIC)
+            if (snd->mode != SFX_MODE_MUSIC || !snd->autoplay)
                 continue;
 
             if (music_load(snd->cdPath, snd->cdPath2))
             {
                 music_set_volume(snd->volume, snd->volume);
-                if (snd->autoplay)
-                    music_play();
+                music_play();
             }
-            break; // first music entity wins, same rule as sfx_stage_music()
+            break; // first ENABLED music entity wins
         }
     }
 
@@ -698,6 +766,12 @@ void init(void)
     // loads + starts the stage's authored sounds (see load_stage()) -
     // which is why this now runs LAST, after sound_init()/music_load().
     load_stage(0);
+
+    // Resolve the third-person player model ONCE (name -> modelRegistry[]
+    // index), same lookup stage objects use. -1 until assets/object/player/
+    // player.obj has been baked in by py_convert_assets.py - draw_player()
+    // no-ops on -1, so a not-yet-converted player just doesn't appear.
+    playerModelIndex = find_model_index_by_name("player");
 }
 
 
@@ -743,21 +817,171 @@ uint8_t use_texture = 0;
 // this is safe to leave set higher than any given texture's row count.
 uint8_t active_palette = 0;
 
-// Reads ONE controller (padbuf[0]) and updates the debug transform,
-// camera, and rendering toggles - both used to be split across two
-// physical controllers; now they're two SCHEMAS on one controller,
-// switched by holding L2:
-//
-//   L2 released -> debug transform schema (scale/rotation/FOV/lighting)
-//   L2 held     -> camera schema (movement/yaw/palette)
-//
-// L2 itself is the schema-switch modifier now, so it's no longer
-// available as a per-axis button within either schema - its old
-// "negative direction" role (paired with R2 for vz-roll and camera-yaw)
-// moved to SELECT, which was otherwise unused. Edge-detected toggles
-// (TRIANGLE/SQUARE/CIRCLE) share ONE prevPadRaw regardless of schema -
-// the active schema only decides which ACTION a press maps to, not how
-// edge detection works.
+// Positions the shared camera behind + above the player for the
+// third-person view, at the current player_cam_yaw (which only changes
+// while the user deliberately pans with the right stick - it never
+// drifts on its own, so the world doesn't spin during normal movement).
+// Locked to the player's XZ position every frame, keeping player and
+// camera tied together. Called at the end of update() while PLAY mode
+// is active, right before main() calls update_camera_matrix().
+void update_player_follow_camera(void)
+{
+    // Local-frame offset: straight BACK (-Z) and UP, rotated by the pan
+    // yaw. "Up" is -Y because the view matrix negates camera.pos - moving
+    // camera.vy DOWN reads as UP everywhere else in this engine (see the
+    // CAMERA schema's L1/R1).
+    SVECTOR yawOnly = { 0, (short)player_cam_yaw, 0 };
+    MATRIX yawMat;
+    RotMatrix(&yawOnly, &yawMat);
+
+    VECTOR off = { 0, -PLAYER_CAM_HEIGHT, -PLAYER_CAM_DIST };
+    VECTOR rotOff;
+    rotOff.vx = ((yawMat.m[0][0] * off.vx) + (yawMat.m[0][1] * off.vy) + (yawMat.m[0][2] * off.vz)) >> 12;
+    rotOff.vy = ((yawMat.m[1][0] * off.vx) + (yawMat.m[1][1] * off.vy) + (yawMat.m[1][2] * off.vz)) >> 12;
+    rotOff.vz = ((yawMat.m[2][0] * off.vx) + (yawMat.m[2][1] * off.vy) + (yawMat.m[2][2] * off.vz)) >> 12;
+
+    camera.pos.vx = player_pos.vx + rotOff.vx;
+    camera.pos.vy = player_pos.vy + rotOff.vy;
+    camera.pos.vz = player_pos.vz + rotOff.vz;
+
+    // Face the pan yaw so the player stays centred; player_cam_pitch tips
+    // the view up/down (base 128/4096 ~ 11 deg down, right-stick Y nudges it).
+    camera.rot.vx = (short)player_cam_pitch;
+    camera.rot.vy = (short)player_cam_yaw;
+    camera.rot.vz = 0;
+}
+
+
+// Edge detector shared by every latched toggle: true only on the frame a
+// button goes released -> pressed (bit was 1 last frame, 0 now). One helper
+// replaces the !(raw & X) && (prevPadRaw & X) that used to be copy-pasted
+// per button. prevPadRaw is the single shared previous-frame state.
+static int edge_pressed(unsigned short raw, unsigned short mask)
+{
+    return !(raw & mask) && (prevPadRaw & mask);
+}
+
+// ---- PLAY mode: the actual game (default on boot) ----
+// Fully digital, nothing held. The D-pad moves the player camera-relative;
+// L1/R1 orbit the follow-cam yaw around the player; L2/R2 pitch its view up/
+// down. The face buttons are left free for player actions. Orbit and pitch
+// are their own held controls, so moving and looking never fight.
+static void update_play(unsigned short raw)
+{
+    playerSpawned = 1;   // idempotent - summon on first PLAY frame, then a no-op
+
+    // L1/R1 orbit the follow-cam yaw; L2/R2 pitch the view (clamped). Pitch
+    // DECREASES toward the sky (base 128 tilts slightly down), so L2 = up.
+    if (!(raw & PAD_L1)) player_cam_yaw -= PLAYER_CAM_YAW_SPEED;   // orbit left
+    if (!(raw & PAD_R1)) player_cam_yaw += PLAYER_CAM_YAW_SPEED;   // orbit right
+    player_cam_yaw &= 4095;
+
+    if (!(raw & PAD_L2)) player_cam_pitch -= PLAYER_CAM_PITCH_SPEED; // look up
+    if (!(raw & PAD_R2)) player_cam_pitch += PLAYER_CAM_PITCH_SPEED; // look down
+    if (player_cam_pitch < PLAYER_CAM_PITCH_MIN) player_cam_pitch = PLAYER_CAM_PITCH_MIN;
+    if (player_cam_pitch > PLAYER_CAM_PITCH_MAX) player_cam_pitch = PLAYER_CAM_PITCH_MAX;
+
+    // Movement: D-pad, treated as full deflection (+/-128) on each axis.
+    int mx = 0, my = 0;
+    if (!(raw & PAD_LEFT))  mx = -128;
+    if (!(raw & PAD_RIGHT)) mx =  128;
+    if (!(raw & PAD_UP))    my = -128;
+    if (!(raw & PAD_DOWN))  my =  128;
+
+    if (mx != 0 || my != 0)
+    {
+        // Camera-relative basis from the orbit yaw (same RotMatrix column
+        // convention as the follow-cam), so D-pad UP always pushes the
+        // player AWAY from the camera whatever the orbit.
+        SVECTOR yawOnly = { 0, (short)player_cam_yaw, 0 };
+        MATRIX yawMat;
+        RotMatrix(&yawOnly, &yawMat);
+        int fwdX = yawMat.m[0][2], fwdZ = yawMat.m[2][2];
+        int rgtX = yawMat.m[0][0], rgtZ = yawMat.m[2][0];
+
+        // forward f = up, strafe s = right; the /128 keeps the same world
+        // units as before now that full deflection is a fixed +/-128.
+        int f = -my, s = mx;
+        player_pos.vx += ((fwdX * f + rgtX * s) / 128 * PLAYER_MOVE_SPEED) >> 12;
+        player_pos.vz += ((fwdZ * f + rgtZ * s) / 128 * PLAYER_MOVE_SPEED) >> 12;
+
+        // Face the direction of travel (OBJ files carry no look target, so
+        // travel direction IS the look direction).
+        player_rot.vx = 0;
+        player_rot.vy = (short)((player_cam_yaw + fp_atan2(s, f)) & 4095);
+        player_rot.vz = 0;
+    }
+
+    player_pos.vy = PLAYER_GROUND_Y;   // no gravity: locked to the ground plane
+}
+
+// ---- CAMERA mode: free-fly dev camera ----
+// Fully digital. D-pad translates on the world X/Z plane, L1/R1 move on Y,
+// L2/R2 yaw the view, TRIANGLE/CROSS pitch it, SQUARE/CIRCLE nudge the global
+// palette row.
+static void update_camera_mode(unsigned short raw)
+{
+    // Translate on the world X/Z plane.
+    if (!(raw & PAD_UP))    camera.pos.vz += CAMERA_MOVE_SPEED; // forward
+    if (!(raw & PAD_DOWN))  camera.pos.vz -= CAMERA_MOVE_SPEED; // backward
+    if (!(raw & PAD_LEFT))  camera.pos.vx -= CAMERA_MOVE_SPEED; // strafe left
+    if (!(raw & PAD_RIGHT)) camera.pos.vx += CAMERA_MOVE_SPEED; // strafe right
+
+    // Y: L1 up, R1 down (view matrix negates camera.pos, so -vy reads up).
+    if (!(raw & PAD_L1)) camera.pos.vy -= CAMERA_MOVE_SPEED; // up
+    if (!(raw & PAD_R1)) camera.pos.vy += CAMERA_MOVE_SPEED; // down
+
+    // Look: L2/R2 yaw, TRIANGLE/CROSS pitch.
+    if (!(raw & PAD_R2)) camera.rot.vy += CAMERA_ROT_SPEED; // yaw right
+    if (!(raw & PAD_L2)) camera.rot.vy -= CAMERA_ROT_SPEED; // yaw left
+    if (!(raw & PAD_TRIANGLE)) camera.rot.vx -= CAMERA_ROT_SPEED; // pitch up
+    if (!(raw & PAD_CROSS))    camera.rot.vx += CAMERA_ROT_SPEED; // pitch down
+    camera.rot.vx &= 4095;
+    camera.rot.vy &= 4095;
+
+    // Palette row nudge - edge-detected, wraps 0-15 (per-TIM row ceiling).
+    if (edge_pressed(raw, PAD_SQUARE)) active_palette = (active_palette + 1) & 0x0F;
+    if (edge_pressed(raw, PAD_CIRCLE)) active_palette = (active_palette - 1) & 0x0F;
+}
+
+// ---- DEBUG mode: model / render inspector ----
+// D-pad yaws (L/R) and pitches (U/D) the global debug transform, L1/R1 roll
+// it, CROSS/CIRCLE drive FOV, TRIANGLE toggles lighting, SQUARE toggles
+// texturing. 12-bit angles wrap via a power-of-two mask so rotation stays
+// continuous through the 0/4096 boundary instead of snapping.
+static void update_debug(unsigned short raw)
+{
+    // Pitch (X rotation): D-pad up/down.
+    if (!(raw & PAD_UP))   model_rot.vx -= ROT_SPEED;
+    if (!(raw & PAD_DOWN)) model_rot.vx += ROT_SPEED;
+    model_rot.vx &= 4095;
+
+    // Yaw (Y rotation): D-pad left/right.
+    if (!(raw & PAD_LEFT))  model_rot.vy -= ROT_SPEED;
+    if (!(raw & PAD_RIGHT)) model_rot.vy += ROT_SPEED;
+    model_rot.vy &= 4095;
+
+    // Roll (Z rotation): L1/R1.
+    if (!(raw & PAD_L1)) model_rot.vz -= ROT_SPEED;
+    if (!(raw & PAD_R1)) model_rot.vz += ROT_SPEED;
+    model_rot.vz &= 4095;
+
+    // FOV: CROSS widens, CIRCLE narrows.
+    if (!(raw & PAD_CROSS))  fov += fov_speed;
+    if (!(raw & PAD_CIRCLE)) fov -= fov_speed;
+    if (fov > 65535) fov = 0;
+    if (fov < -65535) fov = 65536;
+
+    // Edge-detected render toggles.
+    if (edge_pressed(raw, PAD_TRIANGLE)) use_vertex_light ^= 1;
+    if (edge_pressed(raw, PAD_SQUARE))   use_texture ^= 1;
+}
+
+// Reads ONE controller (padbuf[0]) and drives whichever mode is latched.
+// SELECT cycles the mode (edge-detected); each mode owns the whole pad, so
+// there are no held modifiers any more. START (ambience) and L3 (overlay
+// page) work in every mode. The follow-cam is only re-aimed in PLAY so the
+// CAMERA mode's free-fly position is never overwritten.
 void update(void)
 {
     // bytes 2-3 contain button bits (little endian, 0 = pressed).
@@ -766,97 +990,52 @@ void update(void)
     unsigned short raw =
         *(unsigned short *)(padbuf[0] + 2);
 
-    cameraSchemaActive = !(raw & PAD_L2);
+    // SELECT cycles the latched mode: PLAY -> CAMERA -> DEBUG -> PLAY.
+    if (edge_pressed(raw, PAD_SELECT))
+        control_mode = (control_mode + 1) % MODE_COUNT;
 
-    if (!cameraSchemaActive)
+    // Mode-entry hook: fires once on the frame we switch INTO a mode.
+    // - PLAY:   zero the global debug transform so a stale MODEL rotation
+    //           can't tilt the stage under the player.
+    // - CAMERA: level the view to ROT 0,0,0. The PLAY follow-cam leaves
+    //           camera.rot pitched toward the sky (player_cam_pitch), and
+    //           CAMERA mode inherits that rotation, so reset it to a level
+    //           starting point every time you tab in.
+    static int prev_mode = MODE_PLAY;
+    if (control_mode != prev_mode)
     {
-        // ---- Debug transform schema (L2 released) ----
-
-        // Debug scale - a live fixed-point MULTIPLIER (4096 == 1.0)
-        // layered on top of every stage object's own authored scale in
-        // draw_stage(). PAD_UP grows it, PAD_DOWN shrinks it.
-        if (!(raw & PAD_UP)) debug_scale += SCALE_SPEED;
-        if (!(raw & PAD_DOWN)) debug_scale -= SCALE_SPEED;
-        if (debug_scale < 64) debug_scale = 64;       // avoid degenerate near-zero/negative scale
-        if (debug_scale > 16384) debug_scale = 16384; // avoid overflowing the 16-bit matrix entries at extreme sizes
-
-        // XYZ rotation - 12-bit fixed-point angles (4096 = 360 degrees),
-        // so the value space is circular, not bounded. A bitmask wrap
-        // (mod 4096, since 4096 is a power of two) keeps rotation
-        // continuous through the wraparound instead of snapping/popping
-        // at the boundary.
-        if (!(raw & PAD_L1)) model_rot.vx -= ROT_SPEED;
-        if (!(raw & PAD_R1)) model_rot.vx += ROT_SPEED;
-        model_rot.vx &= 4095;
-
-        // SELECT stands in for L2's old "negative" half here, since L2
-        // itself is now the schema-switch modifier (see update()'s own
-        // comment above).
-        if (!(raw & PAD_SELECT)) model_rot.vz -= ROT_SPEED;
-        if (!(raw & PAD_R2)) model_rot.vz += ROT_SPEED;
-        model_rot.vz &= 4095;
-
-        if (!(raw & PAD_LEFT)) model_rot.vy -= ROT_SPEED;   // rotate left
-        if (!(raw & PAD_RIGHT)) model_rot.vy += ROT_SPEED;  // rotate right
-        model_rot.vy &= 4095;
-
-        // FOV
-        if (!(raw & PAD_CROSS)) fov += fov_speed;
-        if (!(raw & PAD_CIRCLE)) fov -= fov_speed;
-        if (fov > 65535) fov = 0;
-        if (fov < -65535) fov = 65536;
-
-        // Lighting mode toggle - only fires on the frame TRIANGLE goes
-        // from released to pressed (bit was 1 last frame, is 0 this
-        // frame), not on every frame it's held down.
-        if (!(raw & PAD_TRIANGLE) && (prevPadRaw & PAD_TRIANGLE))
-            use_vertex_light = use_vertex_light ^ 1;
-
-        // Texture toggle - same edge-detected pattern as above.
-        if (!(raw & PAD_SQUARE) && (prevPadRaw & PAD_SQUARE))
-            use_texture = use_texture ^ 1;
-    }
-    else
-    {
-        // ---- Camera schema (L2 held) ----
-        // D-pad: translate on the world X/Z plane (strafe/forward-back).
-        // L1/R1: translate on Y (up/down). SELECT/R2: yaw (look left/
-        // right) - SELECT stands in for L2's old half of this pair,
-        // same reasoning as the debug schema above. Still a simple,
-        // direct mapping rather than a proper FPS-style look-at/analog
-        // camera (that refinement is still the "Camera" roadmap item).
-        if (!(raw & PAD_UP))    camera.pos.vz += CAMERA_MOVE_SPEED; // forward (into the stage)
-        if (!(raw & PAD_DOWN))  camera.pos.vz -= CAMERA_MOVE_SPEED; // backward
-        if (!(raw & PAD_LEFT))  camera.pos.vx -= CAMERA_MOVE_SPEED; // strafe left
-        if (!(raw & PAD_RIGHT)) camera.pos.vx += CAMERA_MOVE_SPEED; // strafe right
-
-        if (!(raw & PAD_L1)) camera.pos.vy -= CAMERA_MOVE_SPEED; // up
-        if (!(raw & PAD_R1)) camera.pos.vy += CAMERA_MOVE_SPEED; // down
-
-        if (!(raw & PAD_SELECT)) camera.rot.vy -= CAMERA_ROT_SPEED; // yaw left
-        if (!(raw & PAD_R2)) camera.rot.vy += CAMERA_ROT_SPEED;     // yaw right
-        camera.rot.vy &= 4095;
-
-        // Palette row nudge - edge-detected, wraps 0-15 (the per-TIM row
-        // ceiling) rather than any one texture's real paletteCount,
-        // since this is a single global nudge shared across every
-        // placed object - draw_object_into_ot() clamps per-texture on
-        // the output side, this is just input.
-        if (!(raw & PAD_SQUARE) && (prevPadRaw & PAD_SQUARE))
-            active_palette = (active_palette + 1) & 0x0F;
-
-        if (!(raw & PAD_CIRCLE) && (prevPadRaw & PAD_CIRCLE))
-            active_palette = (active_palette - 1) & 0x0F;
+        if (control_mode == MODE_PLAY)
+        {
+            model_rot.vx = 0; model_rot.vy = 0; model_rot.vz = 0;
+            model_pos.vx = 0; model_pos.vy = 0; model_pos.vz = 0;
+        }
+        else if (control_mode == MODE_CAMERA)
+        {
+            camera.rot.vx = 0; camera.rot.vy = 0; camera.rot.vz = 0;
+        }
+        prev_mode = control_mode;
     }
 
-    // START toggles the stage's ambient sounds on/off (every looping sound
-    // the active stage authored - wind in house_demo). Schema-independent
-    // (works whether L2 is held or not) and edge-detected against
-    // prevPadRaw, same released->pressed pattern as the TRIANGLE/SQUARE
-    // toggles above, so a held button doesn't re-toggle every frame. START
-    // is otherwise unused by either control schema.
-    if (!(raw & PAD_START) && (prevPadRaw & PAD_START))
+    // Dispatch to the active mode's handler - each owns the whole pad.
+    if      (control_mode == MODE_PLAY)   update_play(raw);
+    else if (control_mode == MODE_CAMERA) update_camera_mode(raw);
+    else                                  update_debug(raw);
+
+    // ---- Mode-independent controls (fire in every mode) ----
+    // L3 click cycles the debug overlay page. Requires the DualShock in
+    // analog mode (red LED); in digital mode the L3 bit stays high and this
+    // simply never fires.
+    if (edge_pressed(raw, PAD_L3))
+        debug_page = (debug_page + 1) % DEBUG_PAGE_COUNT;
+
+    // START toggles the stage's ambient sounds on/off.
+    if (edge_pressed(raw, PAD_START))
         sfx_stage_toggle();
+
+    // Keep the follow-camera locked on the player only in PLAY. Left out of
+    // the other modes on purpose so CAMERA's free-fly position survives.
+    if (control_mode == MODE_PLAY && playerSpawned)
+        update_player_follow_camera();
 
     prevPadRaw = raw;
 }
@@ -1414,66 +1593,130 @@ void draw_stage(void)
 }
 
 
-// Print debug text to the screen
+// Draws the runtime-summoned player through the same compose/cull/draw
+// pipeline as stage objects, but OUTSIDE draw_stage()'s stage-object loop
+// (the player isn't authored into any stage). No-ops until the player has
+// been summoned (R2 schema) AND its model actually baked into
+// modelRegistry[] (playerModelIndex >= 0). Shares the same OT/prim arena,
+// so it depth-sorts against the stage naturally. Uses identity scale
+// (4096) and the live active_palette, matching stage objects' palette nudge.
+void draw_player(void)
+{
+    if (!playerSpawned || playerModelIndex < 0)
+        return;
+
+    const MODEL_DEF *model = &modelRegistry[playerModelIndex];
+
+    VECTOR pos = { player_pos.vx, player_pos.vy, player_pos.vz };
+    SVECTOR rot = { player_rot.vx, player_rot.vy, player_rot.vz };
+    VECTOR scale = { 4096, 4096, 4096 };
+
+    update_object_world_and_compose(&pos, &rot, &scale);
+
+    if (object_is_culled(model))
+    {
+        culledObjectCount++;
+        return;
+    }
+
+    visibleObjectCount++;
+
+    rotate_object_normals(model);
+    transform_object_vertices(model);
+
+    MODEL_TEXTURE **triTextureCache = modelTriTextureCache[playerModelIndex];
+    draw_object_into_ot(model, triTextureCache, active_palette);
+}
+
+
+// Print debug text to the screen. The readouts are split across
+// DEBUG_PAGE_COUNT pages, cycled by the L3 click (see update()); only the
+// active page's block prints each frame, so the overlay no longer buries
+// the viewport. Every page shares a common header (schema + page number),
+// then prints its own block:
+//   page 0 - RENDER   (frame/stage/visibility/model counts)
+//   page 1 - TRANSFORM+CAMERA+PLAYER (fov/rotation/camera/player state)
+//   page 2 - AUDIO    (sfx/spu/music)
 void debug_text(int counter)
 {
-    FntPrint(-1, "OBJ MODEL TEST (GTE)\n");
-    FntPrint(-1, "FRAME=%d\n", counter);
+    // Common header, always shown so the active mode and page are
+    // visible regardless of which page's block is printing below.
+    FntPrint(-1, "MODE=%s  PAGE %d/%d (SELECT=mode L3=page)\n",
+        control_mode == MODE_PLAY   ? "PLAY"
+            : control_mode == MODE_CAMERA ? "CAMERA" : "DEBUG",
+        debug_page + 1, DEBUG_PAGE_COUNT);
 
-    FntPrint(-1, "STAGE=%s OBJECTS=%d/%d UNRESOLVED=%d\n",
-        (activeStageIndex < stageRegistryCount) ? stageRegistry[activeStageIndex].name : "(none)",
-        activeStageObjectCount,
-        (activeStageIndex < stageRegistryCount) ? stageRegistry[activeStageIndex].objectCount : 0,
-        stageUnresolvedCount);
-    FntPrint(-1, "VISIBLE=%d CULLED=%d PRIM_OVERFLOW=%d\n",
-        visibleObjectCount, culledObjectCount, primOverflowCount);
-    FntPrint(-1, "MODELS_BAKED=%d\n", modelRegistryCount);
+    if (debug_page == 0)
+    {
+        // ---- Page 0: RENDER ----
+        FntPrint(-1, "OBJ MODEL TEST (GTE)\n");
+        FntPrint(-1, "FRAME=%d\n", counter);
+        FntPrint(-1, "STAGE=%s OBJECTS=%d/%d UNRESOLVED=%d\n",
+            (activeStageIndex < stageRegistryCount) ? stageRegistry[activeStageIndex].name : "(none)",
+            activeStageObjectCount,
+            (activeStageIndex < stageRegistryCount) ? stageRegistry[activeStageIndex].objectCount : 0,
+            stageUnresolvedCount);
+        FntPrint(-1, "VISIBLE=%d CULLED=%d PRIM_OVERFLOW=%d\n",
+            visibleObjectCount, culledObjectCount, primOverflowCount);
+        FntPrint(-1, "MODELS_BAKED=%d\n", modelRegistryCount);
+        
+        // Live projection distance: update_camera_matrix() pushes
+        // FOCAL_LENGTH+fov into gte_SetGeomScreen() once per frame, so this
+        // readout tracks the real GTE state (fov driven by CROSS/CIRCLE in
+        // the debug schema).
+        FntPrint(-1, "FOV=%d\n", FOCAL_LENGTH+fov);
+        FntPrint(-1, "ROTX=%d ROTY=%d ROTZ=%d\n", model_rot.vx, model_rot.vy, model_rot.vz);
+        FntPrint(-1, "DEBUGPOSOFFSET=%d,%d,%d\n", model_pos.vx, model_pos.vy, model_pos.vz);
+        FntPrint(-1, "CAMPOS=%d,%d,%d CAMROTY=%d\n",
+            camera.pos.vx, camera.pos.vy, camera.pos.vz, camera.rot.vy);
+        FntPrint(-1, "VERTEXLIGHTING=%d TEXTURED=%d\n", use_vertex_light, use_texture);
+        FntPrint(-1, "TEXTURES_LOADED=%d ACTIVE_PALETTE=%d\n", textureTableCount, active_palette);
+        // Player state: whether summoned, its model resolution, XZ position
+        // and orbit yaw. MODEL=-1 means player.obj hasn't been baked yet.
+        FntPrint(-1, "PLAYER=%s MODEL=%d\n",
+            playerSpawned ? "SPAWNED" : "(none)", playerModelIndex);
+        FntPrint(-1, "PLAYERPOS=%d,%d,%d CAMYAW=%d\n",
+            player_pos.vx, player_pos.vy, player_pos.vz, player_cam_yaw);
 
-    FntPrint(-1, "DEBUGSCALE=%d\n", debug_scale);
-    // Live projection distance: update_camera_matrix() pushes
-    // FOCAL_LENGTH+fov into gte_SetGeomScreen() once per frame, so this
-    // readout tracks the real GTE state (fov driven by CROSS/CIRCLE in
-    // the debug schema).
-    FntPrint(-1, "FOV=%d\n", FOCAL_LENGTH+fov);
-    FntPrint(-1, "ROTX=%d\n", model_rot.vx);
-    FntPrint(-1, "ROTY=%d\n", model_rot.vy);
-    FntPrint(-1, "ROTZ=%d\n", model_rot.vz);
-    FntPrint(-1, "DEBUGPOSOFFSET=%d,%d,%d\n", model_pos.vx, model_pos.vy, model_pos.vz);
-    FntPrint(-1, "CAMPOS=%d,%d,%d\n", camera.pos.vx, camera.pos.vy, camera.pos.vz);
-    FntPrint(-1, "CAMROTY=%d\n", camera.rot.vy);
-    FntPrint(-1, "VERTEXLIGHTING=%d\n", use_vertex_light);
-    FntPrint(-1, "TEXTURED=%d\n", use_texture);
-    FntPrint(-1, "TEXTURES_LOADED=%d\n", textureTableCount);
-    FntPrint(-1, "ACTIVE_PALETTE=%d\n", active_palette);
-    FntPrint(-1, "SCHEMA=%s (hold L2 for CAMERA)\n", cameraSchemaActive ? "CAMERA" : "DEBUG");
-    // Stage-authored sounds (sfx.c): how many the stage authored vs. how
-    // many actually made it off the CD into SPU RAM, the analogue of the
-    // model-name UNRESOLVED count (missing .vag on disc, bad header, SPU
-    // RAM/voice budget), and how many have latched silent via
-    // muteAfterPlay. ON/OFF is the START-toggled master ambience.
-    FntPrint(-1, "SFX=%s (START toggles) LOADED=%d/%d UNRES=%d MUTED=%d\n",
-        sfx_stage_playing() ? "ON" : "OFF",
-        sfx_stage_loaded_count(), sfx_stage_sound_count(),
-        sfx_stage_unresolved_count(), sfx_stage_muted_count());
+        // Stage-authored sounds (sfx.c): how many the stage authored vs. how
+        // many actually made it off the CD into SPU RAM, the analogue of the
+        // model-name UNRESOLVED count (missing .vag on disc, bad header, SPU
+        // RAM/voice budget), and how many have latched silent via
+        // muteAfterPlay. ON/OFF is the START-toggled master ambience.
+        FntPrint(-1, "SFX=%s (START toggles) LOADED=%d/%d UNRES=%d MUTED=%d\n",
+            sfx_stage_playing() ? "ON" : "OFF",
+            sfx_stage_loaded_count(), sfx_stage_sound_count(),
+            sfx_stage_unresolved_count(), sfx_stage_muted_count());
 
-    // SPU RAM budget: bytes of waveform data resident vs. the ~508 KB usable
-    // (512 KB minus the reserved capture area). PCT is used*100/capacity. As
-    // more sound effects are added, watch this climb toward 100 - an upload
-    // that would push past it is refused by the SPU bump allocator (the sound
-    // just won't load) rather than corrupting another sample.
-    FntPrint(-1, "SPU RAM=%d/%d B (%d%%)\n",
-        sound_spu_used(), sound_spu_capacity(),
-        (int)((sound_spu_used() * 100) / sound_spu_capacity()));
+        // SPU RAM budget: bytes of waveform data resident vs. the ~508 KB usable
+        // (512 KB minus the reserved capture area). PCT is used*100/capacity. As
+        // more sound effects are added, watch this climb toward 100 - an upload
+        // that would push past it is refused by the SPU bump allocator (the sound
+        // just won't load) rather than corrupting another sample.
+        FntPrint(-1, "SPU RAM=%d/%d B (%d%%)\n",
+            sound_spu_used(), sound_spu_capacity(),
+            (int)((sound_spu_used() * 100) / sound_spu_capacity()));
 
-    // Music sequencer: playing/loaded state, voices currently keyed on (of
-    // the 16-voice music pool), and the bank's share of the SPU RAM figure
-    // above. LOADED=N means the SONG.VAB/SONG.SEQ pair didn't make it off
-    // the disc (or failed to parse) - the game runs silently, same as WIND.
-    FntPrint(-1, "MUSIC=%s LOADED=%s V=%d/%d BANK=%dB\n",
-        music_playing() ? "ON" : "OFF",
-        music_loaded() ? "Y" : "N",
-        music_voices_active(), MUSIC_VOICE_COUNT,
-        music_spu_used());
+        // Music sequencer: playing/loaded state, voices currently keyed on (of
+        // the 16-voice music pool), and the bank's share of the SPU RAM figure
+        // above. LOADED=N means the SONG.VAB/SONG.SEQ pair didn't make it off
+        // the disc (or failed to parse) - the game runs silently, same as WIND.
+        FntPrint(-1, "MUSIC=%s LOADED=%s V=%d/%d BANK=%dB\n",
+            music_playing() ? "ON" : "OFF",
+            music_loaded() ? "Y" : "N",
+            music_voices_active(), MUSIC_VOICE_COUNT,
+            music_spu_used());
+    }
+    else if (debug_page == 1)
+    {
+        // ---- Page 1: TRANSFORM + CAMERA + PLAYER ----
+        return;
+    }
+    else
+    {
+        // ---- Page 2: AUDIO ----
+        return;
+    }
 }
 
 
@@ -1506,6 +1749,11 @@ int main(int argc, const char *argv[])
         // update_matrix()+sort_model()+draw_model() trio, and no longer
         // does its own CPU depth sort (the OT does that instead).
         draw_stage();
+
+        // Draw the runtime-summoned third-person player (if any) into the
+        // same OT, right after the stage objects so it depth-sorts against
+        // them. No-ops until summoned via the R2 schema.
+        draw_player();
 
         // Kick off the GPU's own back-to-front walk of everything
         // draw_stage() just queued into ot[db], starting from the

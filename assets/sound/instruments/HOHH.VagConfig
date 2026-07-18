@@ -1,0 +1,17 @@
+{
+  "format": "VagConfig",
+  "version": 2,
+  "targetRate": 8000,
+  "quality": "sinc",
+  "cutoffPct": 90,
+  "effort": "exhaustive",
+  "loop": false,
+  "loopStartFrac": 0,
+  "name": "HOHH",
+  "volume": 0.32,
+  "trimStart": 0.06,
+  "trimEnd": 0.6402916666666667,
+  "monitor": "output",
+  "playhead": 0,
+  "sourceFileName": "HOHH.wav"
+}
