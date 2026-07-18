@@ -1,6 +1,6 @@
 <p align="center">
-  <img src="https://github.com/user-attachments/assets/object/76555e37-beda-4315-a491-6deab2ade4bf" height="250" />
-  <img src="https://github.com/user-attachments/assets/object/d1663f86-dcb7-4632-a6e1-de1c8c2f732a" height="250" />
+  <img src="https://github.com/user-attachments/assets/76555e37-beda-4315-a491-6deab2ade4bf" height="250" />
+  <img src="https://github.com/user-attachments/assets/d1663f86-dcb7-4632-a6e1-de1c8c2f732a" height="250" />
 </p>
 
 
