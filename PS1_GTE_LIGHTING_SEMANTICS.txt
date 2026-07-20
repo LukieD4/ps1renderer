@@ -1,0 +1,453 @@
+PS1 GTE LIGHTING SEMANTICS
+How the PlayStation 1 GTE lights geometry, and how this engine uses it
+======================================================================
+
+Companion to PS1AUDIO_SEMANTICS / PS1TIM_SEMANTICS / PS1CUSTOM_MUSIC_
+SEMANTICS / PS1STAGEGEN_EXTRA_SEMANTICS. Covers the Geometry Transform
+Engine's lighting pipeline (the hardware), the coordinate-space rules
+that decide whether light follows the world or the camera, what maps to
+silicon vs what must be faked, and finally how THIS renderer lights
+things today (main.c) plus the planned direction.
+
+Bit-exact shift/clamp constants are deliberately NOT reproduced here -
+they live in the GTE hardware reference (nocash "psx-spx", the GTE
+coprocessor 2 section). This document explains the SEMANTICS: what each
+stage computes and why, at the level needed to reason about the engine.
+
+Fixed-point convention throughout: "ONE == 4096" (1.0 in 20.12 / 1.12
+fixed point), the same scale RotMatrix() and the matrices in main.c use.
+
+
+1. THE GTE LIGHTING PIPELINE (hardware)
+---------------------------------------
+
+The GTE is a fixed-function coprocessor (COP2). Alongside vertex
+transform/projection it has a dedicated LIGHTING path driven by three
+matrix/color registers plus the primitive base color:
+
+  LLM  - "Light matrix" (a.k.a. local light matrix). A 3x3 whose ROWS are
+         up to THREE light DIRECTION vectors. Loaded with
+         gte_SetLightMatrix(&m).
+  LCM  - "Light color matrix". A 3x3 whose COLUMNS are the RGB of those
+         three lights (row 0 = the three lights' red, etc.). Loaded with
+         gte_SetColorMatrix(&m).
+  BK   - "Background color" (RBK/GBK/BBK): one ambient RGB added to every
+         lit vertex. Loaded with gte_SetBackColor(r, g, b).
+  RGBC - the primitive's base color register (R, G, B, CODE), i.e. the
+         material/vertex colour a "color color" op modulates.
+
+Per normal fed in, the lighting op computes, conceptually:
+
+  1.  L   = LLM * normal            ; three dot products, one per light
+                                      direction. Clamped to >= 0 (a light
+                                      can only ADD; back faces to a light
+                                      contribute nothing, not negative).
+  2.  C   = BK + LCM * L            ; ambient plus each light's colour
+                                      scaled by how much that light hits
+                                      this normal.
+  3a. out = C                       ; "normal color" op (NCS/NCT): the raw
+                                      lit colour, ignoring material colour.
+  3b. out = C * RGBC                ; "normal color color" op (NCCS/NCCT):
+                                      the lit colour MODULATED by the
+                                      primitive's base colour (texture tint
+                                      or flat material colour).
+
+The result is pushed to the GTE colour FIFO and read back into a POLY_*
+primitive's RGB field(s).
+
+Op family (single = one normal; triple = three normals, e.g. a whole
+triangle's corners, in one instruction):
+
+  gte_ncs  / gte_nct     - Normal Color            (no material modulate)
+  gte_nccs / gte_ncct    - Normal Color Color      (modulate by RGBC)
+  gte_ncds / gte_ncdt    - Normal Color Depth-cued (adds FC fog blend)
+
+BASE-COLOUR GOTCHA: the "color color" ops (nccs/ncct) multiply by RGBC, and
+with RGBC = 128 (the nominal "1.0" base) that multiply HALVES the result -
+so a naive nccs setup renders at half the brightness a plain ncs gives from
+the same light/back matrices. This engine uses gte_ncs precisely to avoid
+that halving (it was the cause of an early "everything is too dark" bug -
+see section 5); reach for nccs only when you genuinely want to modulate a
+per-vertex material or texture colour, and account for the /2.
+
+Hard limits baked into the hardware:
+  - THREE directional lights maximum (LLM has three rows).
+  - ONE ambient term (BK).
+  - Lights are DIRECTIONAL only. There is no point-light or spotlight
+    primitive: distance falloff and cones are NOT computed by the GTE.
+
+
+2. COORDINATE SPACES (the part that bites)
+------------------------------------------
+
+The single most important fact: the LIGHT matrix (LLM) is SEPARATE from
+the ROTATION matrix (gte_SetRotMatrix) that transforms vertex POSITIONS.
+A lighting op multiplies the normal by LLM; a position op (rtps/rtpt)
+multiplies the vertex by the rotation matrix. They are independent.
+
+This is what lets lighting live in a different space than geometry, and
+it is exactly where a "camera headlamp" bug comes from:
+
+  - If you (mis)use the view*model matrix to rotate normals and read a
+    component, the "light" is whatever axis you read in CAMERA space ->
+    the lit side is always the side facing the camera. It ORBITS with the
+    viewer. (This is the legacy path in this engine; see section 5.)
+
+  - For a WORLD-FIXED light (a sun that stays put as the camera moves),
+    the light directions must be expressed in the same space as the
+    normals. Normals arrive in MODEL space, so per object you load the
+    light data composed with that object's rotation:
+
+        dot(sun_world, normal_world)
+      = dot(sun_world, R_model * normal_model)
+      = dot( R_model^T * sun_world , normal_model )
+
+    i.e. pre-rotate the world light direction by the object's INVERSE
+    (transpose) rotation and feed THAT as the light vector. Then the lit
+    side is fixed in the world regardless of camera.
+
+Because LLM and the rotation matrix are separate registers, you can hold
+gte_SetRotMatrix(view*model) for positions AND a world-space light setup
+simultaneously - adopting the hardware lighting path fixes the headlamp
+issue as a side effect.
+
+
+3. WHAT MAPS TO HARDWARE (and what does not)
+--------------------------------------------
+
+  Light type      GTE fit                              Runtime cost
+  --------------  -----------------------------------  ------------------
+  Ambient         BK back colour, directly             ~free (global add)
+  Directional     LLM row + LCM column (up to 3)       cheap, native
+  Spherical/Point NOT native - needs per-vertex        costly if true;
+                  distance attenuation                 cheap if faked
+  Spot            NOT native - point + cone mask        most costly / bake
+  (Debug headlamp) camera-axis dot, engine-specific    ~one op per normal
+
+Faking point/spot on PS1, common approaches:
+  - Per-object approximation: treat the point light as a directional
+    light aimed from the light to the object's centre, and scale its
+    intensity by distance ONCE per object (not per vertex). Cheap, but
+    flat across a large mesh.
+  - Per-vertex attenuation: compute a distance falloff per vertex on the
+    CPU and fold it into BK/intensity. Correct, but expensive.
+  - BAKE: evaluate the light per vertex OFFLINE and store the result as
+    vertex colours (see section 6). Zero runtime lighting cost.
+
+
+4. COST MODEL
+-------------
+
+  - A lighting op (ncs/nccs) is roughly one GTE op per vertex, ON TOP of
+    the rtps/rtpt you already pay to project that vertex. Lighting N
+    vertices with the hardware path ~ doubles per-vertex GTE work vs an
+    unlit draw. (This engine uses ncs - see section 5.)
+  - THREE-light budget forces a SELECTION problem: a scene with more than
+    three lights must pick, per object per frame, the three that matter
+    most (nearest / brightest) and pack LLM+LCM accordingly. That
+    per-object light pick is usually the real "lighting is expensive"
+    cost, more than the GTE ops themselves.
+  - STATIC geometry lit by STATIC lights need not pay any of this at
+    runtime: bake it (section 6).
+
+
+5. THIS ENGINE'S IMPLEMENTATION (main.c, current)
+-------------------------------------------------
+
+The renderer now uses the GTE hardware lighting path (gte_ncs) for real,
+in two selectable modes toggled by R2 in DEBUG mode (overlay shows
+LIGHT=GTE / LIGHT=HEADLAMP; sun_lighting flag). Lighting is precomputed
+per primitive into shared colour caches, so the draw loop carries NO
+lighting math - it just copies a colour.
+
+Two colour caches (shared scratch, one object at a time):
+  transformedFaceColors[]  - one CVECTOR per triangle  (flat / textured-flat)
+  transformedVertColors[]  - one CVECTOR per vertex     (Gouraud / tex-Gouraud)
+
+5.1 Frame setup - setup_frame_lighting() (once per frame, GTE mode)
+  Sets the FRAME-GLOBAL registers, which nothing between objects disturbs.
+  Light DIRECTIONS are NOT synthesised here - they are authored per stage by
+  load_stage_lights() (or zeroed when the stage authors none); there is no
+  hardcoded sun rebuilt from angles. This pass only:
+    - Applies each light's live EFFECTIVE INTENSITY: authored intensity
+      (g_light_dir_int[], captured by load_stage_lights - colours now bake
+      at UNIT intensity, channel << 7) plus the signed DEBUG offset
+      g_light_intensity_offset, clamped 0..2047 (256 == 1.0, ~8x max).
+      Applying intensity at frame time rather than baking it in is what
+      lets the DEBUG editor raise an authored intensity-0 light (a baked-in
+      multiply left it at colour 0 forever - the historical "sun at 0 never
+      changes" bug).
+    - SPLITS each light's effective intensity across the two matrices,
+      because their headroom differs wildly. The <= 1.0 part scales that
+      light's g_light_color_matrix COLUMN into the LCM. The > 1.0 part
+      instead scales that light's g_light_dir_matrix ROW into
+      g_light_dir_frame (a per-frame copy 5.2 consumes): the unit colour
+      bake sits essentially AT the LCM's int16 ceiling (white -> 32640 of
+      32767), so boosting through colour saturates after a fraction of one
+      tick and visibly does nothing - the historical "L2+Up doesn't
+      brighten" bug. The diffuse term colour*(dir.normal) is linear in both
+      factors and direction rows are ONE (4096) magnitude with 8x int16
+      headroom, so the boost lands there with the identical visual result.
+    - Sets BK = the g_ambient_* back colour.
+
+5.1b Spherical (point) lights - live per-object path (interim)
+  The GTE has no native point light (section 3), so load_stage_lights()
+  collects the stage's SPHERICAL lights (up to MAX_SPHERE_LIGHTS) and
+  compute_object_lighting() approximates each per object: a directional
+  aimed from the light at THIS object's centre, linear range attenuation
+  (atten = 1 - dist/range, range 0 == infinite) evaluated ONCE per object,
+  effective intensity = clamp(authored + L2 offset, 0, 2047) * atten. The
+  brightest spheres fill whichever of the 3 GTE slots the authored
+  directionals left free (directionals always win the slot budget), packed
+  exactly like a directional: unit toward-light row, unit colour bake
+  column, dim/boost split per 5.1. Flat across a large mesh - per-vertex
+  falloff is the offline bake's job (section 8). MOBILITY: the authored
+  static/dynamic flag (STAGE_LIGHT.isStatic, default static) is carried
+  through the pipeline now; until the bake exists BOTH kinds take this
+  live path, and when it lands, isStatic lights leave it for baked vertex
+  colours. The stage-gen PS1 preview evaluates spheres per FRAGMENT (the
+  bake-accurate reference), so in-game dynamic point light reads flatter
+  than the tool on large meshes.
+
+5.2 Per object - compute_object_lighting() (GTE path, sun_lighting == 1)
+  World-fixed lights: MulMatrix0(&g_light_dir_frame, &world_matrix, &lmtx)
+  composes the world light DIRECTIONS with THIS object's rotation, then
+  gte_SetLightMatrix(&lmtx). (This is the section-2 trick done the SDK way:
+  the light matrix is separate from the position matrix, so it never
+  disturbs composed_matrix.) Then a gte_ncs loop over the face normals
+  writes transformedFaceColors[], and - when use_vertex_light is on - over
+  the vertex normals into transformedVertColors[].
+
+  gte_ncs (NOT nccs) is used on purpose: output = clamp(ambient +
+  sum(light_colour * max(0, dir . normal)), 255), with NO base-colour
+  multiply and so NO /2 halving (see the section-1 gotcha). This gives
+  COLOURED, ONE-SIDED lighting for free - a face turned away from every
+  light clamps to the ambient floor, no abs() needed.
+
+  ORDERING: compute_object_lighting() runs AFTER transform_object_
+  vertices() - MulMatrix0 can disturb the rotation-matrix registers, and
+  the headlamp branch below reads composed_matrix via gte_rtv0, so
+  projecting positions first keeps both correct.
+
+5.3 Legacy "debug headlamp" (sun_lighting == 0)
+  The same compute_object_lighting() function, other branch: rotate each
+  normal by composed_matrix (view*model, still loaded) with gte_rtv0 and
+  read vz as a grayscale, TWO-SIDED (abs), camera-locked brightness with a
+  +32 ambient floor - written into the SAME colour caches so the draw loop
+  is identical. This is the engine's original look, kept for comparison.
+
+5.4 Draw primitives (draw_object_into_ot)
+  Per triangle, after cull, one of four primitive types just copies a
+  cached colour - no lighting math here:
+    POLY_F3  - flat        (transformedFaceColors[tri])
+    POLY_G3  - Gouraud     (transformedVertColors[v0/v1/v2])
+    POLY_FT3 - textured flat    (face colour MODULATES the texel)
+    POLY_GT3 - textured Gouraud (vertex colours modulate the texel)
+  use_vertex_light (TRIANGLE) picks flat vs Gouraud; use_texture (SQUARE)
+  picks textured vs untextured.
+
+5.5 The 1024-normal scaling quirk (why authored colours bake so high)
+  This engine's normals are stored at magnitude 1024 (a QUARTER of ONE), so
+  the GTE's normal dot lands ~1/4 of a textbook setup. To compensate,
+  load_stage_lights() bakes each authored directional colour to ~8*ONE at
+  UNIT intensity (channel << 7; the authored intensity is stored aside in
+  g_light_dir_int[] and applied live per frame - see 5.1). Migrating the
+  converter to ONE-length normals later would let the bake drop ~4x. (The
+  headlamp's Z>>2 was tuned for the same 1024 normals.)
+
+5.6 Live tuning (DEBUG mode, hold L2)
+  A live INTENSITY EDITOR (stage-gen style, NOT a multiplier): Up/Down moves
+  g_light_intensity_offset, a signed shift added to every authored
+  directional's intensity; each light's effective value clamps 0..2047
+  (256 == 1.0, ~8x max, where a boosted direction row would hit ITS int16
+  ceiling - see 5.1). Because the offset is ADDITIVE, an authored
+  intensity-0 light responds too. The overlay prints LIGHT INT (the three
+  effective per-light values, same 256==1.0 scale as stage-gen's Intensity
+  field - INT=128 is Intensity 0.5 in the tool) and OFS (the offset).
+  Direction is authored per stage (see 5.7), so there are no pitch/yaw
+  controls - there is nothing to aim at runtime.
+
+5.6b Per-light Disabled tickbox (STAGE_LIGHT.disabled)
+  Every Light entity carries a `Disabled` bool (any type). A disabled
+  light is STILL exported to stage.json and STILL baked into
+  STAGE_LIGHT[] - it stays authoritative authored data (nothing
+  resurrects in its place) - but load_stage_lights() skips it entirely:
+  no GTE slot, no ambient sum, no sphere-list entry. The stage-gen PS1
+  preview applies the same skip. Distinct from intensity 0: an
+  intensity-0 light is off-but-L2-raiseable in DEBUG (5.6); a DISABLED
+  light is immune to the L2 editor - off means off. Missing field
+  (older exports) == enabled.
+
+5.7 Known simplifications (intentional, current)
+  - NO RECOVERY SUN: lighting is authored entirely per stage. load_stage_
+    lights() overwrites g_light_dir_matrix / g_light_color_matrix / ambient
+    from the stage's Light entities, and ZEROES any it does not author. A
+    stage with no authored directional has no directional light; a stage with
+    no authored ambient has no ambient. Nothing is invented - author a Light
+    (stage-gen seeds every new stage with a default directional "Sun"; delete
+    it and the stage is genuinely unlit).
+  - INTENSITY 0 == OFF, but still AUTHORITATIVE: an authored light at
+    intensity 0 is exported and consumed (effective intensity 0), so it
+    contributes nothing yet still counts as authored - it does NOT resurrect
+    any default, because there is none. The DEBUG L2 editor (5.6) can raise
+    it live for previewing, since intensity is applied per frame rather than
+    baked into the colours.
+  - APPLIED TO EVERY object (not just actors), so lighting is visible on any
+    test model before the baked/dynamic split exists.
+  - NON-UNIFORM SCALE skews normals (they want the inverse-transpose) and
+    scales brightness via world_matrix; ignored deliberately (actors draw
+    at identity scale).
+
+
+6. THE HYBRID ARCHITECTURE + DATA PIPELINE (status)
+---------------------------------------------------
+
+Target: BAKE static-lit static geometry offline (zero runtime cost) and
+light DYNAMIC actors live with the GTE. Split by OBJECT rather than adding
+per vertex, because the "color color" op MULTIPLIES rather than ADDs, so
+"baked + dynamic" on one vertex would need a CPU add - splitting (baked
+world, live-lit actors) sidesteps that. The pieces, and where they stand:
+
+  DONE - Runtime GTE engine (section 5). Coloured, one-sided, world-fixed,
+         up to 3 directional + ambient, via gte_ncs, applied to every object.
+         Driven entirely by the active stage's authored lights (no fallback).
+
+  DONE - Authoring: the stage-gen Light entity (PS1STAGEGEN_EXTRA_SEMANTICS
+         section 6b) - lightType, colour, intensity, range, cone, penumbra.
+
+  DONE - Export (stage_export.js): a "lights" array, positions/range *1024,
+         colour as 0-255 RGB, PLUS a precomputed world-space unit direction
+         TOWARD the light (lightDirFromRot: aim is the light's -Z, negated,
+         remapped viewport->renderer). Computing the direction in JS keeps
+         all the trig in one testable place and avoids a degrees-vs-fixed-
+         point ambiguity downstream.
+
+  DONE - Convert (py_convert_stages.py): a resident STAGE_LIGHT[] per stage
+         (type byte, dir SVECTOR ONE==4096, pos, r/g/b, intensity 256==1.0,
+         range, coneAngle 12-bit, penumbra 0..4096), LIGHT_* type defines,
+         and lights/lightCount wired into STAGE_DEF + the registry - exactly
+         how STAGE_SOUND graduated. Absent-lights stages stay NULL,0.
+
+  DONE - Runtime consumption (main.c load_stage_lights, called from
+         load_stage): reads the active stage's STAGE_LIGHT[] and builds
+         g_light_dir_matrix / g_light_color_matrix / back colour from the
+         authored DIRECTIONAL (up to 3) + AMBIENT lights. Directional colour
+         columns use (channel * intensity) >> 1 for a ~8*ONE white light at
+         intensity 1.0; ambient sums into the back colour. A stage with no
+         authored directionals gets NO directional light (all slots zeroed) -
+         there is no recovery sun. Overlay shows SRC=AUTHORED(n) / NONE(0).
+
+  DONE - Live spherical (point) lights, per-object approximation (5.1b):
+         direction + linear range attenuation at the object's centre, the
+         brightest spheres packed into free GTE slots. Interim path for
+         BOTH mobilities (STAGE_LIGHT.isStatic authored in stage-gen,
+         default static) until the bake below claims the static ones.
+
+  TODO - Offline vertex BAKING of spherical/spot (task #6): evaluate the
+         non-GTE-native lights per vertex OFFLINE and store the result as
+         per-instance vertex colours, so static geometry pays ZERO runtime
+         lighting cost. This is the cost optimisation; the DIRECTIONAL+
+         AMBIENT dynamic path above delivers correctness first. Full design
+         sketch in SECTION 8.
+
+
+7. REGISTER / OP CHEAT-SHEET
+----------------------------
+
+  gte_SetLightMatrix(&m)  - LLM: rows are up to 3 light DIRECTIONS.
+  gte_SetColorMatrix(&m)  - LCM: columns are the 3 lights' RGB.
+  gte_SetBackColor(r,g,b) - BK : ambient RGB added to every vertex.
+  gte_SetRotMatrix(&m)    - rotation matrix for POSITIONS (independent of
+                            LLM - this separation is the section-2 point).
+  MulMatrix0(&a,&b,&c)    - c = a * b (3x3, ignores translation). Used to
+                            compose world light dirs with an object's
+                            rotation for world-fixed lighting.
+  (RGBC via the primitive/base colour) - material colour nccs modulates.
+
+  gte_ncs  / gte_nct      - light colour only (ignore material colour).
+                            THIS ENGINE USES ncs (no /2 halving).
+  gte_nccs / gte_ncct     - light colour * material colour (single/triple;
+                            halves at RGBC 128 - see section 1 gotcha).
+  gte_ncds / gte_ncdt     - as nccs plus far-colour depth cue (fog).
+
+  Limits: 3 directional lights + 1 ambient. No point/spot in hardware.
+  Directions/normals in the same space - here via MulMatrix0(lightDirs,
+  world_matrix) per object. Normals unit == 1024 here; matrices unit == 4096.
+
+
+8. PLANNED: OFFLINE VERTEX-BAKING OF STATIC POINT/SPOT LIGHTS (task #6)
+----------------------------------------------------------------------
+
+NOT STARTED. This is the remaining piece of the section-6 hybrid and the
+reason spherical/spot lights are carried through the pipeline but not yet
+lit at runtime. What follows is the intended design, not current behaviour.
+
+8.1 Why bake
+  Spherical (point) and spot lights are NOT GTE-native (section 3): the
+  hardware only dots a normal against directional vectors, so distance
+  falloff and cone masks would have to be computed per vertex on the CPU
+  every frame - expensive - and they would burn the scarce 3-light budget.
+  But stage geometry and its lights are STATIC. Anything static lit by
+  something static can be evaluated ONCE, offline, and stored as vertex
+  colours. Runtime lighting cost for those objects then drops to ZERO (not
+  even a gte_ncs) - cheaper than the dynamic path they use today.
+
+8.2 What gets baked, and where
+  The bake belongs in py_convert_stages.py - the STAGE layer is the only
+  one that knows BOTH the placements (per-instance pos/rot/scale) AND the
+  world-space lights. The model converter only sees a model's local
+  geometry. Per placed static instance the converter will:
+    1. Load that model's baked verts + vertex normals (from
+       generated/<model>.c, or a machine-readable dump py_convert_assets.py
+       emits for this purpose).
+    2. Transform each vert + normal to WORLD space by the instance's
+       pos/rot/scale.
+    3. For each spherical/spot (and any static ambient/directional) light,
+       accumulate a per-vertex contribution (8.3).
+    4. Quantise the summed RGB to 0..255 and emit a per-INSTANCE colour
+       array (one CVECTOR per model vert).
+  Per-INSTANCE, not per-model: two placements of the same model sitting in
+  different light must differ, so the colours cannot live on the shared
+  model data - they attach to the placement.
+
+8.3 Per-vertex lighting math (per light, summed)
+  L    = normalize(lightPos - vertPos)          ; world-space, per vertex
+  diff = max(0, dot(N_world, L))                ; Lambert term
+  SPHERICAL: atten = range==0 ? 1 : clamp(1 - dist/range, 0, 1)  (linear;
+             an inverse-square approx is an option)
+             contribution = colour * intensity * atten * diff
+  SPOT:      as spherical, times a cone mask:
+             c = dot(-aim, L)  (aim = the light's forward)
+             mask = smoothstep(cos(coneAngle), cos(coneAngle*(1-penumbra)), c)
+             contribution = colour * intensity * atten * diff * mask
+  AMBIENT (static): added flat, no diff/atten.
+  Sum all lights, clamp per channel to 255.
+
+8.4 Runtime consumption
+  A static, baked object draws straight from its per-instance colour array:
+  draw_object_into_ot() reads bakedColors[tri->v*] into POLY_G3/GT3 and
+  SKIPS compute_object_lighting() entirely (no normal pass, no gte_ncs).
+  A per-object "baked vs dynamic" flag selects the path. Per section 6 the
+  split is by OBJECT: static stage objects = baked; spawned actors = the
+  live GTE sun. They are NOT combined per vertex, because gte_ncs
+  MULTIPLIES the base colour rather than ADDing, so a baked-plus-dynamic
+  vertex would need a CPU add - the object split avoids that.
+
+8.5 Open decisions (to settle when #6 starts)
+  - How baked colours attach: a new STAGE_OBJECT field (pointer + count) vs
+    a parallel per-stage array indexed by object.
+  - How the converter reaches model geometry: parse generated/<model>.c, or
+    have py_convert_assets.py emit a small vert/normal side-file.
+  - Data size: an RGB triple per vert per placement inflates stage data -
+    the real cost of baking. Mitigations: quantise, dedupe identical
+    instances, or just accept it (PS1 stages are small).
+  - Non-uniform scale: normals need the inverse-transpose when transforming
+    to world space (unlike the runtime path, which ignores this).
+
+
+NOTE ON SCOPE: sections 1-4 and 7 are generic PS1/GTE reference and hold
+for any PlayStation 1 renderer. Sections 5, 6 and 8 are specific to THIS
+engine and will drift as main.c and the converters change - treat main.c
+(setup_frame_lighting, compute_object_lighting, load_stage_lights,
+draw_object_into_ot) and py_convert_stages.py (STAGE_LIGHT) as the source
+of truth for what is actually running. Section 8 is a PLAN, not code.

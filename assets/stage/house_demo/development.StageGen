@@ -170,9 +170,9 @@
       "name": null,
       "parentId": null,
       "pos": {
-        "x": 0.095,
-        "y": 0.826,
-        "z": 5.871
+        "x": -0.5,
+        "y": 0.5,
+        "z": 5.5
       },
       "rot": {
         "x": 0,
@@ -364,7 +364,7 @@
         "z": 1
       },
       "props": {
-        "sample": "TESTING",
+        "sample": "TESTING2",
         "volume": 0.5,
         "mode": "music",
         "fadeOnStageEnter": true,
@@ -376,8 +376,70 @@
         "muteAfterPlay": false,
         "autoplay": false
       }
+    },
+    {
+      "id": 19,
+      "kind": "light",
+      "name": "Sphere Light",
+      "parentId": null,
+      "pos": {
+        "x": 0.501,
+        "y": 0.343,
+        "z": 1.669
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "lightType": "spherical",
+        "disabled": true,
+        "mobility": "static",
+        "color": "#ffffff",
+        "intensity": 1,
+        "range": 5,
+        "coneAngle": 30,
+        "penumbra": 0.2
+      }
+    },
+    {
+      "id": 20,
+      "kind": "light",
+      "name": "Sun",
+      "parentId": null,
+      "pos": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "rot": {
+        "x": -45,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "lightType": "directional",
+        "disabled": false,
+        "mobility": "static",
+        "color": "#ffffff",
+        "intensity": 1,
+        "range": 5,
+        "coneAngle": 30,
+        "penumbra": 0.2
+      }
     }
   ],
-  "nextId": 18,
+  "nextId": 21,
   "nextSpawnId": 5
 }

@@ -66,6 +66,10 @@
       <button id="view-side" class="btn tb-btn" title="Side view (Numpad 3)">Side</button>
       <button id="view-reset" class="btn tb-btn" title="Reset the orbit camera">Reset</button>
       <button id="view-grid" class="btn tb-btn" title="Toggle grid (G)">Grid</button>
+      <label class="tb-check" title="Show missing-texture materials as solid white instead of magenta. Under the PS1 shading preview, a white untextured face displays the raw lit colour - a live probe of the exact brightness the runtime would output.">
+        <input type="checkbox" id="f-missing-white">
+        <span>Missing=White</span>
+      </label>
     </div>
 
     <div class="toolbar-spacer"></div>
@@ -94,7 +98,7 @@
       <dt>F</dt><dd>Toggle Freecam (WASD + mouse-look). Space toggles Walk mode (gravity + ground snap). Esc exits.</dd>
     </dl>
     <h3>Viewport</h3>
-    <p>Drag a model from the Assets tab into the viewport to place it under the cursor (it rests on whatever surface is there), or double-click the model to drop it at the center of the view. Drag the axis gizmo (top-right of the viewport) to snap the view, like Blender's. Number fields are drag-to-scrub: drag vertically to nudge, click to type.</p>
+    <p>Drag a model from the Assets tab into the viewport to place it under the cursor (it rests on whatever surface is there), or double-click the model to drop it at the center of the view. Drag the axis gizmo (top-right of the viewport) to snap the view, like Blender's. The Editor/PS1 toggle next to it switches between unlit editing and a preview of the runtime's GTE lighting from the stage's authored Lights. Number fields are drag-to-scrub: drag vertically to nudge, click to type.</p>
   </div>
 
   <div class="workbench">
@@ -199,6 +203,14 @@
     <main class="main">
       <canvas id="viewport-canvas"></canvas>
       <canvas id="viewport-gizmo-canvas"></canvas>
+      <!-- Blender-style shading toggle (top-right, left of the axis gizmo):
+           Editor = unlit full-bright textures; PS1 = live preview of the
+           runtime's GTE lighting driven by this stage's authored Light
+           entities. See viewer.js's "PS1 lighting parity preview" section. -->
+      <div id="viewport-shading-toggle" class="shading-toggle" aria-label="Viewport lighting">
+        <button id="shading-editor" class="shading-btn is-active" title="Editor lighting: unlit, full-bright textures">Editor</button>
+        <button id="shading-ps1" class="shading-btn" title="PS1 lighting: preview the runtime's GTE lighting from this stage's authored Lights (directional + ambient; spherical/spot await the vertex bake)">PS1</button>
+      </div>
       <div id="freecam-indicator" class="freecam-indicator hidden"></div>
     </main>
 

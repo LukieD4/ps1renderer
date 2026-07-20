@@ -165,6 +165,80 @@ export const ENTITY_KINDS = {
       { key: 'autoplay', label: 'Autoplay',       type: 'bool',   default: true },
     ],
   },
+  light: {
+    // Scene light marker. EXPORTED to stage.json (the second kind to
+    // graduate after Sound): py_convert_stages.py bakes lights into
+    // STAGE_LIGHT[] and main.c's load_stage_lights() consumes DIRECTIONAL
+    // (up to 3) + AMBIENT into the GTE's light/colour/back registers.
+    // Spherical/spot are carried through the data but await the offline
+    // vertex-baking pass before they light anything. Lighting is
+    // expensive on PS1 - the GTE natively affords ~3 directional vectors
+    // plus one ambient (back) color; spherical/spot are CPU
+    // approximations - so `lightType` is a deliberate single-select (like
+    // Sound's Play Mode) rather than stackable toggles, and per-type
+    // fields are showIf-gated so authors only see what a given type uses.
+    label: 'Light',
+    hint: 'Scene light (spherical / directional / spot / ambient / debug)',
+    color: '#ffe066',
+    props: [
+      // The type selector. Changing it re-renders the panel (renderEntity
+      // Props on a select commit), so the type-specific fields below
+      // appear/disappear immediately - same mechanism as Sound's mode.
+      { key: 'lightType', label: 'Light Type', type: 'select', default: 'spherical',
+        options: [
+          { value: 'spherical',   label: 'Spherical Light' },
+          { value: 'directional', label: 'Directional Light' },
+          { value: 'spot',        label: 'Spot Light' },
+          { value: 'ambient',     label: 'Ambient Light' },
+          { value: 'debug',       label: 'Debug Light (legacy headlamp)' },
+        ] },
+      // Disabled: authoring kill switch for THIS light, shown for every
+      // type. The light is still EXPORTED to stage.json - it stays in the
+      // data and stays AUTHORITATIVE (a disabled directional does not
+      // resurrect any default; there is none) - the runtime just skips
+      // applying it, and the PS1 viewport preview does the same. Unlike
+      // intensity 0 (off but L2-raiseable in DEBUG), a disabled light is
+      // immune to the DEBUG intensity editor too: off means off.
+      { key: 'disabled', label: 'Disabled', type: 'bool', default: false },
+      // Static vs dynamic (spherical/spot only): STATIC lights are destined
+      // for the offline vertex bake - evaluated once at convert time into
+      // static geometry's vertex colours, zero runtime cost. DYNAMIC lights
+      // are computed live per object every frame (they compete for the
+      // GTE's free light slots). Until the bake exists the runtime lights
+      // BOTH kinds via the live per-object path, so the flag is authored
+      // now and stages won't need re-touching when the bake lands.
+      // Directional/ambient are GTE-native and always live - hidden there.
+      { key: 'mobility', label: 'Mobility', type: 'select', default: 'static',
+        showIf: (props) => props.lightType === 'spherical' || props.lightType === 'spot',
+        options: [
+          { value: 'static',  label: 'Static (bakeable)' },
+          { value: 'dynamic', label: 'Dynamic (live)' },
+        ] },
+      // Color + intensity apply to every type. The viewport tints the
+      // marker core with `color` for live feedback; intensity is a plain
+      // 0-1 human float py_convert_stages.py scales to fixed point
+      // (256 == 1.0), mirroring how Sound's 0-1 volume bakes to the
+      // SPU's 0..0x3fff. NOTE: for directionals the runtime's colour
+      // scale saturates just past 1.0 - values above ~1.0 clamp, so keep
+      // authored intensity in 0-1.
+      { key: 'color',     label: 'Color',        type: 'color',  default: '#ffffff' },
+      { key: 'intensity', label: 'Intensity (0-1)', type: 'number', default: 1.0 },
+      // Spherical + spot: distance falloff radius in viewport units
+      // (*1024 at export when this graduates). 0 = no distance falloff.
+      // Directional (a sun) and ambient (global) have no position, so it
+      // is hidden for them.
+      { key: 'range', label: 'Range (0=infinite)', type: 'number', default: 5,
+        showIf: (props) => props.lightType === 'spherical' || props.lightType === 'spot' },
+      // Spot only: cone half-angle (degrees) + edge softness. Direction is
+      // the entity's own -Z, set with the rotation gizmo (the viewport
+      // draws a cone + forward pointer), so there is no separate direction
+      // field - rotation IS the aim, same convention as Spawn's pointer.
+      { key: 'coneAngle', label: 'Cone Angle (deg)', type: 'number', default: 30,
+        showIf: (props) => props.lightType === 'spot' },
+      { key: 'penumbra', label: 'Edge Softness (0-1)', type: 'number', default: 0.2,
+        showIf: (props) => props.lightType === 'spot' },
+    ],
+  },
 };
 
 export class StageState {
@@ -220,6 +294,24 @@ export class StageState {
     // and so the Delete key has a folder target.
     this.selectedFolderId = null;
     this.nextId = 1;
+
+    // Default directional "sun" - the lighting counterpart to the default
+    // camera above. A fresh stage always starts with ONE directional light
+    // so authored lighting matches what actually ships: the runtime's
+    // load_stage_lights() only steers off authored directionals, otherwise
+    // it falls back to its hardcoded sun. Pre-placing this makes that sun
+    // visible and editable instead of an invisible default the author can't
+    // see. rot.x = -45 (pitched down, aiming from above-and-front) makes its
+    // exported direction reproduce that fallback exactly ({0,-2896,-2896}),
+    // so a brand-new stage looks identical whether or not this is touched.
+    // Loading a project REPLACES entities (app.js), so this is never
+    // duplicated onto a saved stage - it only seeds new ones.
+    const sun = this.addEntity('light');
+    if (sun) {
+      sun.name = 'Sun';
+      sun.props.lightType = 'directional';
+      sun.rot.x = -45;
+    }
   }
 
   /**
@@ -458,6 +550,94 @@ export class StageState {
     };
     this.entities.push(clone);
     return clone;
+  }
+
+  /**
+   * Serialize a node (instance OR entity) by id into a plain,
+   * id-free data object suitable for the clipboard - copy/paste's
+   * counterpart to duplicate. Deliberately drops id/parentId (paste mints
+   * fresh ones) and deep-copies transform/props so the buffer never
+   * aliases live state. Returns null if the id resolves to neither.
+   */
+  serializeNode(id) {
+    const inst = this.getInstance(id);
+    if (inst) {
+      return {
+        nodeType: 'instance',
+        model: inst.model,
+        palette: inst.palette,
+        name: inst.name,
+        pos: { ...inst.pos },
+        rot: { ...inst.rot },
+        scale: { ...inst.scale },
+      };
+    }
+    const ent = this.getEntity(id);
+    if (ent) {
+      return {
+        nodeType: 'entity',
+        kind: ent.kind,
+        name: ent.name,
+        pos: { ...ent.pos },
+        rot: { ...ent.rot },
+        scale: { ...ent.scale },
+        props: { ...ent.props },
+      };
+    }
+    return null;
+  }
+
+  /**
+   * Create a fresh instance/entity from a serializeNode() payload (the
+   * paste half of copy/paste). Mints a new id (and a fresh unique spawn ID
+   * for spawn-like entities, exactly like duplicateEntity, so a pasted
+   * spawn is never born colliding with its source). Unknown/invalid
+   * payloads return null. Returns { node, type } for the caller to render.
+   */
+  createNodeFromData(data, parentId = null) {
+    if (!data || typeof data !== 'object') return null;
+
+    if (data.nodeType === 'instance') {
+      const instance = {
+        id: this.nextId++,
+        model: data.model,
+        palette: data.palette ?? 0,
+        name: data.name ?? null,
+        parentId,
+        pos: { x: 0, y: 0, z: 0, ...(data.pos || {}) },
+        rot: { x: 0, y: 0, z: 0, ...(data.rot || {}) },
+        scale: { x: 1, y: 1, z: 1, ...(data.scale || {}) },
+      };
+      this.instances.push(instance);
+      return { node: instance, type: 'instance' };
+    }
+
+    if (data.nodeType === 'entity') {
+      const def = ENTITY_KINDS[data.kind];
+      if (!def) return null;
+      // Start from the kind's defaults, overlay the copied props, then
+      // re-mint any unique spawn IDs so the paste can't duplicate one.
+      const props = {};
+      for (const propDef of def.props) props[propDef.key] = propDef.default;
+      Object.assign(props, data.props || {});
+      for (const propDef of def.props) {
+        if (propDef.uniqueSpawnId) props[propDef.key] = this.nextSpawnId++;
+      }
+      const entity = {
+        id: this.nextId++,
+        kind: data.kind,
+        name: data.name ?? null,
+        parentId,
+        pos: { x: 0, y: 0, z: 0, ...(data.pos || {}) },
+        rot: { x: 0, y: 0, z: 0, ...(data.rot || {}) },
+        scale: { x: 1, y: 1, z: 1, ...(data.scale || {}) },
+        props,
+      };
+      this.entities.push(entity);
+      return { node: entity, type: 'entity' };
+    }
+
+    return null;
   }
 
   /**

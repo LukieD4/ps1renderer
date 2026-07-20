@@ -148,13 +148,22 @@ function round3(value) {
  * needed for those callers.
  */
 function resyncViewportFromState() {
-  const desiredIds = new Set([
-    ...state.instances.map((inst) => inst.id),
-    ...state.entities.map((ent) => ent.id),
-  ]);
+  // Purge any tracked viewport object that the new state no longer wants -
+  // either the id is gone entirely, OR the id has been REUSED for a
+  // different model/kind (project load renumbers from scratch, so stage B's
+  // instance #3 can collide with stage A's #3 while being a different
+  // model). Comparing identity, not just presence, stops the old mesh from
+  // surviving under the reused id and leaking into the loaded stage.
+  const trackedMeta = viewer.getTrackedInstanceMeta();
+  const desiredInstModel = new Map(state.instances.map((inst) => [inst.id, inst.model]));
+  const desiredEntKind = new Map(state.entities.map((ent) => [ent.id, ent.kind]));
 
   for (const trackedId of viewer.getTrackedInstanceIds()) {
-    if (!desiredIds.has(trackedId)) {
+    const meta = trackedMeta.get(trackedId);
+    const stillValid = meta.isEntity
+      ? desiredEntKind.get(trackedId) === meta.kind
+      : desiredInstModel.get(trackedId) === meta.modelName;
+    if (!stillValid) {
       viewer.removeInstance(trackedId);
     }
   }
@@ -665,6 +674,85 @@ function duplicateInstance(id) {
   updateUI();
 }
 
+// Copy/paste clipboard. The in-memory buffer is the source of truth: it
+// always works, including in Firefox, where web pages can't READ the system
+// clipboard (navigator.clipboard.readText is unavailable to page scripts).
+// On copy we ALSO best-effort WRITE the payload to the system clipboard
+// (that IS allowed in Firefox on a user gesture), so a paste in another tab
+// - or any browser that does grant readText - can pick it up too.
+let internalClipboard = null;
+const CLIPBOARD_TAG = '__stagegen_node__';
+
+/**
+ * Ctrl+C: serialize the selected instance/entity into the clipboard.
+ * No-op when nothing (or a folder) is selected. Mirrors Ctrl+D's "operate
+ * on the current selection" contract.
+ */
+async function copySelection() {
+  if (state.selectedInstanceId === null) return;
+  const data = state.serializeNode(state.selectedInstanceId);
+  if (!data) return;
+
+  internalClipboard = data;
+  try {
+    // Best-effort only - a rejection (permissions, no gesture, etc.) leaves
+    // internalClipboard as the working copy, so paste still functions.
+    await navigator.clipboard.writeText(JSON.stringify({ [CLIPBOARD_TAG]: 1, data }));
+  } catch (_) {
+    /* system clipboard unavailable - internal buffer covers paste */
+  }
+  showInfo('Copied.');
+}
+
+/**
+ * Ctrl+V: paste whatever's on the clipboard as a new node, selected. Tries
+ * the system clipboard first (so a copy from another tab pastes here where
+ * the browser allows reads), then falls back to the in-memory buffer -
+ * which is the path Firefox always takes.
+ */
+async function pasteSelection() {
+  let data = null;
+  try {
+    const text = await navigator.clipboard.readText();
+    const parsed = JSON.parse(text);
+    if (parsed && parsed[CLIPBOARD_TAG] && parsed.data) data = parsed.data;
+  } catch (_) {
+    /* no system read (Firefox / no permission) - use the internal buffer */
+  }
+  if (!data) data = internalClipboard;
+  if (!data) return;
+
+  // Paste into the selected folder if one is active, otherwise the tree
+  // root - the same target New-asset placement uses.
+  const parentId = state.selectedFolderId ?? null;
+
+  pushHistory(state);
+  markDirty();
+  const created = state.createNodeFromData(data, parentId);
+  if (!created) return;
+
+  const { node, type } = created;
+  if (type === 'instance') {
+    const modelData = state.models.get(node.model);
+    if (modelData) {
+      viewer.addInstance(node.id, node.model, node, modelData.materialsMap);
+      viewer.updateInstancePaletteRow(node.id, node.palette);
+    } else {
+      // Model isn't loaded this session (e.g. pasted from another tab before
+      // its assets folder was opened) - it lives in state and the tree now,
+      // and resyncViewportFromState() will spawn it once the model loads.
+      showInfo(`Pasted "${node.model}" - open its assets folder to see it in 3D.`);
+    }
+  } else {
+    viewer.addEntityHelper(node.id, node.kind, node, node.props);
+  }
+
+  state.selectedInstanceId = node.id;
+  state.selectedFolderId = null;
+  viewer.selectInstance(node.id);
+  updateUI();
+}
+
 /**
  * Delete a single instance by id, after an in-page confirm dialog
  * (modal.js - our own HTML prompt, NOT window.confirm(): native prompts
@@ -1114,7 +1202,11 @@ function applyInstanceField(inputEl, path, { pushUndo, fullRerender }) {
   if (group === 'palette') {
     viewer.updateInstancePaletteRow(id, value);
   } else {
-    viewer.setInstanceTransform(id, { [group]: state.getInstance(id)[group] });
+    // The transform fields are shared between model instances and editor
+    // entities (spawn/light/etc.), so resolve either - getInstance() alone
+    // returns null for an entity and crashed on the [group] read.
+    const node = state.getInstance(id) || state.getEntity(id);
+    if (node) viewer.setInstanceTransform(id, { [group]: node[group] });
   }
 
   if (fullRerender) {
@@ -1294,6 +1386,32 @@ btnViewTop.addEventListener('click', () => viewer.setViewportView('top'));
 btnViewSide.addEventListener('click', () => viewer.setViewportView('side'));
 btnViewReset.addEventListener('click', () => viewer.resetViewportCamera());
 document.getElementById('view-grid').addEventListener('click', () => viewer.toggleGridVisible());
+
+// Viewport shading toggle (top-right overlay, Blender-style): Editor =
+// unlit full-bright textures, PS1 = live preview of the runtime's GTE
+// lighting from this stage's authored Light entities (see viewer.js's
+// "PS1 lighting parity preview" section for exactly what is emulated).
+// Editor preference only - not undo history, not the project file.
+const shadingEditorBtn = document.getElementById('shading-editor');
+const shadingPs1Btn = document.getElementById('shading-ps1');
+
+function setViewportShading(ps1) {
+  viewer.setPS1LightingEnabled(ps1);
+  shadingEditorBtn.classList.toggle('is-active', !ps1);
+  shadingPs1Btn.classList.toggle('is-active', ps1);
+}
+
+shadingEditorBtn.addEventListener('click', () => setViewportShading(false));
+shadingPs1Btn.addEventListener('click', () => setViewportShading(true));
+
+// Missing=White (View group): render missing-texture materials solid white
+// instead of magenta. Pairs with the PS1 shading preview as a brightness
+// probe (an untextured white face shows the raw lit colour). Editor
+// preference only, like the shading toggle.
+const fMissingWhite = document.getElementById('f-missing-white');
+fMissingWhite.addEventListener('change', () => {
+  viewer.setMissingTextureWhite(fMissingWhite.checked);
+});
 
 // ==========================================================================
 // Toolbar: file group - Load / Save / Export
@@ -1516,6 +1634,8 @@ window.addEventListener('keydown', (event) => {
     ((event.ctrlKey || event.metaKey) && event.shiftKey && event.key.toLowerCase() === 'z') ||
     ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'y');
   const isDuplicate = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 'd';
+  const isCopy = (event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'c';
+  const isPaste = (event.ctrlKey || event.metaKey) && !event.shiftKey && event.key.toLowerCase() === 'v';
   const isDelete = event.key === 'Delete' || event.key === 'Backspace';
   const isSave = (event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's';
 
@@ -1557,6 +1677,15 @@ window.addEventListener('keydown', (event) => {
     } else if (state.getEntity(state.selectedInstanceId)) {
       duplicateEntity(state.selectedInstanceId);
     }
+  } else if (isCopy) {
+    // Only claim Ctrl+C when we actually have a node to copy; otherwise let
+    // the browser's own copy (e.g. of selected page text) proceed.
+    if (state.selectedInstanceId === null) return;
+    event.preventDefault();
+    copySelection();
+  } else if (isPaste) {
+    event.preventDefault();
+    pasteSelection();
   } else if (isDelete) {
     // Backspace's browser default is "navigate back" on some pages when
     // focus isn't in a text field - preventDefault() unconditionally here
@@ -1681,6 +1810,21 @@ function renderEntityProps(ent) {
       select.value = valid ? current : propDef.default;
       select.addEventListener('change', () => commit(select.value, select));
       label.appendChild(select);
+      entityPropsBodyEl.appendChild(label);
+    } else if (propDef.type === 'color') {
+      // Native color swatch. The committed value is the browser's
+      // lowercase '#rrggbb' hex string (commit treats it like a string -
+      // no numeric parse), which persists verbatim in the project file and
+      // round-trips through the schema-default merge on load.
+      const label = document.createElement('label');
+      label.className = 'field-full';
+      label.textContent = propDef.label;
+      const input = document.createElement('input');
+      input.type = 'color';
+      input.className = 'color-field';
+      input.value = ent.props[propDef.key] ?? '#ffffff';
+      input.addEventListener('change', () => commit(input.value, input));
+      label.appendChild(input);
       entityPropsBodyEl.appendChild(label);
     } else {
       const label = document.createElement('label');
@@ -1985,4 +2129,9 @@ viewer.onFreecamChange(({ active, walk }) => {
 });
 
 viewer.initViewer(canvasEl, gizmoCanvasEl);
+// Seed the viewport from the initial StageState BEFORE the first paint -
+// the constructor pre-places entities (the default directional "Sun"), and
+// nothing else calls resync at boot, so without this they'd exist in state
+// (and the tree) but never render in 3D.
+resyncViewportFromState();
 updateUI();

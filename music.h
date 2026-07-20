@@ -77,3 +77,14 @@ void music_set_volume(int left, int right);
 int      music_voices_active(void);   // music voices currently keyed on
 uint32_t music_spu_used(void);        // bytes of SPU RAM the bank occupies
 int      music_loaded(void);
+
+// FIRST failure step of the last music_load() (SND_ERR_* in sound.h;
+// +SND_ERR_SEQ_BASE when the SEQ, not the VAB, failed; SND_ERR_NONE =
+// loaded clean). Shown as MUSERR= on the overlay - pinpoints where a
+// hardware-only load failure died from a single photographed frame.
+int      music_last_error(void);
+
+// Where the loaded pair came from: 0 = nothing loaded, 1 = CD (tier 1),
+// 2 = the copy embedded in the EXE (tier 2 fallback - CD path failed,
+// see music_last_error() for where). Overlay SRC=-/CD/EMB.
+int      music_source(void);

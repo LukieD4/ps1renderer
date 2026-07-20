@@ -1,0 +1,99 @@
+PS1 REAL-HARDWARE SEMANTICS - what the console does differently
+================================================================
+Findings from the July 2026 audio investigation: same binary, same cue,
+audio in DuckStation but silence on the console. Resolved 2026-07-20 -
+audio now WORKS on hardware via the embedded-audio tier. This doc records
+what was proven, what the fix is, and how to read the overlay if the CD
+path is ever revisited.
+
+THE BUG (as observed on the first burned disc)
+  SFX LOADED=0/2, SPU RAM=0/520176, MUSIC LOADED=N BANK=0B. Zero bytes
+  ever reached the SPU; everything upstream (stage, models, textures -
+  all baked into the EXE) was fine. Audio was the ONLY runtime CD
+  consumer, so one CD-subsystem failure silenced everything at once.
+
+WHAT WAS RULED OUT (each with evidence)
+  - Burn/ISO layout: disc read back on PC (DEBUG_CD_CONTENTS/) -> all 15
+    audio files bit-identical to sources, SYSTEM.CNF correct.
+  - Disc unreadable by console: the BIOS found and loaded
+    \TEMPLATE.EXE;1 off the same disc to boot the game.
+  - CdInit: works on hardware, first attempt (CD=OK(1), INIT=1).
+  - Mute/volume/playback: SPU registers on hardware match the emulator
+    baseline exactly (SPUCNT=C021, MVOL=3FFF, envelopes live).
+  - SDK version: PSn00bSDK 0.24's isofs.c is identical to master -
+    updating the SDK would change nothing.
+
+ROOT CAUSE (as far as pinned)
+  PSn00bSDK's CdSearchFile() fails on the real drive - every audio load
+  died at step 2 (search) while raw boot-time reads work. The SDK's ISO
+  parser (libpsn00b/psxcd/isofs.c) reads the volume descriptor, path
+  table and directory records itself at double speed, and also REFUSES
+  ALL LOOKUPS if the drive status reports the shell open (CdlIsoLidOpen)
+  - a real hazard on softmod boot chains (this console boots CD-Rs via
+  FreePSXBoot/SD2psx). Which internal step fails was never disambiguated
+  because no further disc was burned; the ISOERR=/PVD= fields on debug
+  page 2 (see below) will name it on any future burn. Emulators pass
+  because their drive status is always clean and their reads never fail.
+
+THE FIX THAT SHIPS (tiered loader, sfx.c/music.c/sound.c)
+  Tier 1: hardened CD path. CdInit retried 3x; all audio reads go
+    through sound_cd_read(): up to 4 attempts, double speed then normal
+    speed. (On the successful hardware test these were never needed -
+    the failure is upstream, in CdSearchFile.)
+  Tier 2: EXE-embedded audio. py_convert_sounds.py bakes every shipped
+    audio file (~456 KB) into the EXE (generated/sound_embed.*, same
+    .incbin-blob pattern as textures), keyed by exact CD path string.
+    ANY tier-1 failure falls through to the embedded copy. This is what
+    carries audio on the console today: SRC=C0/E2 / SRC=EMB.
+  RAM cost: EXE ~1.22 MB of 2 MB total - fine at current asset scale.
+  Verified on hardware 2026-07-20: SFX + music play, page-2 SPU
+  registers identical to emulator, MODE=PLAY tested in-game.
+
+STATUS: NO FURTHER BURNS PLANNED
+  Audio ships from the embed tier. The CD path remains broken-but-
+  diagnosed; nothing depends on it at current scale. Revisit only when
+  assets outgrow main RAM (CD streaming needed) - then use the decision
+  table in AUDIO_HW_ACTION_PLAN.md, and the most promising fix is
+  bypassing CdSearchFile entirely: read the directory once with our own
+  parser on sound_cd_read(), or bake LBAs at build time.
+
+OVERLAY LEGEND (for reading any future hardware photo)
+  Page 1:
+    CD=OK/FAIL(n)   CdInit result, n = attempts used
+    SFX ... ERR=s   first CD-tier failure step: 1 CdInit dead, 2 search,
+                    3 size, 4 read, 5 magic, 6 parse, 7 SPU alloc,
+                    8 voice; 0 = clean
+    SFX SRC=Cn/Em   loaded sounds from CD vs embedded
+    MUSIC ERR=s     same steps; +10 = the SEQ failed rather than the VAB
+    MUSIC SRC=      CD / EMB / -
+  Page 2 (L3 cycles):
+    READY/INIT/RETRY/EMBED  cd ready flag, CdInit attempts, failed-read
+                            retries, files baked into this EXE (15)
+    ISOERR=         libpsxcd parser status from last CdSearchFile:
+                    0 okay, 1 seek, 2 read, 3 not-ISO9660, 4 LID OPEN
+    PVD=            boot raw read of ISO sector 16 via our reader:
+                    0 not run, 1 OK, 2 read fail, 3 garbage
+                    (PVD=1 + ISOERR!=0 -> raw reads fine, parser at
+                    fault; PVD=2/3 -> runtime raw reads themselves bad)
+    SPUCNT          expect 0xC021-ish: bit15 enable + bit14 unmute
+    STAT            oscillates (bit11 capture-half toggle = liveness)
+    MVOL/CDVOL      0x3FFF,0x3FFF from sound_init
+    CURVOL          ~0x7FFE CONSTANT is correct - ramped master volume,
+                    NOT a waveform meter (do not read as a fault)
+    ENDX            end-flag bits latch/clear as voices finish/re-key
+    ENV0-7/8-15     per-voice envelope levels - THE audio-energy signal
+                    (nonzero on keyed voices; 8+ move with the sequencer)
+
+  Healthy hardware reference (2026-07-20, embed tier):
+    CD READY=1 INIT=1 RETRY=0 EMBED=15 / SFX ERR=2 SRC=C0/E2 /
+    MUS ERR=2 SRC=EMB / SPUCNT=C021 STAT=2A1<->AA1 MVOL=3FFF,3FFF
+    CURVOL=7FFE,7FFE ENDX changing / ENV: sfx at 7FFF, music moving.
+
+RELATED FILES
+  AUDIO_HW_ACTION_PLAN.md   full decision tables + emulator baselines
+  BURNING_TO_DISK.md        burn settings log
+  DEBUG_CD_CONTENTS/        PC readback of burn #1 (integrity proof)
+  py_convert_sounds.py      iso.xml + embedded-audio blob generator
+  sound.c/.h                CdInit retry, hardened reads, embed lookup,
+                            PVD probe, ISOERR passthrough
+  sfx.c / music.c           tiered loaders + per-step error recording

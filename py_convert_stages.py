@@ -53,6 +53,19 @@ SOUND_MODES = {"loop": 0, "once": 1, "interval": 2, "music": 3}
 SOUND_TICK_HZ = 60
 SOUND_INTERVAL_FRAMES_MAX = 0xFFFF  # uint16 field - ~18 minutes, plenty
 
+# Light types: stage.json's lightType string -> the STAGE_LIGHT type byte
+# main.c switches on. Keep in sync with the LIGHT_* defines this script
+# writes into stage_common.h (and which main.c uses).
+LIGHT_TYPES = {"directional": 0, "spherical": 1, "spot": 2, "ambient": 3, "debug": 4}
+
+# Light intensity is authored as a human 0-1+ multiplier; the runtime scales
+# a base colour by a fixed-point intensity where 256 == 1.0 (the scale
+# main.c's g_light_dir_int[] / g_light_intensity_offset use), so it is baked
+# to that fixed point here.
+LIGHT_INTENSITY_SCALE = 256
+
+ANGLE_FULL = 4096  # 12-bit angle: 4096 == 360 degrees (cone angle conversion)
+
 
 def sanitize_identifier(name):
     ident = re.sub(r"[^0-9A-Za-z_]", "_", name)
@@ -280,9 +293,83 @@ for stage_dir in stage_dirs:
         output.append("};\n\n")
         output.append(f"const unsigned int {ident}_soundCount = {sound_count};\n")
 
+    # ------------------------------------------------------------------
+    # Lights - optional "lights" array (exported by stage-gen's light
+    # entities). Same optional/NULL handling as sounds: absent/empty stages
+    # carry a NULL pointer + count 0 and emit no <ident>_lights[] array.
+    #
+    # SCOPE: the runtime (main.c setup_frame_lighting) consumes DIRECTIONAL
+    # and AMBIENT lights into the GTE light/colour/back registers. Spherical
+    # and spot are validated and carried through in the data now, ready for a
+    # future offline vertex-baking pass, but are not yet consumed at runtime.
+    # ------------------------------------------------------------------
+    lights = stage.get("lights", [])
+    light_count = 0
+
+    if lights:
+        output.append(f"\nconst STAGE_LIGHT {ident}_lights[] = {{\n")
+        for light_index, lt in enumerate(lights):
+            type_name = lt.get("type", "spherical")
+            if type_name not in LIGHT_TYPES:
+                raise SystemExit(
+                    f"{stage_path}: lights[{light_index}].type {type_name!r} "
+                    f"must be one of {sorted(LIGHT_TYPES)}"
+                )
+            ltype = LIGHT_TYPES[type_name]
+
+            # dir is the precomputed unit direction TOWARD the light (ONE ==
+            # 4096), emitted by stage_export.js. Default points down -Z.
+            dir_v = as_vec3(lt.get("dir", [0, 0, -4096]), f"lights[{light_index}].dir", stage_path)
+            pos = as_vec3(lt.get("pos", [0, 0, 0]), f"lights[{light_index}].pos", stage_path)
+
+            color = lt.get("color", [255, 255, 255])
+            if not (isinstance(color, list) and len(color) == 3):
+                raise SystemExit(f"{stage_path}: lights[{light_index}].color must be a 3-element [r,g,b] array")
+            r, g, b = (max(0, min(255, int(round(float(c))))) for c in color)
+
+            intensity = int(round(float(lt.get("intensity", 1.0)) * LIGHT_INTENSITY_SCALE))
+            intensity = max(0, min(0xFFFF, intensity))
+
+            rng = max(0, int(round(float(lt.get("range", 0)))))
+
+            # coneAngle authored in degrees -> 12-bit angle; penumbra 0-1 ->
+            # 0..4096 fixed point (same scale as object scale's 4096==1.0).
+            cone = int(round(float(lt.get("coneAngle", 30)) * ANGLE_FULL / 360.0)) & ROT_MASK
+            penumbra = int(round(max(0.0, min(1.0, float(lt.get("penumbra", 0.2)))) * SCALE_UPSCALE))
+
+            # mobility (spherical/spot): 1 = static (destined for the offline
+            # vertex bake), 0 = dynamic (lit live per object). Stages exported
+            # before the field existed default to static, matching stage-gen's
+            # own default. NOTE: until the bake exists, main.c lights BOTH via
+            # the live per-object path - the flag is carried so already-
+            # authored stages survive the bake landing unchanged.
+            mobility = lt.get("mobility", "static")
+            if mobility not in ("static", "dynamic"):
+                raise SystemExit(
+                    f"{stage_path}: lights[{light_index}].mobility {mobility!r} "
+                    f"must be 'static' or 'dynamic'"
+                )
+            is_static = 1 if mobility == "static" else 0
+
+            # Per-light Disabled tickbox. Disabled lights are STILL baked
+            # into STAGE_LIGHT[] (never dropped - they stay authoritative
+            # authored data); main.c's load_stage_lights() just skips
+            # applying them. Missing field (older exports) == enabled.
+            is_disabled = 1 if lt.get("disabled") else 0
+
+            output.append(
+                f"    {{ {ltype}, "
+                f"{{ {dir_v[0]}, {dir_v[1]}, {dir_v[2]} }}, "
+                f"{{ {pos[0]}, {pos[1]}, {pos[2]} }}, "
+                f"{r}, {g}, {b}, {intensity}, {rng}, {cone}, {penumbra}, {is_static}, {is_disabled} }},\n"
+            )
+            light_count += 1
+        output.append("};\n\n")
+        output.append(f"const unsigned int {ident}_lightCount = {light_count};\n")
+
     stage_c_path = GENERATED_DIR / f"stage_{ident}.c"
     stage_c_path.write_text("".join(output), newline="\n")
-    print(f"Generated: {stage_c_path} ({object_count} object(s), {sound_count} sound(s))")
+    print(f"Generated: {stage_c_path} ({object_count} object(s), {sound_count} sound(s), {light_count} light(s))")
 
     stage_entries.append({
         "name": stage_name,
@@ -290,6 +377,7 @@ for stage_dir in stage_dirs:
         "cam_pos": cam_pos,
         "cam_rot": cam_rot,
         "sound_count": sound_count,
+        "light_count": light_count,
     })
 
 # ------------------------------------------------------------------
@@ -324,6 +412,24 @@ header_lines.append("    unsigned short delayFrames; // frames before the FIRST 
 header_lines.append("    unsigned short intervalMinFrames; // interval mode: random re-fire delay bounds, in VSync frames\n")
 header_lines.append("    unsigned short intervalMaxFrames;\n")
 header_lines.append("} STAGE_SOUND;\n\n")
+header_lines.append("/* Light type byte (matches LIGHT_TYPES in py_convert_stages.py). */\n")
+header_lines.append("#define LIGHT_DIRECTIONAL 0\n")
+header_lines.append("#define LIGHT_SPHERICAL   1\n")
+header_lines.append("#define LIGHT_SPOT        2\n")
+header_lines.append("#define LIGHT_AMBIENT     3\n")
+header_lines.append("#define LIGHT_DEBUG       4\n\n")
+header_lines.append("typedef struct\n{\n")
+header_lines.append("    unsigned char type;        // LIGHT_* above\n")
+header_lines.append("    SVECTOR dir;               // unit direction TOWARD the light, ONE == 4096 (directional/spot)\n")
+header_lines.append("    VECTOR  pos;               // world position, same fixed-point space as STAGE_OBJECT.pos (spherical/spot)\n")
+header_lines.append("    unsigned char r, g, b;     // light colour, 0-255\n")
+header_lines.append("    unsigned short intensity;  // fixed-point multiplier, 256 == 1.0 (main.c applies it live per frame)\n")
+header_lines.append("    unsigned int range;        // falloff radius in world units, 0 = infinite (spherical/spot)\n")
+header_lines.append("    unsigned short coneAngle;  // spot cone half-angle, 12-bit angle (1024 == 90 deg)\n")
+header_lines.append("    unsigned short penumbra;   // spot edge softness, 0..4096 (0..1)\n")
+header_lines.append("    unsigned char isStatic;    // 1 = bake-destined (static), 0 = dynamic; both lit live until the bake exists\n")
+header_lines.append("    unsigned char disabled;    // 1 = authored off: still present in the data, skipped by load_stage_lights (immune to the DEBUG L2 editor, unlike intensity 0)\n")
+header_lines.append("} STAGE_LIGHT;\n\n")
 header_lines.append("typedef struct\n{\n")
 header_lines.append("    const char *name;\n")
 header_lines.append("    VECTOR  cameraPos;\n")
@@ -332,6 +438,8 @@ header_lines.append("    const STAGE_OBJECT *objects;\n")
 header_lines.append("    unsigned int objectCount;\n")
 header_lines.append("    const STAGE_SOUND *sounds; // NULL when the stage authors no sounds\n")
 header_lines.append("    unsigned int soundCount;\n")
+header_lines.append("    const STAGE_LIGHT *lights; // NULL when the stage authors no lights\n")
+header_lines.append("    unsigned int lightCount;\n")
 header_lines.append("} STAGE_DEF;\n\n")
 header_lines.append("extern const unsigned int stageRegistryCount;\n")
 header_lines.append("extern const STAGE_DEF stageRegistry[];\n\n")
@@ -354,11 +462,15 @@ for entry in stage_entries:
         sounds_ref = f'{entry["ident"]}_sounds, {entry["ident"]}_soundCount'
     else:
         sounds_ref = "0, 0"  # no sounds authored - no <ident>_sounds[] array was emitted
+    if entry["light_count"] > 0:
+        lights_ref = f'{entry["ident"]}_lights, {entry["ident"]}_lightCount'
+    else:
+        lights_ref = "0, 0"  # no lights authored - no <ident>_lights[] array was emitted
     registry_lines.append(
         f'    {{ "{escaped_name}", '
         f'{{ {entry["cam_pos"][0]}, {entry["cam_pos"][1]}, {entry["cam_pos"][2]} }}, '
         f'{{ {entry["cam_rot"][0]}, {entry["cam_rot"][1]}, {entry["cam_rot"][2]} }}, '
-        f'{entry["ident"]}_objects, {entry["ident"]}_objectCount, {sounds_ref} }},\n'
+        f'{entry["ident"]}_objects, {entry["ident"]}_objectCount, {sounds_ref}, {lights_ref} }},\n'
     )
 registry_lines.append("};\n")
 

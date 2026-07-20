@@ -164,7 +164,7 @@
       "autoplay": true
     },
     {
-      "sample": "TESTING",
+      "sample": "TESTING2",
       "pos": [
         -1654,
         -369,
@@ -180,6 +180,66 @@
       "directional": false,
       "muteAfterPlay": false,
       "autoplay": false
+    }
+  ],
+  "lights": [
+    {
+      "type": "spherical",
+      "disabled": true,
+      "mobility": "static",
+      "pos": [
+        513,
+        -351,
+        -1709
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ],
+      "dir": [
+        0,
+        0,
+        -4096
+      ],
+      "color": [
+        255,
+        255,
+        255
+      ],
+      "intensity": 1,
+      "range": 5120,
+      "coneAngle": 30,
+      "penumbra": 0.2
+    },
+    {
+      "type": "directional",
+      "disabled": false,
+      "mobility": "static",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "rot": [
+        -45,
+        0,
+        0
+      ],
+      "dir": [
+        0,
+        -2896,
+        -2896
+      ],
+      "color": [
+        255,
+        255,
+        255
+      ],
+      "intensity": 1,
+      "range": 5120,
+      "coneAngle": 30,
+      "penumbra": 0.2
     }
   ]
 }

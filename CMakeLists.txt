@@ -50,6 +50,16 @@ file(GLOB_RECURSE SOURCE_TIM_FILES   CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/asse
 file(GLOB_RECURSE SOURCE_PNG_FILES   CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/object/*/textures/*.png")
 file(GLOB_RECURSE SOURCE_STAGE_FILES CONFIGURE_DEPENDS "${CMAKE_SOURCE_DIR}/assets/stage/*/stage.json")
 
+# Audio sources, used by BOTH the conversion pipeline (embedded-audio
+# blob, see below) and section 3b (iso.xml entries + cd image DEPENDS).
+# Declared here because the pipeline's custom command needs them.
+file(GLOB_RECURSE SOURCE_VAG_FILES CONFIGURE_DEPENDS
+    "${CMAKE_SOURCE_DIR}/assets/sound/*.vag" "${CMAKE_SOURCE_DIR}/assets/sound/*.VAG"
+    "${CMAKE_SOURCE_DIR}/assets/sound/music/*.vab" "${CMAKE_SOURCE_DIR}/assets/sound/music/*.VAB"
+    "${CMAKE_SOURCE_DIR}/assets/sound/music/*.seq" "${CMAKE_SOURCE_DIR}/assets/sound/music/*.SEQ"
+)
+list(REMOVE_DUPLICATES SOURCE_VAG_FILES) # case-insensitive filesystems match both patterns
+
 # Deletion/rename safety net: Ninja only re-runs a custom command when a
 # DEPENDS file is NEWER, so merely REMOVING a source file (model deleted/
 # renamed) would leave the stamp "up to date" and stale .c files in
@@ -62,7 +72,7 @@ set(CONVERT_MANIFEST "${CMAKE_BINARY_DIR}/convert_sources_manifest.txt")
 string(JOIN "\n" CONVERT_MANIFEST_CONTENT
     ${SOURCE_OBJ_FILES} ${SOURCE_MTL_FILES}
     ${SOURCE_TIM_FILES} ${SOURCE_PNG_FILES}
-    ${SOURCE_STAGE_FILES}
+    ${SOURCE_STAGE_FILES} ${SOURCE_VAG_FILES}
 )
 file(WRITE "${CONVERT_MANIFEST}.tmp" "${CONVERT_MANIFEST_CONTENT}\n")
 execute_process(COMMAND "${CMAKE_COMMAND}" -E copy_if_different
@@ -88,25 +98,38 @@ set(TEX_BLOB_S       "${CMAKE_SOURCE_DIR}/generated/tex_blob.S")
 set(TEX_BLOB_TABLE   "${CMAKE_SOURCE_DIR}/generated/tex_blob_table.c")
 set(TEX_BLOB_TABLE_H "${CMAKE_SOURCE_DIR}/generated/tex_blob_table.h")
 
+# py_convert_sounds.py's embedded-audio artifacts (tier-2 CD fallback,
+# same .incbin-blob pattern as the textures above). They live in
+# generated/ - which py_convert_assets.py WIPES - so the sounds script
+# runs as the pipeline's LAST step to restore them (it also runs at
+# configure time for iso.xml; see section 3b).
+set(SND_EMBED_BIN     "${CMAKE_SOURCE_DIR}/generated/sound_embed.bin")
+set(SND_EMBED_S       "${CMAKE_SOURCE_DIR}/generated/sound_embed.S")
+set(SND_EMBED_TABLE   "${CMAKE_SOURCE_DIR}/generated/sound_embed_table.c")
+set(SND_EMBED_TABLE_H "${CMAKE_SOURCE_DIR}/generated/sound_embed_table.h")
+
 set(CONVERT_STAMP "${CMAKE_BINARY_DIR}/conversion_pipeline.stamp")
 
 add_custom_command(
     OUTPUT "${CONVERT_STAMP}"
         "${TEX_BLOB_BIN}" "${TEX_BLOB_S}" "${TEX_BLOB_TABLE}" "${TEX_BLOB_TABLE_H}"
+        "${SND_EMBED_BIN}" "${SND_EMBED_S}" "${SND_EMBED_TABLE}" "${SND_EMBED_TABLE_H}"
     COMMAND "${Python3_EXECUTABLE}" -u "${CMAKE_SOURCE_DIR}/py_convert_assets.py"
     COMMAND "${Python3_EXECUTABLE}" -u "${CMAKE_SOURCE_DIR}/py_convert_textures.py"
     COMMAND "${Python3_EXECUTABLE}" -u "${CMAKE_SOURCE_DIR}/py_convert_stages.py"
+    COMMAND "${Python3_EXECUTABLE}" -u "${CMAKE_SOURCE_DIR}/py_convert_sounds.py"
     COMMAND "${CMAKE_COMMAND}" -E touch "${CONVERT_STAMP}"
     DEPENDS
         ${SOURCE_OBJ_FILES} ${SOURCE_MTL_FILES}
         ${SOURCE_TIM_FILES} ${SOURCE_PNG_FILES}
-        ${SOURCE_STAGE_FILES}
+        ${SOURCE_STAGE_FILES} ${SOURCE_VAG_FILES}
         "${CONVERT_MANIFEST}"
         "${CMAKE_SOURCE_DIR}/py_convert_assets.py"
         "${CMAKE_SOURCE_DIR}/py_convert_textures.py"
         "${CMAKE_SOURCE_DIR}/py_convert_stages.py"
+        "${CMAKE_SOURCE_DIR}/py_convert_sounds.py"
     WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}"
-    COMMENT "Converting assets (OBJ -> C, TIM -> blob, stage.json -> C)"
+    COMMENT "Converting assets (OBJ -> C, TIM -> blob, stage.json -> C, audio -> embed blob)"
 )
 
 # convert_everything is the entry point; the old per-step names are kept
@@ -130,6 +153,8 @@ psn00bsdk_add_executable(template GPREL
     music.c
     "${TEX_BLOB_S}"
     "${TEX_BLOB_TABLE}"
+    "${SND_EMBED_S}"
+    "${SND_EMBED_TABLE}"
 )
 
 # sound.c pulls in the SPU and CD-ROM libraries. The default template only
@@ -154,12 +179,8 @@ add_dependencies(template convert_everything)
 # CONFIGURE_DEPENDS on the glob makes Ninja/Make re-run CMake (and thus
 # this script) automatically whenever a .vag is added or removed; editing
 # the template or the script also retriggers via CMAKE_CONFIGURE_DEPENDS.
-file(GLOB_RECURSE SOURCE_VAG_FILES CONFIGURE_DEPENDS
-    "${CMAKE_SOURCE_DIR}/assets/sound/*.vag" "${CMAKE_SOURCE_DIR}/assets/sound/*.VAG"
-    "${CMAKE_SOURCE_DIR}/assets/sound/music/*.vab" "${CMAKE_SOURCE_DIR}/assets/sound/music/*.VAB"
-    "${CMAKE_SOURCE_DIR}/assets/sound/music/*.seq" "${CMAKE_SOURCE_DIR}/assets/sound/music/*.SEQ"
-)
-list(REMOVE_DUPLICATES SOURCE_VAG_FILES) # case-insensitive filesystems match both patterns
+# (SOURCE_VAG_FILES is globbed up in section 1 now - the conversion
+# pipeline also consumes it for the embedded-audio blob.)
 
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS
     "${CMAKE_SOURCE_DIR}/iso.xml.template"

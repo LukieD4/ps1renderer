@@ -49,6 +49,53 @@ const DEFAULT_VIEW = { position: new THREE.Vector3(6, 5, 10), target: new THREE.
 let cameraGizmo = null; // small cone mesh representing the exported PS1 camera's transform
 let grid = null; // GridHelper, kept module-level so toggleGridVisible() can reach it
 
+// ---- lighting modes (editor default vs PS1 parity preview) ----
+// The shading toggle (top-right viewport overlay, Blender-style) swaps
+// instance materials between unlit MeshBasicMaterial (editor) and a custom
+// shader implementing the runtime's exact GTE transfer function (PS1).
+// See the "PS1 lighting parity preview" section below for the semantics.
+let editorAmbientLight = null;
+let editorDirLight = null;
+let ps1LightingEnabled = false;
+
+// Missing-texture display colour: magenta by default (the classic flag
+// colour), toggleable to solid white via the "Missing=White" toolbar
+// check. Under the PS1 preview a WHITE untextured face renders the raw lit
+// colour itself, making it a live probe of the exact brightness the
+// runtime would output (PS1 untextured prims ARE the lit colour).
+let missingTextureWhite = false;
+
+// Shared GTE-lighting uniforms, referenced (never copied) by every PS1
+// preview material, so updatePS1LightsFromEntities() updates ONE place per
+// frame and every material sees it. Directions are unit vectors TOWARD
+// each light in viewport space; colours are authored RGB pre-multiplied by
+// authored intensity (1.0 == stage-gen Intensity 1.0 == runtime eff 256);
+// slots beyond the stage's authored directionals stay black, the exact
+// analogue of a zeroed GTE light-matrix row.
+const PS1_MAX_PREVIEW_SPHERES = 8; // mirrors main.c's MAX_SPHERE_LIGHTS
+
+const ps1LightUniforms = {
+  psAmbient: { value: new THREE.Color(0, 0, 0) },
+  psLightDir: {
+    value: [new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 0, 1), new THREE.Vector3(0, 0, 1)],
+  },
+  psLightColor: {
+    value: [new THREE.Color(0, 0, 0), new THREE.Color(0, 0, 0), new THREE.Color(0, 0, 0)],
+  },
+  // Spherical (point) lights: position in viewport units, colour *
+  // intensity (black == unused slot), range in viewport units (0 ==
+  // infinite, matching the authored Range field).
+  psSphPos: {
+    value: Array.from({ length: PS1_MAX_PREVIEW_SPHERES }, () => new THREE.Vector3()),
+  },
+  psSphColor: {
+    value: Array.from({ length: PS1_MAX_PREVIEW_SPHERES }, () => new THREE.Color(0, 0, 0)),
+  },
+  psSphRange: {
+    value: new Array(PS1_MAX_PREVIEW_SPHERES).fill(0),
+  },
+};
+
 // modelName -> triangle count of the parsed template (computed once at
 // load time in loadModelIntoStage, displayed in the sidebar model list).
 const modelTriCounts = new Map();
@@ -142,10 +189,15 @@ export function initViewer(canvasEl, gizmoCanvasEl) {
   grid = new THREE.GridHelper(20, 20);
   stage.add(grid);
 
-  stage.add(new THREE.AmbientLight(0xffffff, 0.6));
-  const dirLight = new THREE.DirectionalLight(0xffffff, 0.8);
-  dirLight.position.set(5, 10, 7.5);
-  stage.add(dirLight);
+  // Editor rig: bright, even, always-on. Inert in practice - model
+  // instances use MeshBasicMaterial (unlit) in editor mode and the PS1
+  // preview's custom shader reads its own uniforms, not scene lights -
+  // but kept so any future lit built-in material behaves sensibly.
+  editorAmbientLight = new THREE.AmbientLight(0xffffff, 0.6);
+  stage.add(editorAmbientLight);
+  editorDirLight = new THREE.DirectionalLight(0xffffff, 0.8);
+  editorDirLight.position.set(5, 10, 7.5);
+  stage.add(editorDirLight);
 
   transformControls = new TransformControls(editCamera, canvas);
   stage.add(transformControls.getHelper ? transformControls.getHelper() : transformControls);
@@ -363,6 +415,14 @@ function renderLoop() {
       s.z ? 1 / s.z : 1
     );
   }
+
+  // PS1 parity preview: re-derive the Three.js light rig from the stage's
+  // authored Light entities every frame. This is deliberately per-frame
+  // rather than event-driven - it's a handful of map lookups over a small
+  // instances map, and it means dragging a Sun's rotation gizmo (or
+  // scrubbing its intensity field) relights the viewport live with zero
+  // extra plumbing through app.js.
+  if (ps1LightingEnabled) updatePS1LightsFromEntities();
 
   renderer.render(stage, editCamera);
   renderAxisGizmo();
@@ -765,6 +825,26 @@ function applySeamSnap(id) {
  * path. The gizmo-drag caller ignores this; the asset-placement exports
  * below use it to decide whether a fallback position is needed.
  */
+// World-space bounding box of an entity marker's PICKABLE meshes only -
+// i.e. the solid core the user actually clicks, skipping decorative pieces
+// tagged userData.noPick (range rings, glow shells, spot cones, aim rods),
+// which can be metres across and would otherwise dominate the box. Falls
+// back to the whole-group box if a marker somehow has no pickable mesh.
+function pickableWorldBox(obj) {
+  const box = new THREE.Box3();
+  let found = false;
+  obj.traverse((child) => {
+    if (!child.isMesh || child.userData.noPick || child.visible === false) return;
+    child.updateWorldMatrix(true, false);
+    const childBox = new THREE.Box3().setFromObject(child);
+    if (!childBox.isEmpty()) {
+      box.union(childBox);
+      found = true;
+    }
+  });
+  return found ? box : new THREE.Box3().setFromObject(obj);
+}
+
 function applySurfaceSnapDrag(id) {
   const inst = instances.get(id);
   if (!inst) return false;
@@ -817,7 +897,14 @@ function applySurfaceSnapDrag(id) {
   // Recomputed per event (not cached at drag start) so mid-drag scale/
   // rotation state is always respected; Box3.setFromObject over one
   // instance is cheap at this tool's model sizes.
-  const bbox = new THREE.Box3().setFromObject(obj);
+  //
+  // For ENTITY markers, snap against ONLY the pickable core (the small
+  // bulb/cone/box), not the whole group: decorative pieces like a light's
+  // range ring or glow shell are metres wide, and including them made the
+  // support distance huge - the marker leapt far off the surface instead of
+  // resting flush at the cursor. Real model instances have no noPick pieces,
+  // so they keep the full-group box unchanged.
+  const bbox = inst.isEntity ? pickableWorldBox(obj) : new THREE.Box3().setFromObject(obj);
   if (bbox.isEmpty()) return false;
   const center = bbox.getCenter(new THREE.Vector3());
   const halfExt = bbox.getSize(new THREE.Vector3()).multiplyScalar(0.5);
@@ -969,7 +1056,13 @@ export async function loadModelIntoStage(modelName, glbArrayBuffer, resolveByNam
       // discards them without the depth-sorting headaches of transparent=true.
       material.alphaTest = 0.5;
     } else {
-      material.color.set(0xff00ff); // magenta = "texture missing" flag color
+      // "Texture missing" flag colour: magenta, or solid white when the
+      // Missing=White toggle is on (see setMissingTextureWhite - white is
+      // a live brightness probe under the PS1 shading preview). The
+      // userData flag is what lets that toggle find these later; it
+      // survives Material.clone() and the unlit<->lit conversion.
+      material.color.set(missingTextureWhite ? 0xffffff : 0xff00ff);
+      material.userData.missingTexture = true;
     }
 
     return material;
@@ -1079,6 +1172,17 @@ export function addInstance(id, modelName, initialTransform = {}, materialsMap =
       : child.material.clone();
   });
 
+  // Templates are always built with unlit MeshBasicMaterial; if the PS1
+  // lighting preview is active, a freshly spawned instance must arrive
+  // already converted to lit materials or it would render full-bright
+  // amid an otherwise-lit stage.
+  if (ps1LightingEnabled) applyLightingModeToObject(object3D, true);
+
+  // Missing-texture flag colour tracks the CURRENT Missing=White toggle,
+  // not whichever state happened to be active when this model's template
+  // was built.
+  applyMissingTextureColor(object3D);
+
   stage.add(object3D);
 
   const materialTimData = materialsMap ? new Map(materialsMap) : new Map();
@@ -1130,6 +1234,7 @@ const ENTITY_COLORS = {
   particle: 0xffd23c,
   billboard: 0x3ec6dc,
   sound: 0xe05d8a,
+  light: 0xffe066,
 };
 
 /** LineLoop circle geometry in the XZ plane (patrol radius rings). */
@@ -1140,6 +1245,31 @@ function makeCircleGeometry(radius, segments = 48) {
     pts.push(new THREE.Vector3(Math.cos(a) * radius, 0, Math.sin(a) * radius));
   }
   return new THREE.BufferGeometry().setFromPoints(pts);
+}
+
+/** Parse an authored '#rrggbb' light color to a THREE-usable hex int,
+ * falling back to the Light kind's tint for anything malformed (a
+ * half-typed value should never throw or blank the marker). */
+function parseLightColor(hex) {
+  return (typeof hex === 'string' && /^#[0-9a-fA-F]{6}$/.test(hex))
+    ? parseInt(hex.slice(1), 16)
+    : ENTITY_COLORS.light;
+}
+
+/** Wireframe cone opening along -Z (apex at the origin, i.e. the light),
+ * sized by a spot's half-angle and range - the spot's visual cone. Built
+ * as EdgesGeometry so it reads as a thin outline, not a solid volume. */
+function makeSpotConeGeometry(coneAngleDeg, height) {
+  const h = Math.max(0.2, height);
+  const half = THREE.MathUtils.degToRad(Math.min(89, Math.max(1, coneAngleDeg)));
+  const radius = Math.tan(half) * h;
+  const cone = new THREE.ConeGeometry(radius, h, 20, 1, true);
+  // Default cone apex points +Y; rotate +Y -> +Z then push back by h/2 so
+  // the apex sits at the group origin and the mouth opens toward -Z (the
+  // same "forward" the directional pointer uses).
+  cone.rotateX(Math.PI / 2);
+  cone.translate(0, 0, -h / 2);
+  return new THREE.EdgesGeometry(cone);
 }
 
 /** Cone + base-disc + forward pointer marker shared by spawn/summon. */
@@ -1266,6 +1396,59 @@ function buildEntityMeshes(group, kind, color, props) {
       ring.userData.noPick = true; // falloff radius ring can be huge - not a click target
       ring.visible = (props.radius || 0) > 0;
       group.add(ring);
+      break;
+    }
+    case 'light': {
+      // One superset marker for all five light types; applyEntityProps
+      // ToMeshes toggles which pieces show and resizes them per lightType
+      // (like sound's ring), so switching type in the panel never has to
+      // rebuild the group. Pieces:
+      //   lightCore     - solid bulb, tinted LIVE with the authored color
+      //   lightRangeRing- XZ falloff circle (spherical / spot)
+      //   lightDirPointer - forward -Z aim rod (directional / spot)
+      //   lightSpotCone - wireframe cone showing a spot's angle + range
+      const core = new THREE.Mesh(
+        new THREE.SphereGeometry(0.18, 16, 12),
+        new THREE.MeshBasicMaterial({ color: parseLightColor(props.color) })
+      );
+      core.name = 'lightCore';
+      core.position.y = 0.25;
+      group.add(core);
+
+      const glow = new THREE.Mesh(
+        new THREE.SphereGeometry(0.3, 16, 12),
+        new THREE.MeshBasicMaterial({ color, wireframe: true, transparent: true, opacity: 0.28 })
+      );
+      glow.position.y = 0.25;
+      glow.userData.noPick = true; // decorative halo - pick the solid bulb
+      group.add(glow);
+
+      const ring = new THREE.LineLoop(
+        makeCircleGeometry(Math.max(0, props.range || 0)),
+        new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.6 })
+      );
+      ring.name = 'lightRangeRing';
+      ring.position.y = 0.02;
+      ring.userData.noPick = true; // falloff ring can be huge - not a click target
+      group.add(ring);
+
+      const pointer = new THREE.Mesh(
+        new THREE.BoxGeometry(0.05, 0.05, 0.6),
+        new THREE.MeshBasicMaterial({ color, transparent: true, opacity: 0.85 })
+      );
+      pointer.name = 'lightDirPointer';
+      pointer.position.set(0, 0.25, -0.4);
+      pointer.userData.noPick = true; // aim rod is context - pick the bulb
+      group.add(pointer);
+
+      const spotCone = new THREE.LineSegments(
+        makeSpotConeGeometry(props.coneAngle || 30, props.range || 3),
+        new THREE.LineBasicMaterial({ color, transparent: true, opacity: 0.5 })
+      );
+      spotCone.name = 'lightSpotCone';
+      spotCone.position.y = 0.25;
+      spotCone.userData.noPick = true; // cone outline is context - pick the bulb
+      group.add(spotCone);
       break;
     }
     default: {
@@ -1398,6 +1581,45 @@ function applyEntityPropsToMeshes(inst) {
     }
   }
 
+  if (inst.kind === 'light') {
+    const type = inst.props.lightType || 'spherical';
+    const range = Math.max(0, inst.props.range || 0);
+    const hasRange = (type === 'spherical' || type === 'spot');
+    const isSpot = type === 'spot';
+    const isDir = type === 'directional';
+
+    // Live color tint on the bulb so the swatch edit is visible at once.
+    const core = inst.object3D.getObjectByName('lightCore');
+    if (core) core.material.color.setHex(parseLightColor(inst.props.color));
+
+    // Falloff ring: spherical/spot only, and only when range > 0
+    // (0 = infinite, nothing meaningful to draw).
+    const ring = inst.object3D.getObjectByName('lightRangeRing');
+    if (ring) {
+      ring.geometry.dispose();
+      ring.geometry = makeCircleGeometry(range);
+      ring.visible = hasRange && range > 0;
+    }
+
+    // Aim rod: directional + spot cast along the entity's -Z.
+    const pointer = inst.object3D.getObjectByName('lightDirPointer');
+    if (pointer) pointer.visible = isDir || isSpot;
+
+    // Spot cone outline, rebuilt from angle + range (fallback height 3
+    // when range is infinite so the cone is still visible).
+    const spotCone = inst.object3D.getObjectByName('lightSpotCone');
+    if (spotCone) {
+      spotCone.visible = isSpot;
+      if (isSpot) {
+        spotCone.geometry.dispose();
+        spotCone.geometry = makeSpotConeGeometry(
+          inst.props.coneAngle || 30,
+          range > 0 ? range : 3
+        );
+      }
+    }
+  }
+
   if (inst.kind === 'billboard') {
     const onTop = !!inst.props.seeThroughWalls;
     inst.object3D.traverse((child) => {
@@ -1429,6 +1651,24 @@ export function updateEntityProps(id, props) {
  */
 export function getTrackedInstanceIds() {
   return Array.from(instances.keys());
+}
+
+/**
+ * Like getTrackedInstanceIds(), but returns each tracked id's identity
+ * (model name for instances, kind for entities) so callers can tell whether
+ * a still-tracked id now represents something DIFFERENT. resyncViewport
+ * FromState() uses this to purge a mesh whose id was reused for another
+ * model/kind on project load - otherwise it would keep the old visual and
+ * only overwrite its transform, leaking the previous stage's objects into
+ * the loaded one.
+ */
+export function getTrackedInstanceMeta() {
+  return new Map(
+    Array.from(instances.entries()).map(([id, inst]) => [
+      id,
+      { isEntity: !!inst.isEntity, modelName: inst.modelName, kind: inst.kind },
+    ])
+  );
 }
 
 export function removeInstance(id) {
@@ -1582,6 +1822,9 @@ export function updateInstancePaletteRow(id, row) {
 
       if (mat.map) mat.map.dispose();
       mat.map = buildDataTexture(decodedTim, row);
+      // The PS1 preview material samples via its uniform, with .map kept
+      // as a bookkeeping mirror (see buildPS1LitMaterial) - update both.
+      if (mat.isShaderMaterial) mat.uniforms.map.value = mat.map;
       mat.needsUpdate = true;
     }
   });
@@ -1629,6 +1872,360 @@ export function onTransformChange(callback) {
  */
 export function onDragStart(callback) {
   dragStartCallback = callback;
+}
+
+// ==========================================================================
+// PS1 lighting parity preview ("PS1" shading toggle, top-right overlay)
+// ==========================================================================
+//
+// Emulates what THIS stage will look like under the runtime's GTE lighting
+// path (main.c: load_stage_lights + compute_object_lighting via gte_ncs -
+// see PS1_GTE_LIGHTING_SEMANTICS.txt sections 5-6), so an author can grasp
+// the shipped look without leaving the tool. What is emulated, and what is
+// deliberately NOT:
+//
+//   - AUTHORED LIGHTS ONLY, exactly like the runtime: up to THREE
+//     directional Light entities (the GTE light matrix has three rows;
+//     the runtime consumes the first three in stage order, so this
+//     preview takes the first three in the same order) plus AMBIENT
+//     entities summed into one ambient term. A stage with no authored
+//     directionals genuinely goes directional-less here too - there is no
+//     recovery sun (semantics doc 5.7), and deleting the seeded "Sun"
+//     shows exactly the unlit stage the runtime would render.
+//   - ONE-SIDED, NO-FALLOFF directionals with the runtime's EXACT transfer
+//     function, implemented in a custom shader (not a stock Three.js lit
+//     material, whose curve is half as hot and lacks the intermediate
+//     clamp). Derived from the GTE register math (unit colour bake
+//     channel<<7, 1024-magnitude normals, MAC>>4 output):
+//
+//       lit   = min(BK + sum_i( 2 * colour_i * intensity_i * max(0, N.L_i) ), 1.0)
+//       final = texel * lit * 255/128     (textured - PS1 modulation, 128 == 1.0)
+//       final = lit                       (untextured - flat prims ARE the lit colour)
+//
+//     Consequences, matching the console: a fully-facing face saturates
+//     at intensity*dot == 0.5 (authored 1.0 white is deliberately "hot");
+//     brightness rises linearly until the per-channel clamp; the VISUAL
+//     ceiling lands around 4x intensity (runtime INT=1024) because by
+//     then everything down to dot=1/8 is already clamped white - only
+//     grazing faces still respond. Faces away from every light fall to
+//     the ambient floor (black if no ambient is authored), like gte_ncs.
+//   - SPHERICAL (point) lights contribute per fragment with the same 2x
+//     curve times a linear range falloff (doc 8.3):
+//
+//       lit += 2 * colour * intensity * clamp(1 - dist/range, 0, 1) * max(0, N.L)
+//
+//     Per-fragment falloff is exactly what STATIC-mobility lights (the
+//     default) will bake to per vertex offline. The runtime's interim
+//     dynamic path instead evaluates direction + attenuation once per
+//     OBJECT and packs only the brightest spheres into the GTE slots the
+//     authored directionals left free - so in-game, point light is
+//     flatter across large meshes and capped at 3 simultaneous lights
+//     per object; this preview is the bake-accurate reference.
+//   - SPOT / DEBUG lights contribute NOTHING, because they contribute
+//     nothing at runtime today (spot awaits the offline vertex bake -
+//     semantics doc section 8). When that lands, this preview should grow
+//     to match it.
+//   - MATERIALS swap MeshBasicMaterial (unlit full-bright, the editor
+//     look) <-> the custom GTE shader above. Smooth vertex normals give a
+//     Gouraud-style result, matching the runtime's use_vertex_light mode.
+//     Non-uniform scale skews normals here exactly like it does on the
+//     console (both use the plain rotation, not inverse-transpose - doc
+//     5.7).
+//   - MISSING-TEXTURE materials render untextured (no modulation). With
+//     the "Missing=White" toolbar toggle they turn solid white, which
+//     under this preview displays the raw lit colour - a live probe for
+//     the exact brightness the runtime would output.
+//   - ENTITY MARKERS (spawn cones, trigger boxes, the light bulbs
+//     themselves...) stay unlit on purpose: they are editor UI, not stage
+//     geometry, and must stay readable in a pitch-black stage.
+//
+// NOT gamma/dither/wobble-accurate - this previews the LIGHTING model,
+// not the console's rasterizer.
+
+const PS1_LIT_VERT = /* glsl */ `
+  varying vec2 vUv;
+  varying vec3 vWorldNormal;
+  varying vec3 vWorldPos;
+
+  void main() {
+    vUv = uv;
+    // World-space normal via the model matrix's rotation. Non-uniform
+    // scale would want the inverse-transpose; ignored DELIBERATELY to
+    // match the runtime, which ignores it too (semantics doc 5.7).
+    vWorldNormal = mat3(modelMatrix) * normal;
+    vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;
+    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+  }
+`;
+
+const PS1_LIT_FRAG = /* glsl */ `
+  uniform sampler2D map;        // real texture, or the 1x1 white fallback
+  uniform float uAlphaTest;     // PS1 black==transparent texel discard
+  uniform float texFactor;      // 255/128 textured (PS1 modulation), 1 untextured
+  uniform vec3 baseColor;       // material tint (white / missing-texture flag)
+  uniform vec3 psAmbient;       // BK back colour, 0..1
+  uniform vec3 psLightDir[3];   // unit vectors TOWARD each light
+  uniform vec3 psLightColor[3]; // authored colour * intensity (black == unused)
+  uniform vec3 psSphPos[${PS1_MAX_PREVIEW_SPHERES}];    // spherical: world position
+  uniform vec3 psSphColor[${PS1_MAX_PREVIEW_SPHERES}];  // spherical: colour * intensity
+  uniform float psSphRange[${PS1_MAX_PREVIEW_SPHERES}]; // spherical: range, 0 == infinite
+  varying vec2 vUv;
+  varying vec3 vWorldNormal;
+  varying vec3 vWorldPos;
+
+  void main() {
+    vec4 texel = texture2D(map, vUv);
+    if (texel.a < uAlphaTest) discard;
+
+    vec3 n = normalize(vWorldNormal);
+    if (!gl_FrontFacing) n = -n; // DoubleSide: light the visible side
+
+    // The GTE lighting sum: ambient + 2*colour*intensity*max(0,dot),
+    // clamped per channel - the same one-sided clamp-at-255 gte_ncs does.
+    vec3 lit = psAmbient;
+    for (int i = 0; i < 3; i++)
+      lit += psLightColor[i] * (2.0 * max(dot(n, psLightDir[i]), 0.0));
+
+    // Spherical (point) lights: same 2x curve, times a linear range
+    // falloff (doc 8.3). Evaluated per fragment, which previews the
+    // OFFLINE VERTEX BAKE static lights are destined for; the runtime's
+    // interim dynamic path evaluates direction/attenuation once per
+    // OBJECT and competes for free GTE slots, so in-game dynamic point
+    // light is flatter across large meshes than this preview.
+    for (int i = 0; i < ${PS1_MAX_PREVIEW_SPHERES}; i++) {
+      vec3 toLight = psSphPos[i] - vWorldPos;
+      float dist = max(length(toLight), 1e-5);
+      float atten = psSphRange[i] > 0.0
+        ? clamp(1.0 - dist / psSphRange[i], 0.0, 1.0)
+        : 1.0;
+      lit += psSphColor[i] * (2.0 * atten * max(dot(n, toLight / dist), 0.0));
+    }
+
+    lit = min(lit, vec3(1.0));
+
+    gl_FragColor = vec4(baseColor * texel.rgb * lit * texFactor, 1.0);
+    #include <colorspace_fragment>
+  }
+`;
+
+// 1x1 white fallback so the sampler uniform is always bound; also what
+// makes an untextured material's texel term a no-op. Never disposed.
+let whiteFallbackTexture = null;
+
+function getWhiteFallbackTexture() {
+  if (!whiteFallbackTexture) {
+    whiteFallbackTexture = new THREE.DataTexture(
+      new Uint8Array([255, 255, 255, 255]), 1, 1, THREE.RGBAFormat
+    );
+    whiteFallbackTexture.needsUpdate = true;
+  }
+  return whiteFallbackTexture;
+}
+
+/** Build one PS1-preview material. Light state comes from the SHARED
+ * ps1LightUniforms objects (referenced, not cloned), so per-frame light
+ * updates reach every material without touching them individually. */
+function buildPS1LitMaterial(srcColor, map, alphaTest, side) {
+  const material = new THREE.ShaderMaterial({
+    vertexShader: PS1_LIT_VERT,
+    fragmentShader: PS1_LIT_FRAG,
+    side,
+    uniforms: {
+      map: { value: map || getWhiteFallbackTexture() },
+      uAlphaTest: { value: map ? alphaTest || 0 : 0 },
+      texFactor: { value: map ? 255 / 128 : 1 },
+      baseColor: { value: srcColor.clone() },
+      psAmbient: ps1LightUniforms.psAmbient,
+      psLightDir: ps1LightUniforms.psLightDir,
+      psLightColor: ps1LightUniforms.psLightColor,
+      psSphPos: ps1LightUniforms.psSphPos,
+      psSphColor: ps1LightUniforms.psSphColor,
+      psSphRange: ps1LightUniforms.psSphRange,
+    },
+  });
+  // Bookkeeping mirrors of the Basic material's properties, so palette-row
+  // rebuilds (which read/assign .map), disposal, and conversion back to
+  // Basic don't need special cases beyond "is it a ShaderMaterial".
+  material.map = map || null;
+  material.alphaTest = alphaTest || 0;
+  return material;
+}
+
+const _ps1AimDir = new THREE.Vector3();
+
+/**
+ * Re-derive the PS1 rig from the stage's authored Light entities. Runs
+ * every frame while the preview is active (see renderLoop) so gizmo drags
+ * and property scrubs on lights relight the viewport live.
+ */
+function updatePS1LightsFromEntities() {
+  const directionals = [];
+  const spheres = [];
+  let ar = 0;
+  let ag = 0;
+  let ab = 0;
+
+  // instances is a Map and Maps iterate in insertion order, which matches
+  // the state's entity order - the same order stage_export.js emits and
+  // the runtime's load_stage_lights() consumes its first three
+  // directionals from. So "first 3 here" == "first 3 on the console".
+  for (const inst of instances.values()) {
+    if (!inst.isEntity || inst.kind !== 'light') continue;
+    if (inst.props.disabled) continue; // per-light Disabled tickbox: authored off, same skip the runtime does
+    const type = inst.props.lightType || 'spherical';
+    const intensity = Math.max(0, inst.props.intensity ?? 1);
+
+    if (type === 'directional') {
+      if (directionals.length < 3) directionals.push({ inst, intensity });
+    } else if (type === 'ambient') {
+      // Ambients SUM into one back-colour term, exactly like the runtime
+      // folding every authored ambient into BK (clamped per channel).
+      const c = new THREE.Color(parseLightColor(inst.props.color));
+      ar += c.r * intensity;
+      ag += c.g * intensity;
+      ab += c.b * intensity;
+    } else if (type === 'spherical') {
+      // Both mobilities preview identically: per-fragment falloff IS what
+      // static lights bake to, and the runtime's interim dynamic path
+      // approximates the same math per object (see the shader comment).
+      if (spheres.length < PS1_MAX_PREVIEW_SPHERES) spheres.push({ inst, intensity });
+    }
+    // spot / debug: intentionally ignored - they are not lit by the
+    // runtime yet either (see this section's header comment).
+  }
+
+  ps1LightUniforms.psAmbient.value.setRGB(Math.min(1, ar), Math.min(1, ag), Math.min(1, ab));
+
+  for (let i = 0; i < 3; i++) {
+    const colorU = ps1LightUniforms.psLightColor.value[i];
+    const dirU = ps1LightUniforms.psLightDir.value[i];
+    const entry = directionals[i];
+    if (!entry) {
+      colorU.setRGB(0, 0, 0); // unused GTE light-matrix row == zeroed
+      continue;
+    }
+
+    // Colour * intensity, the shader's per-light coefficient. Authored 0
+    // stays a valid "off" (black coefficient, light contributes nothing).
+    colorU.setHex(parseLightColor(entry.inst.props.color)).multiplyScalar(entry.intensity);
+
+    // The light AIMS along its marker's world -Z (the dirPointer rod, the
+    // same forward convention stage_export.js's lightDirFromRot encodes);
+    // the shader wants the unit vector TOWARD the light, i.e. its negation.
+    entry.inst.object3D.updateWorldMatrix(true, false);
+    _ps1AimDir.set(0, 0, -1).transformDirection(entry.inst.object3D.matrixWorld);
+    dirU.copy(_ps1AimDir).negate();
+  }
+
+  for (let i = 0; i < PS1_MAX_PREVIEW_SPHERES; i++) {
+    const colorU = ps1LightUniforms.psSphColor.value[i];
+    const entry = spheres[i];
+    if (!entry) {
+      colorU.setRGB(0, 0, 0); // unused slot: black coefficient == no light
+      continue;
+    }
+    colorU.setHex(parseLightColor(entry.inst.props.color)).multiplyScalar(entry.intensity);
+    entry.inst.object3D.updateWorldMatrix(true, false);
+    entry.inst.object3D.getWorldPosition(ps1LightUniforms.psSphPos.value[i]);
+    ps1LightUniforms.psSphRange.value[i] = Math.max(0, entry.inst.props.range || 0);
+  }
+}
+
+/** Build the unlit/lit counterpart of one instance material, carrying over
+ * everything load-bearing: name (palette-row rebuilds look materials up BY
+ * NAME - see updateInstancePaletteRow), map, alphaTest (PS1 black=
+ * transparent texels), side, color (including the missing-texture flag
+ * colour), and userData (which carries the missingTexture flag itself). */
+function buildCounterpartMaterial(mat, lit) {
+  const srcColor = mat.isShaderMaterial ? mat.uniforms.baseColor.value : mat.color;
+  let next;
+  if (lit) {
+    next = buildPS1LitMaterial(srcColor, mat.map || null, mat.alphaTest || 0, mat.side);
+  } else {
+    next = new THREE.MeshBasicMaterial({ color: srcColor.clone(), side: mat.side });
+    next.map = mat.map || null;
+    next.alphaTest = mat.alphaTest || 0;
+  }
+  next.name = mat.name;
+  next.userData = { ...mat.userData };
+  next.needsUpdate = true;
+  return next;
+}
+
+/** Swap every mesh material on one instance between unlit (editor) and lit
+ * (PS1 preview). The old material is disposed but its texture map is NOT -
+ * it transfers to the replacement (removeInstance still owns final map
+ * disposal). Already-correct materials pass through untouched, so this is
+ * cheap to call redundantly. */
+function applyLightingModeToObject(object3D, lit) {
+  object3D.traverse((child) => {
+    if (!child.isMesh) return;
+    const convert = (m) => {
+      if (lit ? m.isShaderMaterial : m.isMeshBasicMaterial) return m;
+      const next = buildCounterpartMaterial(m, lit);
+      m.dispose();
+      return next;
+    };
+    child.material = Array.isArray(child.material)
+      ? child.material.map(convert)
+      : convert(child.material);
+  });
+}
+
+/**
+ * Enable/disable the PS1 lighting parity preview. Swaps which rig is
+ * visible and converts every MODEL instance's materials (entity markers
+ * are editor UI and stay unlit - see the section header). Returns the
+ * resulting state so the caller can reflect it in the toggle UI.
+ */
+export function setPS1LightingEnabled(enabled) {
+  const next = !!enabled;
+  if (next === ps1LightingEnabled) return ps1LightingEnabled;
+  ps1LightingEnabled = next;
+
+  for (const inst of instances.values()) {
+    if (inst.isEntity) continue;
+    applyLightingModeToObject(inst.object3D, next);
+  }
+
+  if (next) updatePS1LightsFromEntities();
+  return ps1LightingEnabled;
+}
+
+/** Whether the PS1 lighting parity preview is currently active. */
+export function isPS1LightingEnabled() {
+  return ps1LightingEnabled;
+}
+
+/** Recolour every missing-texture material on one instance to match the
+ * CURRENT Missing=White toggle. Works on both material types. */
+function applyMissingTextureColor(object3D) {
+  const hex = missingTextureWhite ? 0xffffff : 0xff00ff;
+  object3D.traverse((child) => {
+    if (!child.isMesh) return;
+    const mats = Array.isArray(child.material) ? child.material : [child.material];
+    for (const m of mats) {
+      if (!m.userData.missingTexture) continue;
+      if (m.isShaderMaterial) m.uniforms.baseColor.value.setHex(hex);
+      else m.color.setHex(hex);
+    }
+  });
+}
+
+/**
+ * Toggle how missing-texture materials display: magenta flag colour
+ * (default) or solid white. White is the useful probe under the PS1
+ * preview: an untextured white face shows the raw lit colour, i.e. the
+ * exact brightness the runtime's flat prims would output. Returns the
+ * resulting state for the UI.
+ */
+export function setMissingTextureWhite(enabled) {
+  missingTextureWhite = !!enabled;
+  for (const inst of instances.values()) {
+    if (inst.isEntity) continue;
+    applyMissingTextureColor(inst.object3D);
+  }
+  return missingTextureWhite;
 }
 
 // ==========================================================================

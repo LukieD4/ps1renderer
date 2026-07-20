@@ -109,6 +109,20 @@ int sfx_stage_loaded_count(void);
 int sfx_stage_unresolved_count(void);
 int sfx_stage_muted_count(void);
 
+// FIRST failure step of the stage's load pass (SND_ERR_* in sound.h;
+// SND_ERR_NONE = nothing failed). Companion to unresolved_count: that
+// says a sound didn't load, this says WHICH STEP its load died at -
+// shown as SFXERR= on the overlay so a hardware-only silence can be
+// diagnosed from a single photographed frame.
+int sfx_stage_first_error(void);
+
+// Where this stage's loaded sounds came from: CD (tier 1) vs. the copy
+// embedded in the EXE (tier 2 fallback). Overlay SRC=C<n>/E<m>; E>0
+// with audio playing = the CD path failed (see SFXERR) and the embed
+// tier rescued it.
+int sfx_stage_src_cd_count(void);
+int sfx_stage_src_emb_count(void);
+
 // The active stage's authored music entity (first mode==SFX_MODE_MUSIC
 // sound WITH autoplay set - autoplay is music's enable toggle, so a
 // stage may author several tracks and tick exactly one; unticked tracks

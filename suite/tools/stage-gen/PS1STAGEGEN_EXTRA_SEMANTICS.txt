@@ -1,5 +1,5 @@
 PS1STAGEGEN EXTRA SEMANTICS
-Editor-native entities: Billboard, Trigger, Spawn, Summon, Sound
+Editor-native entities: Billboard, Trigger, Spawn, Summon, Sound, Light
 ================================================================
 
 Companion to PS1AUDIO_SEMANTICS / PS1TIM_SEMANTICS / PS1CUSTOM_MUSIC_
@@ -287,6 +287,60 @@ entity kind "graduates".
   Voices: 8 for sfx, 16 for music. Sounds per stage: 8 (== voice pool).
   A sound that misses any budget (RAM, voice, file) counts UNRES and
   plays nothing - the stage still runs.
+
+
+6b. LIGHT  (color #ffe066, warm yellow)
+---------------------------------------
+
+Scene light marker. EXPORTED to stage.json (the second kind to graduate,
+after Sound): py_convert_stages.py bakes lights into STAGE_LIGHT[] and
+main.c consumes DIRECTIONAL (up to 3) + AMBIENT via the GTE registers,
+and SPHERICAL via the live per-object approximation (PS1_GTE_LIGHTING_
+SEMANTICS 5.1b); spot still awaits the offline vertex bake. Budget
+context: the GTE natively affords ~3 directional light vectors plus one
+ambient (back) color; spherical and spot are CPU approximations - which
+is why `lightType` is a single-select (mutually exclusive), not
+stackable toggles.
+
+Params:
+  lightType : select, default 'spherical'
+      spherical / directional / spot / ambient / debug. Drives which of
+      the fields below are shown (showIf), same mechanism as Sound's mode.
+  disabled  : bool, default false  - all types.
+      Authored kill switch for this light. STILL exported to stage.json
+      (never dropped - stays authoritative authored data); the runtime's
+      load_stage_lights() and the PS1 viewport preview just skip applying
+      it. Unlike intensity 0, immune to the DEBUG L2 intensity editor.
+  mobility  : select, default 'static'  [spherical, spot]
+      static = destined for the offline vertex bake (zero runtime cost,
+      static geometry); dynamic = lit live per object every frame,
+      competing for the GTE's free light slots. Until the bake exists the
+      runtime lights BOTH via the live path - the flag is authored now so
+      stages survive the bake landing unchanged. Hidden for directional/
+      ambient (GTE-native, always live). Exports as `mobility`, converts
+      to STAGE_LIGHT.isStatic.
+  color     : color (#rrggbb), default #ffffff
+      New 'color' prop type - a native swatch (app.js renderEntityProps).
+      Committed value is the browser's lowercase hex string; persists
+      verbatim and round-trips through the schema-default merge on load.
+      The viewport tints the marker's bulb with it live.
+  intensity : number 0-1, default 1.0   - all types.
+  range     : number, default 5         [spherical, spot]
+      Distance falloff radius in viewport units (*1024 at export when
+      graduated). 0 = infinite / no falloff. Hidden for directional
+      (a sun) and ambient (global) - neither has a position.
+  coneAngle : number degrees, default 30 [spot only]  - cone half-angle.
+  penumbra  : number 0-1, default 0.2    [spot only]  - edge softness.
+
+  Direction (directional + spot) is the entity's own -Z, set with the
+  rotation gizmo - rotation IS the aim, same convention as Spawn's
+  pointer, so there is no separate direction field.
+
+  Viewport helper: one superset marker whose pieces toggle per lightType
+  (applyEntityPropsToMeshes, no rebuild on type switch) - a color-tinted
+  bulb + wireframe glow (always), an XZ falloff ring (spherical/spot,
+  hidden at range 0), a forward -Z aim rod (directional/spot), and a
+  wireframe cone sized by coneAngle + range (spot only).
 
 
 7. GRADUATING ANOTHER KIND (the recipe Sound proved)

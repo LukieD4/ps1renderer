@@ -79,6 +79,28 @@ static SFX_SLOT slots[SFX_MAX_STAGE_SOUNDS];
 static unsigned int slotCount = 0;      // sounds the active stage authored (clamped)
 static unsigned int loadedCount = 0;    // of those, how many are resident + voiced
 static unsigned int unresolvedCount = 0;
+
+// FIRST failure step of this stage's load pass (SND_ERR_* from sound.h,
+// SND_ERR_NONE while everything resolved). Overlay diagnostic: UNRES>0
+// says a sound didn't load, this says WHERE its load died - which is the
+// difference between "file missing from the ISO" (SEARCH), "drive can't
+// read it" (READ) and "read garbage" (MAGIC) when hardware disagrees
+// with the emulator. First failure only: with a shared root cause every
+// slot fails the same way, and the first is the untainted one.
+static uint8_t firstErr = SND_ERR_NONE;
+
+// How many of this stage's loaded sounds came off the CD vs. out of the
+// EXE's embedded copy (tier-2 fallback). Overlay shows SRC=C<n>/E<m>:
+// on a healthy disc E is 0; E>0 with audio playing means the CD path
+// failed (see ERR=) and the embed tier rescued it.
+static unsigned int srcCdCount  = 0;
+static unsigned int srcEmbCount = 0;
+
+static void sfx_record_err(uint8_t step)
+{
+    if (firstErr == SND_ERR_NONE)
+        firstErr = step;
+}
 static unsigned int mutedCount = 0;     // latched by muteAfterPlay
 static unsigned int musicCount = 0;     // mode==MUSIC entries (excluded from the sfx counts)
 static int stagePlaying = 0;            // master ambience on/off flag
@@ -143,36 +165,72 @@ static uint32_t sfx_isqrt(uint32_t v)
 // Generic VAG loader (the old sound.c wind loader, parameterized)
 // ------------------------------------------------------------
 
-// Loads `cdPath`'s VAG off the disc, reserves SPU RAM through sound.c's
-// shared allocator, uploads the body, and fills `slot`'s waveform fields
-// (not its voice - the caller assigns that). Returns 1 on success. On any
+// sfx_load_vag (below) fetches `cdPath`'s VAG - tier 1 the disc, tier 2
+// the EXE-embedded copy - reserves SPU RAM through sound.c's shared
+// allocator, uploads the body, and fills `slot`'s waveform fields (not
+// its voice - the caller assigns that). Returns 1 on success. On any
 // failure the slot is left not-loaded and NO SPU RAM stays reserved, so
 // the caller can just count it unresolved and move on.
-static int sfx_load_vag(const char *cdPath, SFX_SLOT *slot)
+
+// Tier-1 CD fetch: search + size bounds + hardened read (retries and a
+// speed fallback via sound_cd_read) into sfx_vagbuf. Returns the bytes,
+// or NULL with the failing step recorded for the overlay's SFXERR=.
+static const uint8_t *sfx_cd_fetch(const char *cdPath, uint32_t *size)
 {
     if (!sound_cd_ready())
-        return 0; // CdInit failed at boot (no disc?) - degrade to silence
+    {
+        sfx_record_err(SND_ERR_NOCD);
+        return 0; // CdInit failed at boot - CD tier is down entirely
+    }
 
     CdlFILE file;
     if (!CdSearchFile(&file, cdPath))
-        return 0; // not on the disc (typo'd sample name, or iso.xml entry missing)
+    {
+        sfx_record_err(SND_ERR_SEARCH);
+        return 0; // not found (typo'd sample name, iso.xml entry missing, or hardware directory-parse failure)
+    }
 
     if (file.size <= 48 || file.size > SFX_MAX_VAG_BYTES)
+    {
+        sfx_record_err(SND_ERR_SIZE);
         return 0; // too small to be a real VAG, or won't fit our load buffer
+    }
 
-    // Whole 2048-byte sectors at double speed; CdReadSync(0,...) blocks
-    // until every sector has landed (or returns <0 on a read error).
-    int sectors = (file.size + 2047) / 2048;
-    CdControl(CdlSetloc, (const uint8_t *)&file.pos, 0);
-    CdRead(sectors, sfx_vagbuf, CdlModeSpeed);
-    if (CdReadSync(0, 0) < 0)
-        return 0;
+    if (!sound_cd_read(&file.pos, (int)((file.size + 2047) / 2048), sfx_vagbuf))
+    {
+        sfx_record_err(SND_ERR_READ);
+        return 0; // every retry at both speeds failed
+    }
 
-    const uint8_t *bytes = (const uint8_t *)sfx_vagbuf;
+    *size = (uint32_t)file.size;
+    return (const uint8_t *)sfx_vagbuf;
+}
 
-    // Sanity-check the magic before trusting the header.
-    if (!(bytes[0] == 'V' && bytes[1] == 'A' && bytes[2] == 'G' && bytes[3] == 'p'))
-        return 0;
+static int sfx_load_vag(const char *cdPath, SFX_SLOT *slot)
+{
+    // Tier 1: the disc. On ANY failure - including a read that
+    // "succeeds" but returns garbage (magic mismatch) - fall through to
+    // tier 2, the copy baked into the EXE, so a hostile CD path costs
+    // sound nothing while the recorded ERR step still diagnoses it.
+    uint32_t fsize = 0;
+    const uint8_t *bytes = sfx_cd_fetch(cdPath, &fsize);
+    uint8_t fromEmbed = 0;
+
+    if (bytes &&
+        !(bytes[0] == 'V' && bytes[1] == 'A' && bytes[2] == 'G' && bytes[3] == 'p'))
+    {
+        sfx_record_err(SND_ERR_MAGIC);
+        bytes = 0; // CD copy is garbage - try the embedded one
+    }
+
+    if (!bytes)
+    {
+        bytes = sound_embed_find(cdPath, &fsize);
+        if (!bytes || fsize <= 48 ||
+            !(bytes[0] == 'V' && bytes[1] == 'A' && bytes[2] == 'G' && bytes[3] == 'p'))
+            return 0; // not baked in either (or embed data bad) - truly unresolved
+        fromEmbed = 1;
+    }
 
     // Sampling frequency is a BIG-ENDIAN field at offset 0x10 (the VAG
     // header is big-endian even though the console is little-endian - see
@@ -187,14 +245,17 @@ static int sfx_load_vag(const char *cdPath, SFX_SLOT *slot)
 
     // Body = everything after the 48-byte header.
     const uint32_t *body = (const uint32_t *)(bytes + 48);
-    uint32_t body_bytes  = (uint32_t)file.size - 48;
+    uint32_t body_bytes  = fsize - 48;
 
     // Reserve this waveform's slice through the shared bump allocator so
     // it's counted in the debug overlay's SPU RAM budget. 0 = budget
     // exhausted - skip rather than clobber another sample.
     slot->spu_addr = sound_spu_reserve(body_bytes);
     if (slot->spu_addr == 0)
+    {
+        sfx_record_err(SND_ERR_SPUALLOC);
         return 0;
+    }
 
     SpuSetTransferStartAddr(slot->spu_addr);
     SpuWrite(body, body_bytes);
@@ -241,6 +302,11 @@ static int sfx_load_vag(const char *cdPath, SFX_SLOT *slot)
 
     slot->body_bytes = body_bytes;
     slot->owns_spu   = 1;
+
+    if (fromEmbed)
+        srcEmbCount++;
+    else
+        srcCdCount++;
     return 1;
 }
 
@@ -309,6 +375,9 @@ void sfx_stage_unload(void)
     slotCount = 0;
     loadedCount = 0;
     unresolvedCount = 0;
+    firstErr = SND_ERR_NONE;
+    srcCdCount = 0;
+    srcEmbCount = 0;
     mutedCount = 0;
     musicCount = 0;
     stageMusic = 0;
@@ -421,6 +490,7 @@ void sfx_stage_load(const STAGE_DEF *stage)
         // on the overlay, instead of silently aliasing another voice.
         if (nextVoice >= SFX_VOICE_FIRST + SFX_VOICE_COUNT)
         {
+            sfx_record_err(SND_ERR_VOICE);
             slot->loaded = 0;
             unresolvedCount++;
             continue;
@@ -654,4 +724,19 @@ int sfx_stage_unresolved_count(void)
 int sfx_stage_muted_count(void)
 {
     return (int)mutedCount;
+}
+
+int sfx_stage_first_error(void)
+{
+    return (int)firstErr;
+}
+
+int sfx_stage_src_cd_count(void)
+{
+    return (int)srcCdCount;
+}
+
+int sfx_stage_src_emb_count(void)
+{
+    return (int)srcEmbCount;
 }

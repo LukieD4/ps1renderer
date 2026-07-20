@@ -2,6 +2,8 @@
 build/
 generated/
 _idea/
+_indev/
+SD2psx/
 
 *.blend
 *.blend1

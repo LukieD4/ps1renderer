@@ -58,6 +58,7 @@
 #include <psxgpu.h>
 #include <psxapi.h>   // BIOS API: InitPAD, StartPAD, ChangeClearPAD, etc.
 #include <psxpad.h>   // PadButton enums (PAD_UP, PAD_DOWN, PAD_LEFT, PAD_RIGHT)
+#include <hwregs_c.h> // raw SPU registers for debug page 2's audio dump
 #include <inline_c.h> // GTE macros (gte_ldv0, gte_rtpt, gte_nclip, etc.)
 
 // SPU core (sound.c): boots SPU + CD and owns the shared SPU RAM allocator.
@@ -281,7 +282,7 @@ static int control_mode = MODE_PLAY;
 // in update(); requires the DualShock in analog mode). debug_text() reads
 // this to pick which block of readouts to print.
 static int debug_page = 0;
-#define DEBUG_PAGE_COUNT 1
+#define DEBUG_PAGE_COUNT 2 // page 2 = audio deep-dive (L3 cycles)
 
 
 
@@ -397,17 +398,20 @@ VECTOR model_pos = { 0, 0, 0 };
 // update_camera_matrix()).
 MATRIX world_matrix;
 
-// Rotated face normal cache (one per triangle, post-transform), reused
-// as shared scratch across every drawn object - draw_stage() always
-// fully finishes one object (rotate -> cull -> draw) before moving to
-// the next, so nothing here needs to survive past a single object's turn.
-// Index-matches a model's faceNormals/tris 1:1.
-SVECTOR transformedNormals[MAX_MODEL_TRIS];
+// Per-FACE lit colour cache (one RGB per triangle), reused as shared
+// scratch across every drawn object - draw_stage() always fully finishes
+// one object (light -> cull -> draw) before moving to the next, so nothing
+// here needs to survive past a single object's turn. Filled by
+// compute_object_lighting(): the GTE hardware path writes gte_ncs output
+// here; the legacy headlamp path writes grayscale here. draw_object_into_
+// ot() then just reads the colour - no lighting math in the draw loop.
+// Index-matches a model's faceNormals/tris 1:1 (flat + textured-flat).
+CVECTOR transformedFaceColors[MAX_MODEL_TRIS];
 
-// Rotated VERTEX normal cache, same shared-scratch reasoning as
-// transformedNormals above. Index-matches vertNormals/verts 1:1; looked
-// up per-triangle-corner in draw_object_into_ot() for Gouraud shading.
-SVECTOR transformedVertNormals[MAX_MODEL_VERTS];
+// Per-VERTEX lit colour cache, same shared-scratch reasoning. Index-matches
+// vertNormals/verts 1:1; looked up per-triangle-corner in draw_object_into_
+// ot() for Gouraud shading (untextured G3 + textured GT3).
+CVECTOR transformedVertColors[MAX_MODEL_VERTS];
 
 // Cached per-vertex screen-space projection, one entry per unique model
 // vertex - built ONCE per object per frame by transform_object_vertices()
@@ -416,7 +420,7 @@ SVECTOR transformedVertNormals[MAX_MODEL_VERTS];
 // gte_rtpt() per TRIANGLE. Since most vertices are shared by more than
 // one triangle, this cuts the GTE's most expensive op (rotate+translate+
 // perspective) from 3x triangleCount down to just vertCount calls per
-// object. Same shared-scratch reasoning as transformedNormals above.
+// object. Same shared-scratch reasoning as transformedFaceColors above.
 static DVECTOR transformedScreenXY[MAX_MODEL_VERTS];
 static uint32_t transformedScreenSZ[MAX_MODEL_VERTS];
 
@@ -582,6 +586,12 @@ static int find_model_index_by_name(const char *name)
 }
 
 
+// Populates the GTE lighting state from a stage's authored lights, or
+// clears all lighting when it authors none (no recovery sun). Defined
+// further down (near the light globals it writes); forward-declared here because
+// load_stage() below calls it.
+void load_stage_lights(const STAGE_DEF *stage);
+
 // Makes `index` (into stageRegistry[]) the active stage: pulls its
 // camera block into the live CAMERA struct, and resolves every object's
 // model-name string against modelRegistry[] ONCE. Safe to call again
@@ -603,6 +613,7 @@ void load_stage(unsigned int index)
         // draw_stage() simply has zero objects to draw (and sfx has zero
         // sounds to play - unloaded above).
         activeStageIndex = 0;
+        load_stage_lights(0); // no stage -> no authored lights (scene unlit)
         return;
     }
 
@@ -644,6 +655,10 @@ void load_stage(unsigned int index)
     // so stage sounds sit ABOVE the music bank in the SPU bump allocator
     // and a runtime stage switch can release them without touching music.
     sfx_stage_load(stage);
+
+    // Build the GTE lighting state from this stage's authored lights (or
+    // clear all lighting when it authors none - no recovery sun).
+    load_stage_lights(stage);
 }
 
 
@@ -686,8 +701,11 @@ void init(void)
     // Load debug font
     FntLoad(960, 0);
 
-    // Open up a debug font text stream of 500 characters
-    FntOpen(0, 8, 320, 224, 0, 500);
+    // Open up a debug font text stream of 800 characters (600 was within
+    // ~30 chars of page 0's total once the CD/ERR diagnostics landed -
+    // an overflow here silently truncates the LAST lines, which are
+    // exactly the audio diagnostics we photograph hardware for).
+    FntOpen(0, 8, 320, 224, 0, 800);
 
     // Init pad (BIOS driver). Only padbuf[0] (controller 1) is actually
     // read by update() now - the BIOS pad driver still expects a second
@@ -796,6 +814,237 @@ void display(void)
 
 
 uint8_t use_vertex_light = 1;
+
+// ---- GTE hardware lighting (world-space, coloured, up to 3 lights) ------
+// When sun_lighting is on, compute_object_lighting() uses the GTE's native
+// lighting path (gte_ncs): each normal is dotted against up to THREE
+// world-space directional lights, scaled by their colours, added to a
+// global ambient, and clamped >= 0 by the hardware (so it is ONE-SIDED -
+// faces turned away from a light get ambient only, unlike the old headlamp
+// abs()). R2 in DEBUG mode toggles this against the legacy camera headlamp.
+//
+// Applied to EVERY object for now (so it's visible on any test model); once
+// static geometry is baked, placed objects will read baked vertex colours
+// and only dynamic actors will keep this live path.
+//
+// LIGHTS ARE AUTHORED PER STAGE: load_stage_lights() overwrites all three
+// globals below from the active stage's STAGE_LIGHT[] every time a stage
+// loads (and zeroes them when it authors none). The initial values here are
+// only what's in effect before the first stage loads - there is no recovery
+// sun, so a stage that authors no directional light stays unlit.
+uint8_t sun_lighting = 1;
+
+// LIGHT DIRECTION MATRIX: each ROW is one light's world-space direction
+// (the unit vector TOWARD the light; |.| ~= ONE). An all-zero row disables
+// that light. Per object this is multiplied by the object's rotation
+// (MulMatrix0) so the light stays fixed in the world, not welded to the
+// model. Overwritten per stage (see above).
+MATRIX g_light_dir_matrix = {
+    0, 0, 0,   // light 0 (set by load_stage_lights)
+    0, 0, 0,   // light 1
+    0, 0, 0,   // light 2
+};
+
+// FRAME-SCALED copy of g_light_dir_matrix, rebuilt by setup_frame_lighting()
+// every frame and consumed by compute_object_lighting() in place of the
+// authored matrix. This is where each light's >1.0 effective-intensity half
+// lives: the unit colour bake already sits at the int16 ceiling of the GTE
+// colour matrix (white bakes to 32640 of 32767), so scaling the COLOUR
+// matrix upward saturates immediately and visibly does nothing. The diffuse
+// term is colour * (dir . normal) - linear in BOTH factors - and the
+// direction rows sit at ONE (4096) magnitude, a full 8x below their own
+// int16 ceiling, so the boost is applied per row here instead, with
+// identical visual effect.
+MATRIX g_light_dir_frame = {
+    0, 0, 0,
+    0, 0, 0,
+    0, 0, 0,
+};
+
+// LIGHT COLOUR MATRIX: each COLUMN is one light's RGB (ONE == 1.0). Laid
+// out row-major as reds / greens / blues across the 3 lights, matching the
+// PSn00bSDK convention. Overwritten per stage (see above).
+//
+// SCALE NOTE: with gte_ncs the per-vertex output is
+//   clamp(ambient + colour * IR >> 12, 255),  IR = (dir . normal) >> 12.
+// This engine's normals are magnitude 1024 (a quarter of ONE), so a fully
+// light-facing face reaches IR ~= 1024. load_stage_lights() bakes each
+// authored light's colour to ~8*ONE at intensity 1.0 to suit that scale.
+MATRIX g_light_color_matrix = {
+    0, 0, 0,   // reds   (set by load_stage_lights)
+    0, 0, 0,   // greens
+    0, 0, 0,   // blues
+};
+
+// Global AMBIENT (GTE back colour): added to every lit vertex, and the floor
+// a one-sided face falls to when it faces away from every light. Overwritten
+// per stage by load_stage_lights() (authored ambient, or 0 if none).
+int g_ambient_r = 0, g_ambient_g = 0, g_ambient_b = 0;
+
+// ---- Live intensity editor (DEBUG mode, hold L2 + Up/Down) --------------
+// Redefined from the old multiplicative "dimmer": L2 now edits the lights'
+// INTENSITY directly, stage-gen style. Authored per-light intensities are
+// kept at runtime (g_light_dir_int[] below) and this signed OFFSET shifts
+// them all equally: effective_i = clamp(authored_i + offset, 0, 2047).
+// 256 == 1.0, the same scale stage-gen's Intensity (0-1) field bakes to,
+// so the overlay's INT readout is directly comparable to what was
+// authored. Because the offset is ADDITIVE, an authored intensity-0 light
+// can now be raised live (the old multiplier was stuck at 0 x anything ==
+// 0 forever). A stage with NO authored directional still stays unlit no
+// matter what - the offset shifts existing lights, it never invents one.
+int g_light_intensity_offset = 0;   // signed, 256 == +/-1.0. L2+Up/Down.
+
+// Authored per-directional intensity (256 == 1.0), captured by
+// load_stage_lights(). Intensity is NO LONGER baked into the colour
+// matrix - setup_frame_lighting() applies these live each frame, which is
+// what lets the DEBUG offset move them.
+int g_light_dir_int[3] = { 0, 0, 0 };
+
+// ---- Spherical (point) lights: live per-object path ---------------------
+// The active stage's spherical lights, collected by load_stage_lights().
+// The GTE has no native point light (semantics doc section 3), so
+// compute_object_lighting() approximates each as a DIRECTIONAL light aimed
+// from the light at THIS OBJECT'S CENTRE, with linear range attenuation
+// evaluated once per object - flat across a large mesh, cheap everywhere -
+// and packs the brightest ones into whichever of the 3 GTE light slots the
+// authored directionals left free (authored directionals always win the
+// slot budget). STATIC-mobility lights are destined for the offline vertex
+// bake (doc section 8); until that exists they take this live path too, so
+// authored stages light correctly today - when the bake lands, isStatic
+// lights leave this list and bake into static geometry instead.
+#define MAX_SPHERE_LIGHTS 8
+static const STAGE_LIGHT *g_sphere_lights[MAX_SPHERE_LIGHTS];
+static int g_sphere_light_count = 0;
+
+// Frame-scaled colour matrix (directional columns x live intensity), kept
+// in a global (not just the GTE register) because objects with sphere
+// contributions build a per-object copy with their sphere columns filled
+// in, then restore-by-overwrite for the next object.
+static MATRIX g_frame_color_matrix;
+
+// ---- Authored stage lights ---------------------------------------------
+// load_stage_lights() writes the active stage's authored DIRECTIONAL and
+// AMBIENT lights into g_light_dir_matrix / g_light_color_matrix / back
+// colour. There is NO recovery sun: a stage that authors no directional
+// light simply has none (its directional slots are zeroed), and ambient is
+// whatever the stage authored or, absent that, nothing. Light a stage by
+// authoring a Light entity - stage-gen seeds every new stage with a default
+// directional "Sun"; delete it and the stage is genuinely unlit.
+uint8_t stage_lights_active = 0; // 1 = the stage authored >=1 directional
+int authored_light_count = 0;    // authored directionals in use (overlay)
+
+// Populate the GTE lighting registers' backing state from `stage`'s authored
+// STAGE_LIGHT[] (baked by py_convert_stages.py). Called once per stage from
+// load_stage(). Up to 3 DIRECTIONAL lights fill the light-direction rows and
+// colour-matrix columns; AMBIENT lights sum into the back colour. A stage
+// with no directional lights (or stage == NULL) gets NO directional light -
+// the unused slots are zeroed and there is no recovery sun; likewise no
+// authored ambient means no ambient. Nothing is invented.
+void load_stage_lights(const STAGE_DEF *stage)
+{
+    stage_lights_active = 0;
+    authored_light_count = 0;
+    g_sphere_light_count = 0;
+
+    int dirCount = 0;
+    int ambR = 0, ambG = 0, ambB = 0, haveAmbient = 0;
+
+    if (stage && stage->lights)
+    {
+        for (unsigned int i = 0; i < stage->lightCount; i++)
+        {
+            const STAGE_LIGHT *lt = &stage->lights[i];
+
+            // Per-light Disabled tickbox: authored off. The light stays in
+            // the stage data (authoritative - nothing resurrects in its
+            // place) but is skipped entirely here, so it neither fills a
+            // GTE slot nor sums into ambient nor joins the sphere list.
+            // Unlike intensity 0, it is immune to the DEBUG L2 editor.
+            if (lt->disabled)
+                continue;
+
+            if (lt->type == LIGHT_DIRECTIONAL && dirCount < 3)
+            {
+                // Direction row: the authored unit vector TOWARD the light
+                // (ONE == 4096), used directly (MulMatrix0 composes it with
+                // each object's rotation per frame).
+                g_light_dir_matrix.m[dirCount][0] = lt->dir.vx;
+                g_light_dir_matrix.m[dirCount][1] = lt->dir.vy;
+                g_light_dir_matrix.m[dirCount][2] = lt->dir.vz;
+
+                // Colour column: baked at UNIT intensity - (channel << 7)
+                // puts full white at 32640 (~8*ONE), the scale the engine's
+                // 1024-magnitude normals need (see the 1024-normal note
+                // above; 255 << 7 = 32640 <= 32767, so no clamp needed).
+                // The light's authored INTENSITY is deliberately NOT baked
+                // in any more: it is stored aside in g_light_dir_int[] and
+                // applied live by setup_frame_lighting(), so the DEBUG
+                // intensity editor can move it - including up from an
+                // authored 0, which the old baked-in multiply made
+                // permanently dark.
+                g_light_color_matrix.m[0][dirCount] = (short)((int)lt->r << 7);
+                g_light_color_matrix.m[1][dirCount] = (short)((int)lt->g << 7);
+                g_light_color_matrix.m[2][dirCount] = (short)((int)lt->b << 7);
+                g_light_dir_int[dirCount] = lt->intensity;
+
+                dirCount++;
+            }
+            else if (lt->type == LIGHT_AMBIENT)
+            {
+                // Ambient contributes to the back colour: intensity 1.0
+                // passes the 0-255 colour through unchanged.
+                ambR += ((int)lt->r * lt->intensity) >> 8;
+                ambG += ((int)lt->g * lt->intensity) >> 8;
+                ambB += ((int)lt->b * lt->intensity) >> 8;
+                haveAmbient = 1;
+            }
+            else if (lt->type == LIGHT_SPHERICAL && g_sphere_light_count < MAX_SPHERE_LIGHTS)
+            {
+                // Live per-object path (see g_sphere_lights) - STATIC ones
+                // included until the offline vertex bake exists. Intensity-0
+                // lights are kept: authored-off but L2-raiseable, the same
+                // authoritative rule directionals follow.
+                g_sphere_lights[g_sphere_light_count++] = lt;
+            }
+            // SPOT / DEBUG are carried in the data but not yet consumed
+            // here - spot awaits the offline vertex-baking pass.
+        }
+    }
+
+    // Zero every directional slot the stage did NOT author (rows dirCount..2
+    // of the direction matrix and the matching colour columns). This both
+    // clears stale data from a previously-loaded stage AND, when dirCount is
+    // 0, wipes ALL directionals - a stage with no authored directional has no
+    // directional light. There is no recovery sun to fall back to.
+    for (int d = dirCount; d < 3; d++)
+    {
+        g_light_dir_matrix.m[d][0] = g_light_dir_matrix.m[d][1] = g_light_dir_matrix.m[d][2] = 0;
+        g_light_color_matrix.m[0][d] = g_light_color_matrix.m[1][d] = g_light_color_matrix.m[2][d] = 0;
+        g_light_dir_int[d] = 0;
+    }
+
+    // The DEBUG intensity offset resets to neutral (pure authored values)
+    // for every stage.
+    g_light_intensity_offset = 0;
+    stage_lights_active = (dirCount > 0);
+    authored_light_count = dirCount;
+
+    if (haveAmbient)
+    {
+        if (ambR > 255) ambR = 255;
+        if (ambG > 255) ambG = 255;
+        if (ambB > 255) ambB = 255;
+        g_ambient_r = ambR;
+        g_ambient_g = ambG;
+        g_ambient_b = ambB;
+    }
+    else
+    {
+        // No authored ambient -> no ambient fill. A stage lights itself
+        // entirely from what it authors (nothing authored = fully dark).
+        g_ambient_r = g_ambient_g = g_ambient_b = 0;
+    }
+}
 
 // Global "prefer textures when available" toggle. Note this is now a
 // PREFERENCE, not a hard switch: draw_object_into_ot() only takes the
@@ -947,10 +1196,37 @@ static void update_camera_mode(unsigned short raw)
 // ---- DEBUG mode: model / render inspector ----
 // D-pad yaws (L/R) and pitches (U/D) the global debug transform, L1/R1 roll
 // it, CROSS/CIRCLE drive FOV, TRIANGLE toggles lighting, SQUARE toggles
-// texturing. 12-bit angles wrap via a power-of-two mask so rotation stays
-// continuous through the 0/4096 boundary instead of snapping.
+// texturing, R2 toggles GTE hardware lighting vs the legacy headlamp.
+// HOLD L2 to instead aim/dim the sun (see the block below). 12-bit angles
+// wrap via a power-of-two mask so rotation stays continuous through the
+// 0/4096 boundary instead of snapping.
 static void update_debug(unsigned short raw)
 {
+    // Hold L2: LIVE INTENSITY EDITOR (only meaningful with GTE lighting on).
+    // Up/Down moves the authored lights' intensity by eye - the model-
+    // rotation and FOV controls below are suspended while L2 is held. Light
+    // DIRECTION is authored per stage, so there is nothing to aim here; the
+    // effective values show on the overlay. The render toggles stay live.
+    if (!(raw & PAD_L2))
+    {
+        // Up/Down: live INTENSITY editor (stage-gen-style absolute value,
+        // not a multiplier). Shifts every authored directional's intensity
+        // by the same signed offset; +/-4 per held frame == 1/64 of 1.0.
+        // Each light's effective value clamps 0..2047 (~8x) in
+        // setup_frame_lighting(); the offset itself clamps to the same
+        // span so releasing/reversing always responds immediately.
+        if (!(raw & PAD_UP))    g_light_intensity_offset += 4;
+        if (!(raw & PAD_DOWN))  g_light_intensity_offset -= 4;
+        if (g_light_intensity_offset < -2047) g_light_intensity_offset = -2047;
+        if (g_light_intensity_offset >  2047) g_light_intensity_offset =  2047;
+
+        // Keep the render toggles usable while tuning.
+        if (edge_pressed(raw, PAD_TRIANGLE)) use_vertex_light ^= 1;
+        if (edge_pressed(raw, PAD_SQUARE))   use_texture ^= 1;
+        if (edge_pressed(raw, PAD_R2))       sun_lighting ^= 1;
+        return;
+    }
+
     // Pitch (X rotation): D-pad up/down.
     if (!(raw & PAD_UP))   model_rot.vx -= ROT_SPEED;
     if (!(raw & PAD_DOWN)) model_rot.vx += ROT_SPEED;
@@ -975,6 +1251,10 @@ static void update_debug(unsigned short raw)
     // Edge-detected render toggles.
     if (edge_pressed(raw, PAD_TRIANGLE)) use_vertex_light ^= 1;
     if (edge_pressed(raw, PAD_SQUARE))   use_texture ^= 1;
+    // R2 flips between GTE hardware lighting (coloured, world-space, up to
+    // 3 lights, one-sided) and the legacy camera headlamp, so the two can
+    // be compared on the same object live.
+    if (edge_pressed(raw, PAD_R2))       sun_lighting ^= 1;
 }
 
 // Reads ONE controller (padbuf[0]) and drives whichever mode is latched.
@@ -1025,7 +1305,7 @@ void update(void)
     // L3 click cycles the debug overlay page. Requires the DualShock in
     // analog mode (red LED); in digital mode the L3 bit stays high and this
     // simply never fires.
-    if (edge_pressed(raw, PAD_L3))
+    if (edge_pressed(raw, PAD_R2))
         debug_page = (debug_page + 1) % DEBUG_PAGE_COUNT;
 
     // START toggles the stage's ambient sounds on/off.
@@ -1156,35 +1436,308 @@ void update_object_world_and_compose(const VECTOR *pos, SVECTOR *rot, const VECT
 }
 
 
-// Rotates one model's face + vertex normals into the shared
-// transformedNormals/transformedVertNormals scratch arrays, using
-// whatever composed_matrix is CURRENTLY loaded in the GTE (i.e. must be
-// called right after update_object_world_and_compose() for the same
-// object, with nothing else touching the GTE's rotation matrix in
-// between).
-void rotate_object_normals(const MODEL_DEF *model)
+// Sets the FRAME-GLOBAL GTE lighting registers - the light COLOUR matrix
+// and the ambient back colour. Neither changes per object, and nothing
+// between objects touches them, so main() calls this once per frame (when
+// GTE lighting is on) before draw_stage()/draw_player(). The per-OBJECT
+// light DIRECTION matrix is set inside compute_object_lighting() instead,
+// since it is composed with each object's own rotation.
+void setup_frame_lighting(void)
 {
-    unsigned int triCount = model->triCount < MAX_MODEL_TRIS ? model->triCount : MAX_MODEL_TRIS;
-
-    // SVECTOR normals don't need translation, so this writes into
-    // transformedNormals using gte_rtv0 (rotate-only) rather than
-    // gte_rtps (rotate+translate+project).
-    for (unsigned int i = 0; i < triCount; i++)
+    // Light DIRECTIONS are fully authored per stage by load_stage_lights()
+    // (or zeroed when the stage authors none) - nothing is synthesised here.
+    // This pass applies each light's live effective intensity and pushes the
+    // ambient back colour, both once per frame.
+    //
+    // PER LIGHT: effective intensity = authored + the live DEBUG offset
+    // (256 == 1.0, clamped 0..2047). Intensity is applied HERE every frame
+    // (load_stage_lights bakes colours at unit intensity now), which is
+    // what makes the L2 editor able to raise an authored intensity-0 light
+    // - the old baked-in multiply left such a light at colour 0 forever.
+    //
+    // Each light's effective intensity is SPLIT across the two matrices,
+    // because their headroom differs wildly:
+    //   <= 1.0: scales that light's COLOUR column. The unit bake tops out
+    //           at 32640 and only ever shrinks here, so no clamp needed.
+    //   >  1.0: scales that light's DIRECTION row instead. The colour
+    //           column sits ~0.4% under its int16 ceiling, so boosting
+    //           through colour saturates after a fraction of one tick and
+    //           visibly does nothing; direction rows are ONE (4096)
+    //           magnitude with 8x headroom, and diffuse =
+    //           colour*(dir.normal) is linear in both factors, so the
+    //           visual result is identical.
+    // Light c is COLUMN c of the colour matrix and ROW c of the direction
+    // matrix (GTE register layout - see section 1/7 of the semantics doc).
+    for (int c = 0; c < 3; c++)
     {
-        gte_ldv0(&model->faceNormals[i]);
-        gte_rtv0();
-        gte_stsv(&transformedNormals[i]);
+        int eff = g_light_dir_int[c] + g_light_intensity_offset;
+        if (eff < 0)    eff = 0;
+        if (eff > 2047) eff = 2047; // ~8x: keeps a boosted 4096-magnitude
+                                    // direction row's post-rotation
+                                    // components inside int16. Capping the
+                                    // whole factor (not per component)
+                                    // preserves the light's direction.
+        int dim   = eff < 256 ? eff : 256;
+        int boost = eff > 256 ? eff : 256;
+
+        for (int r = 0; r < 3; r++)
+        {
+            g_frame_color_matrix.m[r][c] = (short)((g_light_color_matrix.m[r][c] * dim) >> 8);
+            g_light_dir_frame.m[c][r] = (short)((g_light_dir_matrix.m[c][r] * boost) >> 8);
+        }
+    }
+    g_frame_color_matrix.t[0] = g_frame_color_matrix.t[1] = g_frame_color_matrix.t[2] = 0;
+    g_light_dir_frame.t[0] = g_light_dir_frame.t[1] = g_light_dir_frame.t[2] = 0;
+
+    // Kept in a global too (not just the register): objects with sphere-
+    // light contributions load a per-object copy of this matrix with their
+    // sphere columns filled (compute_object_lighting), so the pristine
+    // directional-only version must survive the frame.
+    gte_SetColorMatrix(&g_frame_color_matrix);
+    gte_SetBackColor(g_ambient_r, g_ambient_g, g_ambient_b);
+}
+
+// Integer square root (bit-by-bit), used for sphere-light distances. Local
+// helper rather than an SDK call so there's no dependency question; inputs
+// are prescaled so they sit comfortably in 32 bits.
+static unsigned int isqrt32(unsigned int v)
+{
+    unsigned int res = 0;
+    unsigned int bit = 1u << 30;
+    while (bit > v) bit >>= 2;
+    while (bit != 0)
+    {
+        if (v >= res + bit)
+        {
+            v -= res + bit;
+            res = (res >> 1) + bit;
+        }
+        else
+        {
+            res >>= 1;
+        }
+        bit >>= 2;
+    }
+    return res;
+}
+
+// Fill the GTE light slots the authored directionals left free (slots
+// authored_light_count..2 - their rows/columns arrive zeroed) with THIS
+// object's brightest spherical lights. Per sphere, per object:
+//
+//   L     = lightPos - objectCentre        (world units, *1024)
+//   atten = range==0 ? 1 : clamp(1 - dist/range, 0, 1)   (linear falloff)
+//   eff   = clamp(authored_intensity + L2 offset, 0, 2047) * atten
+//
+// The winning spheres per free slot (largest eff = brightest at this
+// object) are packed exactly like a directional: unit toward-light row in
+// the direction matrix, unit colour bake in the colour column, eff split
+// dim-onto-colour / boost-onto-direction - the same headroom rule as
+// setup_frame_lighting(). Direction and attenuation are evaluated ONCE per
+// object (the section-3 approximation): flat across a large mesh, but
+// per-vertex falloff for static geometry is the offline bake's job.
+static void fill_sphere_light_slots(MATRIX *dmtx, MATRIX *cmtx)
+{
+    int effs[MAX_SPHERE_LIGHTS];
+    int dirx[MAX_SPHERE_LIGHTS], diry[MAX_SPHERE_LIGHTS], dirz[MAX_SPHERE_LIGHTS];
+
+    for (int i = 0; i < g_sphere_light_count; i++)
+    {
+        const STAGE_LIGHT *lt = g_sphere_lights[i];
+        effs[i] = 0;
+
+        // Offset from the object's centre (world_matrix translation) to
+        // the light, prescaled >>4 so the squared sum stays in 32 bits
+        // even for far-flung stages (65k world units each axis).
+        int sx = (int)(lt->pos.vx - world_matrix.t[0]) >> 4;
+        int sy = (int)(lt->pos.vy - world_matrix.t[1]) >> 4;
+        int sz = (int)(lt->pos.vz - world_matrix.t[2]) >> 4;
+        int sdist = (int)isqrt32((unsigned int)(sx * sx + sy * sy + sz * sz));
+
+        // Linear attenuation in 0..4096. range is world units (*1024, like
+        // positions); compare in the same >>4 prescale.
+        int atten = 4096;
+        if (lt->range > 0)
+        {
+            int srange = (int)(lt->range >> 4);
+            if (srange <= 0 || sdist >= srange) continue; // out of range: dark
+            atten = 4096 - (sdist * 4096) / srange;
+        }
+
+        int eff = (int)lt->intensity + g_light_intensity_offset;
+        if (eff < 0)    eff = 0;
+        if (eff > 2047) eff = 2047;
+        eff = (eff * atten) >> 12;
+        if (eff == 0) continue;
+
+        // Unit vector TOWARD the light (the GTE row convention). A light
+        // sitting exactly on the object's centre has no direction - treat
+        // it as coming from straight above (renderer up is -Y).
+        if (sdist == 0)
+        {
+            dirx[i] = 0; diry[i] = -4096; dirz[i] = 0;
+        }
+        else
+        {
+            dirx[i] = (sx << 12) / sdist;
+            diry[i] = (sy << 12) / sdist;
+            dirz[i] = (sz << 12) / sdist;
+        }
+        effs[i] = eff;
     }
 
-    if (use_vertex_light)
+    // Pack the brightest spheres into the free slots (bounded: <=3 slots
+    // over <=MAX_SPHERE_LIGHTS candidates).
+    for (int slot = authored_light_count; slot < 3; slot++)
     {
-        unsigned int vertCount = model->vertCount < MAX_MODEL_VERTS ? model->vertCount : MAX_MODEL_VERTS;
+        int best = -1;
+        for (int i = 0; i < g_sphere_light_count; i++)
+            if (effs[i] > 0 && (best < 0 || effs[i] > effs[best])) best = i;
+        if (best < 0) break;
 
-        for (unsigned int i = 0; i < vertCount; i++)
+        const STAGE_LIGHT *lt = g_sphere_lights[best];
+        int eff   = effs[best];
+        int dim   = eff < 256 ? eff : 256;
+        int boost = eff > 256 ? eff : 256;
+        effs[best] = 0; // consumed
+
+        cmtx->m[0][slot] = (short)((((int)lt->r << 7) * dim) >> 8);
+        cmtx->m[1][slot] = (short)((((int)lt->g << 7) * dim) >> 8);
+        cmtx->m[2][slot] = (short)((((int)lt->b << 7) * dim) >> 8);
+
+        dmtx->m[slot][0] = (short)((dirx[best] * boost) >> 8);
+        dmtx->m[slot][1] = (short)((diry[best] * boost) >> 8);
+        dmtx->m[slot][2] = (short)((dirz[best] * boost) >> 8);
+    }
+}
+
+// Fills transformedFaceColors[] (and transformedVertColors[] when Gouraud
+// is on) with this object's per-primitive LIT COLOURS, so draw_object_into_
+// ot() only copies a colour into each primitive - no lighting math in the
+// draw loop. Two paths, chosen by sun_lighting:
+//
+//   ON  (GTE hardware): gte_ncs dots each normal against up to 3 world
+//       lights (via the light matrix), scales by their colours, adds the
+//       ambient back colour, CLAMPS >= 0 in hardware (so it is ONE-SIDED -
+//       a face turned away from a light gets ambient only), and modulates a
+//       white base -> COLOURED, one-sided output. The light DIRECTION
+//       matrix is composed with the object's rotation (MulMatrix0) so
+//       lights stay world-fixed. Crucially the GTE's LIGHT matrix is
+//       SEPARATE from the rotation matrix positions use, so this never
+//       disturbs composed_matrix.
+//
+//   OFF (legacy headlamp): rotate each normal by composed_matrix (gte_rtv0)
+//       and read vz as a grayscale, two-sided (abs), camera-locked
+//       brightness with a +32 ambient floor - the engine's original look.
+//
+// MUST run AFTER transform_object_vertices() for the same object: the GTE
+// path's MulMatrix0 can disturb the rotation-matrix registers, and the
+// headlamp path reads composed_matrix via gte_rtv0 - projecting positions
+// first keeps both correct.
+void compute_object_lighting(const MODEL_DEF *model)
+{
+    unsigned int triCount  = model->triCount  < MAX_MODEL_TRIS  ? model->triCount  : MAX_MODEL_TRIS;
+    unsigned int vertCount = model->vertCount < MAX_MODEL_VERTS ? model->vertCount : MAX_MODEL_VERTS;
+
+    if (sun_lighting)
+    {
+        // World-fixed lights: compose the world-space direction matrix with
+        // this object's rotation so a MODEL-space normal lands correctly
+        // against the world light directions. MulMatrix0 ignores the
+        // translation part of world_matrix (the "0" variant).
+        // g_light_dir_frame (NOT g_light_dir_matrix): the frame copy carries
+        // each light's >1.0 effective-intensity boost, rescaled by
+        // setup_frame_lighting() this frame - see its comment for why
+        // brightening lives on the DIRECTION rows rather than the (already
+        // int16-saturated) colour matrix.
+        //
+        // SPHERICAL lights: if the stage has any and the authored
+        // directionals left free GTE slots, build per-object copies of the
+        // frame matrices with the brightest spheres packed into those free
+        // slots (direction/attenuation evaluated at this object's centre -
+        // see fill_sphere_light_slots). The colour matrix must then be
+        // (re)loaded per object, since the previous object may have loaded
+        // different sphere columns. Stages with no spheres skip all of it.
+        MATRIX lmtx;
+        if (g_sphere_light_count > 0 && authored_light_count < 3)
         {
-            gte_ldv0(&model->vertNormals[i]);
+            MATRIX dmtx = g_light_dir_frame;
+            MATRIX cmtx = g_frame_color_matrix;
+            fill_sphere_light_slots(&dmtx, &cmtx);
+            gte_SetColorMatrix(&cmtx);
+            MulMatrix0(&dmtx, &world_matrix, &lmtx);
+        }
+        else
+        {
+            MulMatrix0(&g_light_dir_frame, &world_matrix, &lmtx);
+        }
+        gte_SetLightMatrix(&lmtx);
+
+        // gte_ncs = "normal colour" (NO material-colour multiply): output =
+        // clamp(ambient + sum(light_colour * max(0, dir . normal)), 255).
+        // This is the pure lit colour - one-sided (the hardware clamps the
+        // dot >= 0) and, crucially, NOT halved the way gte_nccs with a 128
+        // base is. For textured prims this colour becomes the tint the GPU
+        // multiplies into the texel; for untextured it is the vertex colour
+        // directly. (The proven PSn00bSDK GTE example uses ncs for exactly
+        // this reason.)
+        for (unsigned int i = 0; i < triCount; i++)
+        {
+            gte_ldv0(&model->faceNormals[i]);
+            gte_ncs();
+            gte_strgb(&transformedFaceColors[i]);
+        }
+
+        // Per-vertex colour (Gouraud paths), only when needed.
+        if (use_vertex_light)
+        {
+            for (unsigned int i = 0; i < vertCount; i++)
+            {
+                gte_ldv0(&model->vertNormals[i]);
+                gte_ncs();
+                gte_strgb(&transformedVertColors[i]);
+            }
+        }
+    }
+    else
+    {
+        // Legacy headlamp: composed_matrix (view*model) is still loaded from
+        // update_object_world_and_compose(); gte_rtv0 rotates the normal and
+        // vz is the camera-space facing term. Grayscale, two-sided (abs),
+        // +32 ambient floor - written into the SAME colour caches so the
+        // draw loop is identical for both lighting paths.
+        for (unsigned int i = 0; i < triCount; i++)
+        {
+            SVECTOR n;
+            gte_ldv0(&model->faceNormals[i]);
             gte_rtv0();
-            gte_stsv(&transformedVertNormals[i]);
+            gte_stsv(&n);
+            int b = n.vz >> 2;
+            if (b < 0) b = -b;
+            if (b > 255) b = 255;
+            b += 32;
+            if (b > 255) b = 255;
+            transformedFaceColors[i].r = (uint8_t)b;
+            transformedFaceColors[i].g = (uint8_t)b;
+            transformedFaceColors[i].b = (uint8_t)b;
+        }
+
+        if (use_vertex_light)
+        {
+            for (unsigned int i = 0; i < vertCount; i++)
+            {
+                SVECTOR n;
+                gte_ldv0(&model->vertNormals[i]);
+                gte_rtv0();
+                gte_stsv(&n);
+                int b = n.vz >> 2;
+                if (b < 0) b = -b;
+                b += 32;
+                if (b > 255) b = 255;
+                transformedVertColors[i].r = (uint8_t)b;
+                transformedVertColors[i].g = (uint8_t)b;
+                transformedVertColors[i].b = (uint8_t)b;
+            }
         }
     }
 }
@@ -1200,8 +1753,8 @@ void rotate_object_normals(const MODEL_DEF *model)
 // less GTE work than the old per-triangle transform, scaling with
 // vertCount instead of 3x triCount. Must be called after
 // update_object_world_and_compose() for this same object (needs
-// composed_matrix current), same ordering requirement as
-// rotate_object_normals() above.
+// composed_matrix current). Runs BEFORE compute_object_lighting() so the
+// GTE lighting path can safely reuse GTE matrix registers afterwards.
 void transform_object_vertices(const MODEL_DEF *model)
 {
     unsigned int vertCount = model->vertCount < MAX_MODEL_VERTS ? model->vertCount : MAX_MODEL_VERTS;
@@ -1288,9 +1841,9 @@ int object_is_culled(const MODEL_DEF *model)
 // the GPU's own DrawOTag() walk (see main()) back-to-front sorts every
 // object's triangles together, so objects need no depth-sort pass of
 // their own. Positions are NOT re-transformed here - transform_object_
-// vertices() must already have cached this object's screen-space verts
-// (same ordering requirement as rotate_object_normals()); this function
-// only culls/buckets/emits primitives from that cache.
+// vertices() must already have cached this object's screen-space verts,
+// and compute_object_lighting() must have filled the colour caches; this
+// function only culls/buckets/emits primitives from those caches.
 void draw_object_into_ot(const MODEL_DEF *model, MODEL_TEXTURE **triTextureCache, unsigned int objectPalette)
 {
     unsigned int triCount = model->triCount < MAX_MODEL_TRIS ? model->triCount : MAX_MODEL_TRIS;
@@ -1354,9 +1907,10 @@ void draw_object_into_ot(const MODEL_DEF *model, MODEL_TEXTURE **triTextureCache
 
         // Every primitive gets its own slot bump-allocated from
         // primBuffer[db] (see nextpri's comment), checked against
-        // sizeof(POLY_FT3) - the largest of the three types - so this
-        // check is correct no matter which branch below runs.
-        if (primBytesRemaining < (long)sizeof(POLY_FT3))
+        // sizeof(POLY_GT3) - the largest of the four types (textured
+        // Gouraud) - so this check is correct no matter which branch
+        // below runs.
+        if (primBytesRemaining < (long)sizeof(POLY_GT3))
         {
             primOverflowCount++;
             continue;
@@ -1368,99 +1922,126 @@ void draw_object_into_ot(const MODEL_DEF *model, MODEL_TEXTURE **triTextureCache
             // GPU coords) and binds this triangle's resolved texture's
             // TPAGE/CLUT (tex->tim, resolved once at load time).
             //
-            // Uses flat (one-normal-per-triangle) brightness rather than
-            // per-vertex Gouraud, keeping the textured path independent
-            // of use_vertex_light. Textured+Gouraud (POLY_GT3) is a
-            // possible future variant, not wired up here.
-            POLY_FT3 *pol = (POLY_FT3 *)nextpri;
-            setPolyFT3(pol);
+            // Two variants, chosen by use_vertex_light:
+            //   ON  -> POLY_GT3, per-vertex brightness (textured Gouraud)
+            //   OFF -> POLY_FT3, one brightness per triangle (textured flat)
+            // Either way the brightness MODULATES the sampled texel (the
+            // GPU multiplies texel colour by this RGB) rather than
+            // replacing it - same vz-based brightness as the untextured
+            // paths, just applied as a tint. The UV/TPAGE/CLUT setup is
+            // identical for both prim types, so only the colour + prim
+            // type differ between the two branches below.
+            if (use_vertex_light)
+            {
+                // Textured Gouraud: per-vertex lit colours from
+                // transformedVertColors (compute_object_lighting() fills
+                // these only when use_vertex_light is on), applied as the
+                // tint the GPU multiplies into the sampled texel.
+                POLY_GT3 *pol = (POLY_GT3 *)nextpri;
+                setPolyGT3(pol);
 
-            SVECTOR *n = &transformedNormals[i];
+                CVECTOR *c0 = &transformedVertColors[tri->v0];
+                CVECTOR *c1 = &transformedVertColors[tri->v1];
+                CVECTOR *c2 = &transformedVertColors[tri->v2];
 
-            int brightness = n->vz >> 2;
-            if (brightness < 0)
-                brightness = -brightness;
-            if (brightness > 255)
-                brightness = 255;
-            brightness += 32;
-            if (brightness > 255)
-                brightness = 255;
+                setRGB0(pol, c0->r, c0->g, c0->b);
+                setRGB1(pol, c1->r, c1->g, c1->b);
+                setRGB2(pol, c2->r, c2->g, c2->b);
 
-            // RGB here MODULATES the texture's own sampled colour (GPU
-            // multiplies texel colour by this RGB) rather than replacing
-            // it - same brightness value as the flat path, just applied
-            // as a tint instead of a literal fill colour.
-            setRGB0(pol, brightness, brightness, brightness);
+                setXY3(
+                    pol,
+                    sxy[0].vx, sxy[0].vy,
+                    sxy[1].vx, sxy[1].vy,
+                    sxy[2].vx, sxy[2].vy
+                );
 
-            setXY3(
-                pol,
-                sxy[0].vx, sxy[0].vy,
-                sxy[1].vx, sxy[1].vy,
-                sxy[2].vx, sxy[2].vy
-            );
+                // tri->uv0/uv1/uv2 index into model->uvs[][2] (converter-
+                // emitted, split-vertex space - same index space as
+                // tri->v0/v1/v2).
+                setUV3(
+                    pol,
+                    model->uvs[tri->uv0][0], model->uvs[tri->uv0][1],
+                    model->uvs[tri->uv1][0], model->uvs[tri->uv1][1],
+                    model->uvs[tri->uv2][0], model->uvs[tri->uv2][1]
+                );
 
-            // tri->uv0/uv1/uv2 index into model->uvs[][2] (converter-
-            // emitted, split-vertex space - same index space as
-            // tri->v0/v1/v2).
-            setUV3(
-                pol,
-                model->uvs[tri->uv0][0], model->uvs[tri->uv0][1],
-                model->uvs[tri->uv1][0], model->uvs[tri->uv1][1],
-                model->uvs[tri->uv2][0], model->uvs[tri->uv2][1]
-            );
+                setTPage(pol, tex->tim.mode & 0x3, 0, tex->tim.prect->x, tex->tim.prect->y);
 
-            // TPAGE/CLUT resolved once at texture-load time (in
-            // load_textures(), stored in tex->tim), not recomputed per-
-            // triangle-per-frame - tex->tim.mode is the colour-depth bits
-            // GetTimInfo() already decoded from that texture's TIM header.
-            setTPage(pol, tex->tim.mode & 0x3, 0, tex->tim.prect->x, tex->tim.prect->y);
+                unsigned int row = objectPalette;
+                if (tex->paletteCount == 0)
+                    row = 0;
+                else if (row >= tex->paletteCount)
+                    row = tex->paletteCount - 1;
 
-            // Multi-CLUT row select: tim.crect->y is row 0's VRAM Y; row
-            // k lives at crect->y + k (one 16-texel, 1-pixel-tall strip
-            // per row). objectPalette is this object's stage-authored
-            // base row plus the live active_palette nudge, clamped
-            // against THIS texture's own paletteCount.
-            unsigned int row = objectPalette;
-            if (tex->paletteCount == 0)
-                row = 0; // shouldn't happen (converter enforces clut_height >= 1) but don't underflow below
-            else if (row >= tex->paletteCount)
-                row = tex->paletteCount - 1;
+                setClut(pol, tex->tim.crect->x, tex->tim.crect->y + row);
 
-            setClut(pol, tex->tim.crect->x, tex->tim.crect->y + row);
+                addPrim(&ot[db][bucket], pol);
+                nextpri += sizeof(POLY_GT3);
+                primBytesRemaining -= sizeof(POLY_GT3);
+            }
+            else
+            {
+                // Textured flat: one lit colour per triangle, tinting texel.
+                POLY_FT3 *pol = (POLY_FT3 *)nextpri;
+                setPolyFT3(pol);
 
-            addPrim(&ot[db][bucket], pol);
-            nextpri += sizeof(POLY_FT3);
-            primBytesRemaining -= sizeof(POLY_FT3);
+                CVECTOR *c = &transformedFaceColors[i];
+                setRGB0(pol, c->r, c->g, c->b);
+
+                setXY3(
+                    pol,
+                    sxy[0].vx, sxy[0].vy,
+                    sxy[1].vx, sxy[1].vy,
+                    sxy[2].vx, sxy[2].vy
+                );
+
+                setUV3(
+                    pol,
+                    model->uvs[tri->uv0][0], model->uvs[tri->uv0][1],
+                    model->uvs[tri->uv1][0], model->uvs[tri->uv1][1],
+                    model->uvs[tri->uv2][0], model->uvs[tri->uv2][1]
+                );
+
+                // TPAGE/CLUT resolved once at texture-load time (in
+                // load_textures(), stored in tex->tim), not recomputed per-
+                // triangle-per-frame - tex->tim.mode is the colour-depth bits
+                // GetTimInfo() already decoded from that texture's TIM header.
+                setTPage(pol, tex->tim.mode & 0x3, 0, tex->tim.prect->x, tex->tim.prect->y);
+
+                // Multi-CLUT row select: tim.crect->y is row 0's VRAM Y; row
+                // k lives at crect->y + k (one 16-texel, 1-pixel-tall strip
+                // per row). objectPalette is this object's stage-authored
+                // base row plus the live active_palette nudge, clamped
+                // against THIS texture's own paletteCount.
+                unsigned int row = objectPalette;
+                if (tex->paletteCount == 0)
+                    row = 0; // shouldn't happen (converter enforces clut_height >= 1) but don't underflow below
+                else if (row >= tex->paletteCount)
+                    row = tex->paletteCount - 1;
+
+                setClut(pol, tex->tim.crect->x, tex->tim.crect->y + row);
+
+                addPrim(&ot[db][bucket], pol);
+                nextpri += sizeof(POLY_FT3);
+                primBytesRemaining -= sizeof(POLY_FT3);
+            }
         }
         else if (use_vertex_light)
         {
-            // Gouraud path: one brightness per vertex, looked up from
-            // transformedVertNormals via this triangle's own vertex
-            // indices (tri->v0/v1/v2 - same indices used to load
-            // positions above). The GPU interpolates between these 3
-            // colours across the triangle face in hardware.
+            // Gouraud path: per-vertex lit colours from transformedVert
+            // Colors, looked up via this triangle's own vertex indices
+            // (tri->v0/v1/v2). The GPU interpolates the 3 colours across
+            // the face in hardware.
             POLY_G3 *pol = (POLY_G3 *)nextpri;
             setPolyG3(pol);
 
-            SVECTOR *nv0 = &transformedVertNormals[tri->v0];
-            SVECTOR *nv1 = &transformedVertNormals[tri->v1];
-            SVECTOR *nv2 = &transformedVertNormals[tri->v2];
+            CVECTOR *c0 = &transformedVertColors[tri->v0];
+            CVECTOR *c1 = &transformedVertColors[tri->v1];
+            CVECTOR *c2 = &transformedVertColors[tri->v2];
 
-            int b0 = nv0->vz >> 2;
-            int b1 = nv1->vz >> 2;
-            int b2 = nv2->vz >> 2;
-
-            if (b0 < 0) b0 = -b0;
-            if (b1 < 0) b1 = -b1;
-            if (b2 < 0) b2 = -b2;
-
-            b0 += 32; if (b0 > 255) b0 = 255;
-            b1 += 32; if (b1 > 255) b1 = 255;
-            b2 += 32; if (b2 > 255) b2 = 255;
-
-            setRGB0(pol, b0, b0, b0);
-            setRGB1(pol, b1, b1, b1);
-            setRGB2(pol, b2, b2, b2);
+            setRGB0(pol, c0->r, c0->g, c0->b);
+            setRGB1(pol, c1->r, c1->g, c1->b);
+            setRGB2(pol, c2->r, c2->g, c2->b);
 
             setXY3(
                 pol,
@@ -1475,23 +2056,13 @@ void draw_object_into_ot(const MODEL_DEF *model, MODEL_TEXTURE **triTextureCache
         }
         else
         {
-            // Flat path: one colour per triangle, from the precomputed,
-            // GTE-rotated face normal built in rotate_object_normals().
+            // Flat path: one lit colour per triangle, precomputed in
+            // compute_object_lighting().
             POLY_F3 *pol = (POLY_F3 *)nextpri;
             setPolyF3(pol);
 
-            SVECTOR *n = &transformedNormals[i];
-
-            int brightness = n->vz >> 2;
-            if (brightness < 0)
-                brightness = -brightness;
-            if (brightness > 255)
-                brightness = 255;
-            brightness += 32;
-            if (brightness > 255)
-                brightness = 255;
-
-            setRGB0(pol, brightness, brightness, brightness);
+            CVECTOR *c = &transformedFaceColors[i];
+            setRGB0(pol, c->r, c->g, c->b);
 
             setXY3(
                 pol,
@@ -1582,8 +2153,11 @@ void draw_stage(void)
 
         visibleObjectCount++;
 
-        rotate_object_normals(model);
+        // Positions first, then lighting: compute_object_lighting()'s GTE
+        // path can disturb the rotation-matrix registers, so project the
+        // vertices (which need composed_matrix) before lighting runs.
         transform_object_vertices(model);
+        compute_object_lighting(model);
 
         MODEL_TEXTURE **triTextureCache = modelTriTextureCache[modelIndex];
         unsigned int objectPalette = obj->palette + active_palette;
@@ -1621,8 +2195,9 @@ void draw_player(void)
 
     visibleObjectCount++;
 
-    rotate_object_normals(model);
+    // Positions first, then lighting (see draw_stage() for why).
     transform_object_vertices(model);
+    compute_object_lighting(model);
 
     MODEL_TEXTURE **triTextureCache = modelTriTextureCache[playerModelIndex];
     draw_object_into_ot(model, triTextureCache, active_palette);
@@ -1669,7 +2244,28 @@ void debug_text(int counter)
         FntPrint(-1, "DEBUGPOSOFFSET=%d,%d,%d\n", model_pos.vx, model_pos.vy, model_pos.vz);
         FntPrint(-1, "CAMPOS=%d,%d,%d CAMROTY=%d\n",
             camera.pos.vx, camera.pos.vy, camera.pos.vz, camera.rot.vy);
-        FntPrint(-1, "VERTEXLIGHTING=%d TEXTURED=%d\n", use_vertex_light, use_texture);
+        FntPrint(-1, "VERTEXLIGHTING=%d TEXTURED=%d LIGHT=%s (R2)\n",
+                 use_vertex_light, use_texture, sun_lighting ? "GTE" : "HEADLAMP");
+        // Effective per-light intensity (authored + the L2 offset, clamped
+        // the same way setup_frame_lighting applies it), in the 256==1.0
+        // scale stage-gen's Intensity field bakes to - so INT=128 here is
+        // Intensity 0.5 in the tool.
+        {
+            int effL[3];
+            for (int li = 0; li < 3; li++)
+            {
+                int e = (li < authored_light_count)
+                    ? g_light_dir_int[li] + g_light_intensity_offset
+                    : 0;
+                if (e < 0)    e = 0;
+                if (e > 2047) e = 2047;
+                effL[li] = e;
+            }
+            FntPrint(-1, "LIGHT INT=%d,%d,%d OFS=%d SRC=%s(%d) SPH=%d (L2:U/D)\n",
+                     effL[0], effL[1], effL[2], g_light_intensity_offset,
+                     stage_lights_active ? "AUTHORED" : "NONE", authored_light_count,
+                     g_sphere_light_count);
+        }
         FntPrint(-1, "TEXTURES_LOADED=%d ACTIVE_PALETTE=%d\n", textureTableCount, active_palette);
         // Player state: whether summoned, its model resolution, XZ position
         // and orbit yaw. MODEL=-1 means player.obj hasn't been baked yet.
@@ -1683,38 +2279,122 @@ void debug_text(int counter)
         // model-name UNRESOLVED count (missing .vag on disc, bad header, SPU
         // RAM/voice budget), and how many have latched silent via
         // muteAfterPlay. ON/OFF is the START-toggled master ambience.
-        FntPrint(-1, "SFX=%s (START toggles) LOADED=%d/%d UNRES=%d MUTED=%d\n",
+        // ERR is the FIRST failure step of the CD tier (SND_ERR_* in
+        // sound.h: 1=CdInit dead 2=search 3=size 4=read 5=magic 6=parse
+        // 7=SPU alloc 8=voice; 0=no failure). SRC=C<n>/E<m> is how many
+        // loaded sounds came from the CD vs. the EXE-embedded fallback -
+        // E>0 with audio playing means the CD path failed (see ERR) and
+        // tier 2 rescued it. Together they make one photographed frame
+        // both the diagnosis AND the proof of what saved it.
+        FntPrint(-1, "SFX=%s (START toggles) LOADED=%d/%d UNRES=%d MUTED=%d ERR=%d SRC=C%d/E%d\n",
             sfx_stage_playing() ? "ON" : "OFF",
             sfx_stage_loaded_count(), sfx_stage_sound_count(),
-            sfx_stage_unresolved_count(), sfx_stage_muted_count());
+            sfx_stage_unresolved_count(), sfx_stage_muted_count(),
+            sfx_stage_first_error(),
+            sfx_stage_src_cd_count(), sfx_stage_src_emb_count());
 
         // SPU RAM budget: bytes of waveform data resident vs. the ~508 KB usable
         // (512 KB minus the reserved capture area). PCT is used*100/capacity. As
         // more sound effects are added, watch this climb toward 100 - an upload
         // that would push past it is refused by the SPU bump allocator (the sound
         // just won't load) rather than corrupting another sample.
-        FntPrint(-1, "SPU RAM=%d/%d B (%d%%)\n",
+        // CD=OK/FAIL is CdInit()'s boot result, (n) how many attempts it
+        // took (sound.c now retries - emulators pass on try 1, a real
+        // drive may need more). FAIL = every audio load below was dead
+        // before it started - the first thing to check when hardware is
+        // silent but DuckStation isn't.
+        FntPrint(-1, "SPU RAM=%d/%d B (%d%%) CD=%s(%d)\n",
             sound_spu_used(), sound_spu_capacity(),
-            (int)((sound_spu_used() * 100) / sound_spu_capacity()));
+            (int)((sound_spu_used() * 100) / sound_spu_capacity()),
+            sound_cd_ready() ? "OK" : "FAIL",
+            sound_cd_init_attempts());
 
         // Music sequencer: playing/loaded state, voices currently keyed on (of
         // the 16-voice music pool), and the bank's share of the SPU RAM figure
         // above. LOADED=N means the SONG.VAB/SONG.SEQ pair didn't make it off
         // the disc (or failed to parse) - the game runs silently, same as WIND.
-        FntPrint(-1, "MUSIC=%s LOADED=%s V=%d/%d BANK=%dB\n",
+        // ERR: where the CD tier died (same SND_ERR_* steps as SFXERR;
+        // +10 = the SEQ failed rather than the VAB, e.g. 2=VAB not
+        // found, 12=SEQ not found; 0=no failure). SRC: which tier the
+        // playing pair actually came from (- = neither worked).
+        FntPrint(-1, "MUSIC=%s LOADED=%s V=%d/%d BANK=%dB ERR=%d SRC=%s\n",
             music_playing() ? "ON" : "OFF",
             music_loaded() ? "Y" : "N",
             music_voices_active(), MUSIC_VOICE_COUNT,
-            music_spu_used());
+            music_spu_used(), music_last_error(),
+            music_source() == 2 ? "EMB" : (music_source() == 1 ? "CD" : "-"));
     }
     else if (debug_page == 1)
     {
-        // ---- Page 1: TRANSFORM + CAMERA + PLAYER ----
+        // ---- Page 2: AUDIO DEEP-DIVE ----
+        // Everything needed to sort a "silent on hardware" report into
+        // load-side vs. playback-side from one photographed frame,
+        // paired with page 1's ERR/SRC codes.
+
+        // Load-side pipeline state (mirrors + extends page 1's tags):
+        // INIT = CdInit attempts, RETRY = failed read attempts that were
+        // retried (>0 with clean audio = the retry tier saved it),
+        // EMBED = files baked into this EXE (0 = embed tier missing!).
+        // ISOERR = libpsxcd's parser status from the last CdSearchFile
+        // (1=seek 2=read 3=not-iso 4=LID OPEN; 0=okay). PVD = boot-time
+        // raw read of ISO sector 16 through our own hardened reader
+        // (1=OK 2=read-fail 3=garbage). PVD=1 + ISOERR!=0 = raw reads
+        // work, the SDK parser is what dies - the discriminator for the
+        // hardware ERR=2 result.
+        FntPrint(-1, "CD READY=%d INIT=%d RETRY=%d EMBED=%d ISOERR=%d PVD=%d\n",
+            sound_cd_ready(), sound_cd_init_attempts(),
+            sound_cd_retries(), sound_embed_count(),
+            sound_cd_iso_error(), sound_pvd_status());
+        FntPrint(-1, "SFX ERR=%d SRC=C%d/E%d  MUS ERR=%d SRC=%s\n",
+            sfx_stage_first_error(),
+            sfx_stage_src_cd_count(), sfx_stage_src_emb_count(),
+            music_last_error(),
+            music_source() == 2 ? "EMB" : (music_source() == 1 ? "CD" : "-"));
+
+        // Playback-side: raw SPU registers. Healthy expectations
+        // (verified against DuckStation before the hardware burn):
+        //   SPUCNT = 0xC021-ish: bit15 enable + bit14 unmute (0xC000),
+        //            bit0 CD audio in, bits4-5 leftover transfer mode.
+        //   STAT   oscillates (bit11 = capture-buffer half toggles
+        //          while the SPU runs - a liveness heartbeat).
+        //   MVOL   = 0x3fff,0x3fff (sound_init's master volume).
+        //   CURVOL = ~0x7ffe,0x7ffe CONSTANT - this is the RAMPED
+        //            MASTER volume, NOT a waveform meter; pinned at max
+        //            is correct. (Do not read a steady value as fault.)
+        //   ENDX   bits latch/clear as voices hit end flags / re-key.
+        //   ENV    nonzero on keyed voices - THE audio-energy signal.
+        // SPU RAM loaded + voices keyed + SPUCNT 0xC0xx + MVOL 3fff but
+        // ENV stuck at 0 = playback-side fault (branch F of the plan).
+        FntPrint(-1, "SPUCNT=%x STAT=%x MVOL=%x,%x\n",
+            SPU_CTRL, SPU_STAT,
+            SPU_MASTER_VOL_L, SPU_MASTER_VOL_R);
+        FntPrint(-1, "CDVOL=%x,%x CURVOL=%x,%x ENDX=%x:%x\n",
+            SPU_CD_VOL_L, SPU_CD_VOL_R,
+            SPU_CURRENT_VOL_L, SPU_CURRENT_VOL_R,
+            SPU_CHAN_STATUS2, SPU_CHAN_STATUS1);
+
+        // Live ADSR envelope level per sfx voice (0..7): a keyed-on
+        // voice with waveform data under it shows nonzero here even if
+        // the mix never reaches the DAC - separates "voice never keyed/
+        // no data" from "mixed but muted downstream".
+        FntPrint(-1, "ENV0-7=%x %x %x %x %x %x %x %x\n",
+            SPU_CH_ADSR_VOL(0), SPU_CH_ADSR_VOL(1),
+            SPU_CH_ADSR_VOL(2), SPU_CH_ADSR_VOL(3),
+            SPU_CH_ADSR_VOL(4), SPU_CH_ADSR_VOL(5),
+            SPU_CH_ADSR_VOL(6), SPU_CH_ADSR_VOL(7));
+
+        // Same for the first half of the music pool (8..15; enough to
+        // see the sequencer breathing without burning page space).
+        FntPrint(-1, "ENV8-15=%x %x %x %x %x %x %x %x\n",
+            SPU_CH_ADSR_VOL(8),  SPU_CH_ADSR_VOL(9),
+            SPU_CH_ADSR_VOL(10), SPU_CH_ADSR_VOL(11),
+            SPU_CH_ADSR_VOL(12), SPU_CH_ADSR_VOL(13),
+            SPU_CH_ADSR_VOL(14), SPU_CH_ADSR_VOL(15));
         return;
     }
     else
     {
-        // ---- Page 2: AUDIO ----
+        // ---- (spare page slot) ----
         return;
     }
 }
@@ -1734,6 +2414,13 @@ int main(int argc, const char *argv[])
         // Camera-only matrix rebuild - once per frame, shared by every
         // object draw_stage() composes against this frame.
         update_camera_matrix();
+
+        // Frame-global GTE lighting registers (light colours + ambient).
+        // Only needed for the GTE hardware path; the headlamp ignores them.
+        // The per-object light DIRECTION matrix is set in
+        // compute_object_lighting() instead.
+        if (sun_lighting)
+            setup_frame_lighting();
 
         // Reset THIS frame's OT (ClearOTagR wires every bucket to link
         // to the next, all initially empty) and rewind the primitive

@@ -80,6 +80,23 @@ static uint32_t vsync_chz = MUSIC_VSYNC_CHZ_NTSC;
 static uint32_t chunk_buf[CHUNK_BYTES / 4];
 static uint32_t seq_buf[MAX_SEQ_BYTES / 4];
 
+// FIRST failure step of the last music_load() (SND_ERR_* from sound.h,
+// +SND_ERR_SEQ_BASE when the SEQ rather than the VAB is what failed;
+// SND_ERR_NONE = loaded clean). Overlay diagnostic (MUSERR=): LOADED=N
+// says the pair didn't make it, this says which file died at which step -
+// same scheme as sfx.c's sfx_stage_first_error().
+static uint8_t mus_err = SND_ERR_NONE;
+
+// Where the playing pair came from: 0 = nothing loaded, 1 = CD (tier 1),
+// 2 = EXE-embedded copy (tier 2 fallback). Overlay SRC=-/CD/EMB.
+static uint8_t mus_src = 0;
+
+static void mus_record(uint8_t step)
+{
+    if (mus_err == SND_ERR_NONE)
+        mus_err = step;
+}
+
 // ------------------------------------------------------------
 // Bank state (parsed VH + SPU addresses)
 // ------------------------------------------------------------
@@ -221,13 +238,14 @@ static void voice_volume(const Program *pg, int vel, int16_t *l, int16_t *r)
 // ------------------------------------------------------------
 
 // Read `sectors` sectors starting `sector_off` sectors into `file` (blocking).
+// Goes through sound.c's hardened reader: retries plus a double->normal
+// speed fallback, so marginal CD-R reads get every chance before the
+// embedded-audio tier takes over.
 static int cd_read_at(const CdlFILE *file, int sector_off, int sectors, uint32_t *dst)
 {
     CdlLOC loc;
     CdIntToPos(CdPosToInt((CdlLOC *)&file->pos) + sector_off, &loc);
-    CdControl(CdlSetloc, (const uint8_t *)&loc, 0);
-    CdRead(sectors, dst, CdlModeSpeed);
-    return CdReadSync(0, 0) >= 0;
+    return sound_cd_read(&loc, sectors, dst);
 }
 
 // ------------------------------------------------------------
@@ -238,26 +256,35 @@ static int load_vab(const char *path)
 {
     CdlFILE file;
     if (!CdSearchFile(&file, (char *)path))
+    {
+        mus_record(SND_ERR_SEARCH);
         return 0;
+    }
 
     int total_sectors = (int)((file.size + 2047) / 2048);
     int first = total_sectors < CHUNK_SECTORS ? total_sectors : CHUNK_SECTORS;
     if (!cd_read_at(&file, 0, first, chunk_buf))
+    {
+        mus_record(SND_ERR_READ);
         return 0;
+    }
 
     const uint8_t *vh = (const uint8_t *)chunk_buf;
 
     // magic: bytes "pBAV" (the 32-bit ID "VABp", little-endian on disc)
     if (!(vh[0] == 'p' && vh[1] == 'B' && vh[2] == 'A' && vh[3] == 'V'))
+    {
+        mus_record(SND_ERR_MAGIC);
         return 0;
+    }
 
     prog_count = vh[0x12] | (vh[0x13] << 8);
     int vag_count = vh[0x16] | (vh[0x17] << 8);
-    if (prog_count <= 0 || prog_count > MUSIC_MAX_PROGRAMS) return 0;
-    if (vag_count  <= 0 || vag_count  > MUSIC_MAX_VAGS)     return 0;
+    if (prog_count <= 0 || prog_count > MUSIC_MAX_PROGRAMS) { mus_record(SND_ERR_PARSE); return 0; }
+    if (vag_count  <= 0 || vag_count  > MUSIC_MAX_VAGS)     { mus_record(SND_ERR_PARSE); return 0; }
 
     uint32_t vh_size = 0x20 + 2048 + (uint32_t)prog_count * 512 + 512;
-    if (vh_size > (uint32_t)first * 2048) return 0; // VH must fit the first chunk
+    if (vh_size > (uint32_t)first * 2048) { mus_record(SND_ERR_PARSE); return 0; } // VH must fit the first chunk
 
     // VAG pointer table: entry 0 is a dummy; vag n's size = tbl[n] << 3.
     const uint8_t *vt = vh + 0x20 + 2048 + (uint32_t)prog_count * 512;
@@ -268,11 +295,11 @@ static int load_vab(const char *path)
         vag_size[n] = (uint32_t)(vt[n * 2] | (vt[n * 2 + 1] << 8)) << 3;
         vb_size += vag_size[n];
     }
-    if (vb_size == 0 || vh_size + vb_size > file.size + 2047) return 0;
+    if (vb_size == 0 || vh_size + vb_size > file.size + 2047) { mus_record(SND_ERR_PARSE); return 0; }
 
     // Reserve SPU RAM through sound.c's allocator (counted in the overlay).
     uint32_t base = sound_spu_reserve(vb_size);
-    if (base == 0) return 0;
+    if (base == 0) { mus_record(SND_ERR_SPUALLOC); return 0; }
     bank_spu_bytes = vb_size;
 
     // Per-vag SPU addresses by prefix sum.
@@ -314,7 +341,10 @@ static int load_vab(const char *path)
             int nsec = total_sectors - sec;
             if (nsec > CHUNK_SECTORS) nsec = CHUNK_SECTORS;
             if (nsec <= 0 || !cd_read_at(&file, sec, nsec, chunk_buf))
+            {
+                mus_record(SND_ERR_READ);
                 return 0;
+            }
             chunk_base = (uint32_t)sec * 2048;
             chunk_bytes = (uint32_t)nsec * 2048;
         }
@@ -327,6 +357,99 @@ static int load_vab(const char *path)
         SpuIsTransferCompleted(SPU_TRANSFER_WAIT);
         written += n_up;
     }
+    return 1;
+}
+
+static uint32_t inc_for_uspq(uint32_t uspq); // defined below (tempo math)
+
+// Tier-2 mirror of load_vab for a fully-resident file (the EXE-embedded
+// copy): same header checks and program parse, but the VB upload is one
+// straight SpuWrite from the blob instead of chunked CD re-reads. Kept
+// deliberately parallel to load_vab - if a check changes there, change
+// it here too. Records no mus_err: by the time this runs the CD tier
+// already recorded WHERE it failed, which is the diagnostic we keep.
+static int load_vab_mem(const uint8_t *vh, uint32_t fsize)
+{
+    if (fsize < 0x20 + 2048 + 512)
+        return 0;
+    if (!(vh[0] == 'p' && vh[1] == 'B' && vh[2] == 'A' && vh[3] == 'V'))
+        return 0;
+
+    prog_count = vh[0x12] | (vh[0x13] << 8);
+    int vag_count = vh[0x16] | (vh[0x17] << 8);
+    if (prog_count <= 0 || prog_count > MUSIC_MAX_PROGRAMS) return 0;
+    if (vag_count  <= 0 || vag_count  > MUSIC_MAX_VAGS)     return 0;
+
+    uint32_t vh_size = 0x20 + 2048 + (uint32_t)prog_count * 512 + 512;
+    if (vh_size > fsize) return 0;
+
+    const uint8_t *vt = vh + 0x20 + 2048 + (uint32_t)prog_count * 512;
+    uint32_t vag_size[MUSIC_MAX_VAGS + 1];
+    uint32_t vb_size = 0;
+    int n;
+    for (n = 1; n <= vag_count; n++) {
+        vag_size[n] = (uint32_t)(vt[n * 2] | (vt[n * 2 + 1] << 8)) << 3;
+        vb_size += vag_size[n];
+    }
+    if (vb_size == 0 || vh_size + vb_size > fsize) return 0;
+
+    uint32_t base = sound_spu_reserve(vb_size);
+    if (base == 0) return 0;
+    bank_spu_bytes = vb_size;
+
+    uint32_t vag_addr[MUSIC_MAX_VAGS + 1];
+    uint32_t at = base;
+    for (n = 1; n <= vag_count; n++) { vag_addr[n] = at; at += vag_size[n]; }
+
+    const uint8_t *pa = vh + 0x20;
+    const uint8_t *ta = vh + 0x20 + 2048;
+    int p;
+    for (p = 0; p < prog_count; p++) {
+        const uint8_t *pr = pa + p * 16;
+        const uint8_t *tn = ta + (p * 16) * 32;
+        int vag = tn[22] | (tn[23] << 8);
+        Program *pg = &progs[p];
+        if (pr[0] == 0 || vag < 1 || vag > vag_count) {
+            pg->spu_addr = 0;
+            continue;
+        }
+        pg->spu_addr = vag_addr[vag];
+        pg->center   = tn[4];
+        pg->fine     = tn[5] & 0x7f;
+        pg->adsr1    = (uint16_t)(tn[16] | (tn[17] << 8));
+        pg->adsr2    = (uint16_t)(tn[18] | (tn[19] << 8));
+        pg->mvol     = pr[1];
+        pg->pan      = pr[4];
+    }
+
+    // Whole VB is resident - one transfer. vh_size is a multiple of 4
+    // and embed blob entries are 4-byte aligned, so the DMA source is too.
+    SpuSetTransferStartAddr(base);
+    SpuWrite((const uint32_t *)(vh + vh_size), vb_size);
+    SpuIsTransferCompleted(SPU_TRANSFER_WAIT);
+    return 1;
+}
+
+// Tier-2 mirror of load_seq: the embedded SEQ is resident for the
+// program's whole life, so seq_ev points straight into the blob - no
+// seq_buf copy, and no MAX_SEQ_BYTES cap (that bound exists for the
+// buffer, not the format).
+static int load_seq_mem(const uint8_t *s, uint32_t fsize)
+{
+    if (fsize < 16)
+        return 0;
+    if (!(s[0] == 'p' && s[1] == 'Q' && s[2] == 'E' && s[3] == 'S'))
+        return 0;
+
+    seq_ppq = ((uint32_t)s[8] << 8) | s[9];
+    uint32_t uspq = ((uint32_t)s[10] << 16) | ((uint32_t)s[11] << 8) | s[12];
+    if (!seq_ppq) seq_ppq = 480;
+    if (!uspq) uspq = 500000;
+
+    tick_inc = inc_for_uspq(uspq);
+
+    seq_ev = s + 15;
+    seq_len = fsize - 15;
     return 1;
 }
 
@@ -344,17 +467,31 @@ static uint32_t inc_for_uspq(uint32_t uspq)
 
 static int load_seq(const char *path)
 {
+    // Failure steps recorded +SND_ERR_SEQ_BASE so the overlay's MUSERR
+    // distinguishes "SEQ died" (1x) from "VAB died" (single digit).
     CdlFILE file;
     if (!CdSearchFile(&file, (char *)path))
+    {
+        mus_record(SND_ERR_SEQ_BASE + SND_ERR_SEARCH);
         return 0;
+    }
     if (file.size < 16 || file.size > MAX_SEQ_BYTES)
+    {
+        mus_record(SND_ERR_SEQ_BASE + SND_ERR_SIZE);
         return 0;
+    }
     if (!cd_read_at(&file, 0, (int)((file.size + 2047) / 2048), seq_buf))
+    {
+        mus_record(SND_ERR_SEQ_BASE + SND_ERR_READ);
         return 0;
+    }
 
     const uint8_t *s = (const uint8_t *)seq_buf;
     if (!(s[0] == 'p' && s[1] == 'Q' && s[2] == 'E' && s[3] == 'S'))
+    {
+        mus_record(SND_ERR_SEQ_BASE + SND_ERR_MAGIC);
         return 0;
+    }
 
     seq_ppq = ((uint32_t)s[8] << 8) | s[9];                    // BE u16
     uint32_t uspq = ((uint32_t)s[10] << 16) | ((uint32_t)s[11] << 8) | s[12];
@@ -378,8 +515,53 @@ int music_load(const char *vab_path, const char *seq_path)
     loaded = 0;
     bank_spu_bytes = 0;
     prog_count = 0;
-    if (!load_vab(vab_path)) return 0;
-    if (!load_seq(seq_path)) return 0;
+    mus_err = SND_ERR_NONE;
+    mus_src = 0;
+
+    // Tier 1: the disc. The cd_ready gate was previously missing here,
+    // so a failed CdInit sent CdSearchFile against an uninitialized
+    // drive (harmless-looking in emulators, undefined on hardware).
+    int ok = 0;
+    if (!sound_cd_ready())
+        mus_record(SND_ERR_NOCD);
+    else
+        ok = load_vab(vab_path) && load_seq(seq_path);
+
+    // Tier 2: the copy baked into the EXE. Any CD-tier failure lands
+    // here with its step already recorded in mus_err - so the overlay
+    // still diagnoses the CD path even while music plays from the
+    // embedded pair.
+    if (!ok)
+    {
+        // A VAB that loaded before its SEQ failed holds an SPU
+        // reservation - give it back before this tier re-reserves
+        // (LIFO allocator; ours is the top slice at boot).
+        if (bank_spu_bytes)
+        {
+            sound_spu_release(bank_spu_bytes);
+            bank_spu_bytes = 0;
+        }
+        prog_count = 0;
+
+        uint32_t vab_size = 0, seq_size = 0;
+        const uint8_t *vab = sound_embed_find(vab_path, &vab_size);
+        const uint8_t *seq = sound_embed_find(seq_path, &seq_size);
+        if (vab && seq && load_vab_mem(vab, vab_size) && load_seq_mem(seq, seq_size))
+        {
+            ok = 2;
+        }
+        else if (bank_spu_bytes)
+        {
+            // mem-VAB reserved but its SEQ half failed - rewind again.
+            sound_spu_release(bank_spu_bytes);
+            bank_spu_bytes = 0;
+        }
+    }
+
+    if (!ok)
+        return 0;
+
+    mus_src = (ok == 2) ? 2 : 1;
     loaded = 1;
     return 1;
 }
@@ -647,3 +829,5 @@ int music_voices_active(void)
 
 uint32_t music_spu_used(void) { return bank_spu_bytes; }
 int music_loaded(void) { return loaded; }
+int music_last_error(void) { return (int)mus_err; }
+int music_source(void) { return (int)mus_src; }

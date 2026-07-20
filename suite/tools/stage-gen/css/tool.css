@@ -209,6 +209,45 @@ body {
   cursor: pointer;
 }
 
+/* Blender-style shading/lighting toggle, pinned top-right of the viewport
+   just left of the orientation gizmo (mirroring where Blender parks its
+   own viewport-shading pill group). Two mutually exclusive modes: the
+   editor's unlit full-bright look vs the PS1 GTE lighting preview
+   (viewer.js's "PS1 lighting parity preview" section). */
+.shading-toggle {
+  position: absolute;
+  top: 12px;
+  right: 110px;
+  display: flex;
+  background: rgba(0, 0, 0, 0.55);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+}
+
+.shading-btn {
+  padding: 4px 10px;
+  font-size: 11px;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  letter-spacing: 0.04em;
+}
+
+.shading-btn + .shading-btn {
+  border-left: 1px solid var(--border);
+}
+
+.shading-btn:hover {
+  color: var(--text);
+}
+
+.shading-btn.is-active {
+  background: var(--panel-raised);
+  color: var(--accent);
+}
+
 /* ---------- Docks + tab strips (.NET-style) ---------- */
 
 .dock {
@@ -666,6 +705,14 @@ body {
   font-size: 12px;
   width: 100%;
   box-sizing: border-box;
+}
+
+/* Native color swatch (light entity `color` prop). Keep it a compact,
+   clickable chip rather than inheriting the tall text-field padding. */
+.field-full input.color-field {
+  height: 28px;
+  padding: 2px;
+  cursor: pointer;
 }
 
 /* Inside the Properties dock the sections themselves sit on --panel, so
