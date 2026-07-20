@@ -128,6 +128,9 @@ static uint8_t  running = 0;         // MIDI running status
 static int32_t  wait_ticks = 0;      // delta ticks until the next event
 static uint32_t acc = 0;             // 20.12 fixed-point tick accumulator
 static uint32_t tick_inc = 0;        // ticks<<12 advanced per vblank
+static uint32_t tick_inc0 = 0;       // tick_inc at load time (the header tempo) -
+                                     // restored by rewind_to_start() so a replay
+                                     // after a mid-song FF 51 starts at the right tempo
 static int      playing = 0;
 static int      ended = 0;
 static int      last_vsync = 0;      // VSync(-1) reading at the previous tick
@@ -447,6 +450,7 @@ static int load_seq_mem(const uint8_t *s, uint32_t fsize)
     if (!uspq) uspq = 500000;
 
     tick_inc = inc_for_uspq(uspq);
+    tick_inc0 = tick_inc;
 
     seq_ev = s + 15;
     seq_len = fsize - 15;
@@ -499,6 +503,7 @@ static int load_seq(const char *path)
     if (!uspq) uspq = 500000;
 
     tick_inc = inc_for_uspq(uspq);
+    tick_inc0 = tick_inc;
 
     seq_ev = s + 15;                                           // past header
     seq_len = (uint32_t)file.size - 15;
@@ -658,6 +663,8 @@ static void all_music_off(void)
 static void rewind_to_start(void)
 {
     pos = 0; running = 0; ended = 0; acc = 0;
+    tick_inc = tick_inc0;  // restart at the HEADER tempo - a mid-song FF 51
+                           // must not leak into a replay from the top
     memset(ch_prog, 0, sizeof(ch_prog));
     wait_ticks = (int32_t)read_vlq();  // prefetch the first delta
 }

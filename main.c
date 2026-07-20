@@ -18,7 +18,7 @@
  * - Textured polygon rendering (POLY_FT3)
  * - Multi-CLUT palette-swap textures (stacked CLUT rows in one TIM,
  *   base row is per-object stage data, live-nudged via SQUARE/CIRCLE in
- *   the camera control schema - hold L2, see update())
+ *   CAMERA mode - see update())
  * - GPU Ordering Table (OT_LEN buckets - see draw_object_into_ot()):
  *   every triangle from every visible object is inserted into ONE shared
  *   OT keyed by its own gte_avsz3()-derived depth bucket; the GPU's
@@ -39,8 +39,8 @@
  * - Multiple simultaneous models (generated/model_registry.c), resolved
  *   by name per stage object instead of one hand-#include'd model
  * - Double buffering
- * - Single-controller input (see update()): holding L2 switches pad 1
- *   from the debug transform schema to the camera schema
+ * - Single-controller input (see update()): SELECT cycles pad 1 through
+ *   the latched PLAY / CAMERA / DEBUG control modes
  *
  */
 
@@ -122,12 +122,165 @@ static unsigned int textureTableCount = 0;
 
 
 
+// ======================= FRAME TIME (DELTA) ==============================
+// One shared time source for everything that moves: the player now, and
+// monsters / entities / timers / animation as they land. Nothing should
+// advance state by a per-frame constant any more - a constant means the
+// simulation runs at whatever speed the renderer happens to manage, which
+// is exactly the 50 -> 25fps halving that motivated this.
+//
+// THE UNIT IS A VBLANK, NOT A MILLISECOND, and that is deliberate. VSync(0)
+// waits for the NEXT vblank, so a PS1 frame is always an integer number of
+// vblanks - 1, 2, 3 - never 1.7. Delta is therefore naturally quantised,
+// and a per-tick speed multiplied by an integer tick count is EXACT: no
+// truncation, no drift, no accumulated rounding error at 60fps or 30fps.
+// Milliseconds would throw that property away and buy nothing back.
+//
+// DT_ONE == one reference tick == 1/60s. Scale is 8.8 fixed point rather
+// than the 20.12 used elsewhere in this file, on purpose: delta needs far
+// less precision than a position does, and the smaller scale keeps
+// (speed * delta) inside int32 for any speed this engine will plausibly
+// author. At 20.12 a 28-units/tick player was already within a factor of
+// four of overflowing that multiply.
+#define DT_ONE      256
+#define DT_MAX      (DT_ONE * 4)    // hitch clamp - see g_dt
+
+// Ticks elapsed this frame, 256 == one 60Hz tick. This is the number
+// everything multiplies by.
+int g_dt = DT_ONE;
+
+// Raw vblanks elapsed, unnormalised and unclamped - diagnostics only.
+int g_dt_vblanks = 1;
+
+// Monotonic time since boot in the same units, for anything that needs a
+// clock rather than a delta: entity timers, cooldowns, animation phase,
+// scripted events. Wraps after ~97 hours at 60fps.
+int g_time_ticks = 0;
+
+// VSync(-1) reading from the previous frame. Seeded in init() so the very
+// first delta is 1 tick rather than however many vblanks boot took.
+int g_prev_vblank = 0;
+
+// Display refresh. Delta is normalised against 60Hz so a PAL machine runs
+// the simulation at the SAME wall-clock speed as NTSC instead of the
+// traditional 5/6 PAL slowdown - authored speeds mean "per 1/60s"
+// everywhere, on both.
+//
+// This initialiser is only what's in effect during init() itself, before
+// the display is up. init() sets the video mode and then overwrites this
+// from GetVideoMode(), so editing the value here changes nothing at
+// runtime - change SetVideoMode() in init() instead.
+int g_refresh_hz = 60;
+
+// Scales a per-tick amount by this frame's delta. For integer quantities
+// where losing a fraction per frame doesn't matter - camera nudges, editor
+// sliders, anything driven by a held button.
+//
+// SIMULATION SHOULD USE dt_advance() INSTEAD. Truncating here loses up to
+// one unit per frame, which is invisible on a debug control and is a slow
+// positional drift on anything that has to agree with collision or another
+// entity's idea of where it is.
+static inline int dt_scale(int perTick)
+{
+    return (perTick * g_dt) / DT_ONE;
+}
+
+// Advances a 20.12 fixed-point accumulator by (speedFP * delta) and returns
+// the WHOLE units to add to an integer position, keeping the remainder in
+// the accumulator. This is the primitive monsters, projectiles and any
+// other moving entity should be built on: it makes sub-unit speeds work
+// (a 0.4 units/tick crawler moves, rather than truncating to zero every
+// frame) and it makes movement frame-rate independent without drift.
+//
+//   static int mob_frac_x;
+//   mob->pos.vx += dt_advance(&mob_frac_x, MOB_SPEED_FP);
+//
+// Each moving axis of each entity needs its own accumulator - the
+// remainder is per-axis state, not shared.
+//
+// Overflow: speedFP * DT_MAX must stay in int32, so |speedFP| < 2.1e6,
+// i.e. about 512 units per tick. Well past anything sane at this world
+// scale (the player is 28).
+static inline int dt_advance(int *accum, int speedFP)
+{
+    *accum += (speedFP * g_dt) / DT_ONE;
+
+    int whole = *accum >> 12;
+    *accum -= whole << 12;
+    return whole;
+}
+
+// Samples the vblank counter and republishes g_dt / g_time_ticks. Called
+// once at the TOP of the frame, before update(), so every system in the
+// frame sees the same delta.
+void update_frame_time(void)
+{
+    int now = VSync(-1);
+
+    // Signed subtraction, so the counter's eventual 32-bit wrap produces a
+    // correct small delta rather than a catastrophic one.
+    int elapsed = now - g_prev_vblank;
+    g_prev_vblank = now;
+
+    // A frame cannot take less than one vblank; a reading of 0 means we
+    // were called twice inside one, which would freeze the simulation.
+    if (elapsed < 1) elapsed = 1;
+
+    // Clamp BEFORE scaling. A long hitch - CD seek, stage load, debugger
+    // break - must not teleport everything through walls on the frame it
+    // finishes. The world then runs slower than wall-clock for that one
+    // frame, which is the right trade: a stutter is recoverable, a
+    // tunnelled player is not.
+    if (elapsed > 16) elapsed = 16;
+
+    g_dt_vblanks = elapsed;
+
+    // Normalise to the 60Hz reference. 16 * 256 * 60 = 245760, nowhere
+    // near int32 - the clamp above is what guarantees that.
+    g_dt = (elapsed * DT_ONE * 60) / g_refresh_hz;
+    if (g_dt > DT_MAX) g_dt = DT_MAX;
+    if (g_dt < 1)      g_dt = 1;
+
+    g_time_ticks += g_dt;
+}
+// =========================================================================
+
 // Screen consts (for model placement)
+//
+// 256 LINES, NOT 240: this build targets PAL (see SetVideoMode in init).
+// PAL's active area is 256 lines, so a 240-line framebuffer leaves 16 lines
+// unused and the display hardware scales the difference - which is the
+// vertical stretch/widening a 240-line buffer shows on a PAL machine.
+//
+// This is not a free constant to change. Two 320x256 buffers occupy VRAM
+// rows 0-511 in the x:0-319 column, i.e. the ENTIRE height, where two
+// 320x240 buffers only reached row 479 and left rows 480-511 for the CLUT
+// strip. py_convert_textures.py's CLUT_REGION_* was moved out of that
+// column to suit; if this ever goes back to 240, the VRAM map in that
+// script is the other half of the change. The map as it stands:
+//
+//   x:0-319    y:0-255    framebuffer 0
+//   x:0-319    y:256-511  framebuffer 1
+//   x:320-335  y:0-511    CLUT strip (16 units wide, 512 rows)
+//   x:336-639  y:0-511    free
+//   x:640-959  y:0-511    textures
+//   x:960-1023 y:0-...    debug font (FntLoad below)
 #define DISPLAY_W 320
-#define DISPLAY_H 240
+#define DISPLAY_H 256
 
 #define SCREEN_CX (DISPLAY_W / 2)
 #define SCREEN_CY (DISPLAY_H / 2)
+
+// FOG COLOUR. Used by THREE things that must never disagree: the GTE far
+// colour geometry depth-cues toward (setup_frame_fog), the layered fog
+// quads (draw_fog_layers), and the screen CLEAR colour (init) that fills
+// the void behind everything. If the clear colour and the fog colour drift
+// apart, geometry fades to one shade against a background of another and
+// the whole effect collapses. Declared this early only because init() needs
+// it; the fog system itself is documented further down, at fog_enabled.
+#define FOG_COL_R 128
+#define FOG_COL_G 128
+#define FOG_COL_B 128
 
 
 
@@ -165,6 +318,22 @@ static unsigned int textureTableCount = 0;
 #define FOCAL_LENGTH    256
 int fov = FOCAL_LENGTH;
 int fov_speed = 10;
+
+// ---- GTE depth-cue (fog) control registers -----------------------------
+// PSn00bSDK 0.24's inline_c.h exposes gte_SetFarColor()/gte_dpcs() but has
+// NO setter for DQA (cop2 control reg 27) or DQB (reg 28), the two values
+// that shape the depth ramp. These mirror the SDK's own house style
+// (gte_SetGeomScreen is the same one-line ctc2). DQA is 16-bit signed, DQB
+// 32-bit signed - see setup_frame_fog() for the values pushed here.
+#define gte_SetDQA( r0 ) __asm__ volatile ( \
+	"ctc2	%0, $27;"		\
+	:						\
+	: "r"( r0 ) )
+
+#define gte_SetDQB( r0 ) __asm__ volatile ( \
+	"ctc2	%0, $28;"		\
+	:						\
+	: "r"( r0 ) )
 
 // Maximum number of vertices we cache for a transformed model.
 // Bumped from 127 -> 512 for Option B vertex-splitting at seams: a split
@@ -238,9 +407,11 @@ static uint32_t ot[2][OT_LEN];
 // POLY_FT3 data has to live somewhere that survives until DrawOTag()
 // finishes walking it, so every triangle gets its OWN slot, bump-
 // allocated from this arena via nextpri/primBytesRemaining below. Sized
-// as MAX_PRIMS_PER_FRAME worst-case POLY_FT3s (the largest of the three
-// types); the bump allocator advances by each primitive's real size, so
-// the byte budget is correct regardless of the actual type mix.
+// in POLY_FT3 units; POLY_GT3 (textured Gouraud) is LARGER, so a
+// GT3-heavy frame's real triangle cap lands below MAX_PRIMS_PER_FRAME -
+// that's fine, because primBytesRemaining (checked against
+// sizeof(POLY_GT3), the true worst case) is the actual overrun guard,
+// and the bump allocator advances by each primitive's real size.
 static char primBuffer[2][MAX_PRIMS_PER_FRAME * sizeof(POLY_FT3)];
 
 // Bump-allocator cursor into primBuffer[db] - reset at the top of every
@@ -265,8 +436,8 @@ static unsigned int primOverflowCount = 0;
 static unsigned char padbuf[2][34];
 
 // Previous frame's raw pad state, used for edge detection on toggle
-// buttons (TRIANGLE/SQUARE) so a held button doesn't re-toggle every
-// single frame (60x/sec) - only the released->pressed transition fires.
+// buttons so a held button doesn't re-toggle every single frame -
+// only the released->pressed transition fires (see edge_pressed()).
 unsigned short prevPadRaw = 0xFFFF; // all-released, matches BIOS idle state
 
 // Latched control mode, cycled by the SELECT click (edge-detected in
@@ -278,11 +449,23 @@ unsigned short prevPadRaw = 0xFFFF; // all-released, matches BIOS idle state
 enum { MODE_PLAY = 0, MODE_CAMERA, MODE_DEBUG, MODE_COUNT };
 static int control_mode = MODE_PLAY;
 
-// Which debug overlay page is shown, cycled by the L3 click (edge-detected
-// in update(); requires the DualShock in analog mode). debug_text() reads
-// this to pick which block of readouts to print.
+// Which debug overlay page is shown, cycled by an R2 click (edge-detected
+// in update(); R2 rather than L3 so a DIGITAL pad on real hardware can
+// still reach page 2 - L3 needs analog mode). debug_text() reads this to
+// pick which block of readouts to print. KNOWN DOUBLE-DUTY: in DEBUG mode
+// an R2 press also toggles sun_lighting (update_debug), and in PLAY R2 is
+// the held pitch control - a deliberate trade-off, not an accident.
 static int debug_page = 0;
-#define DEBUG_PAGE_COUNT 2 // page 2 = audio deep-dive (L3 cycles)
+// R2 cycles. Order: RENDER, WORLD, LIGHT, FOG, AUDIO, AUDIOHW - see the
+// DEBUG OVERLAY block near debug_text() for what lives on each and the
+// 40-column rule for adding to them.
+//
+// KEEP THIS EVEN. In DEBUG mode a bare R2 press both advances the page and
+// toggles sun_lighting (documented in update() as an accepted trade-off).
+// With an even page count a full cycle returns to the page you started on
+// AND the lighting path you started with; an odd count leaves the lighting
+// flipped every lap.
+#define DEBUG_PAGE_COUNT 6
 
 
 
@@ -323,22 +506,29 @@ MATRIX composed_matrix;
 
 
 // ------------------------------------------------------------
-// Player (third-person schema, R2 held). NOT a stage-authored object -
-// summoned at runtime the first time the R2 schema is entered, drawn by
+// Player (PLAY mode). NOT a stage-authored object - summoned at runtime
+// on the first PLAY-mode frame (the boot default), drawn by
 // draw_player() through the same compose/cull/draw pipeline as stage
 // objects. Confined to a flat plane (XZ) with NO gravity - vy is pinned
 // to PLAYER_GROUND_Y every frame - and followed by an orbiting
 // third-person camera (update_player_follow_camera()).
 // ------------------------------------------------------------
 static int playerModelIndex = -1;         // resolved from "player" in init(); -1 = not baked yet
-static int playerSpawned = 0;             // set once the R2 schema summons it
+static int playerSpawned = 0;             // set on the first PLAY-mode frame
 static VECTOR player_pos = { 0, 0, 0 };   // world-space; vy re-pinned to ground each frame
 static SVECTOR player_rot = { 0, 0, 0 };  // faces the direction of travel (see update())
+// Sub-unit movement remainders for the player, one per moving axis. See
+// dt_advance(): integer world positions would otherwise throw away the
+// fraction of a unit each frame leaves over, which at low frame rates is
+// most of the movement. Every entity that moves will want its own pair.
+static int player_move_frac_x = 0;
+static int player_move_frac_z = 0;
+
 static int player_cam_yaw = 0;            // 12-bit follow-cam yaw, orbited via L1/R1 in PLAY
 static int player_cam_pitch = 128;        // follow-cam view pitch, nudged by L2/R2 in PLAY
 
 #define PLAYER_GROUND_Y     0             // the flat plane the player is confined to (no gravity)
-#define PLAYER_MOVE_SPEED   28            // world units/frame at full D-pad deflection
+#define PLAYER_MOVE_SPEED   14            // world units/frame at full D-pad deflection
 #define PLAYER_CAM_DIST     2200          // how far BEHIND the player the follow-cam sits
 #define PLAYER_CAM_HEIGHT   900           // how far ABOVE the player the follow-cam sits
 #define PLAYER_CAM_YAW_SPEED 22           // follow-cam yaw units/frame while L1/R1 held (orbit)
@@ -380,8 +570,7 @@ static int fp_atan2(int y, int x)
 // by pad 1. Purely a live testing knob - e.g. spin the whole stage to
 // eyeball lighting, or nudge every object at once without reconverting.
 // ------------------------------------------------------------
-int debug_scale = 4096;                 // fixed-point multiplier, 4096 == 1.0x
-const uint16_t SCALE_SPEED = 64;        // ~1.5% of 1.0x per frame
+int debug_scale = 4096;                 // fixed-point multiplier, 4096 == 1.0x (no pad control wired today)
 const uint8_t ROT_SPEED = 22;
 
 // XYZ rotation angles, fed straight into RotMatrix() as an SVECTOR.
@@ -678,18 +867,44 @@ void init(void)
     gte_SetGeomScreen(FOCAL_LENGTH);
 
     // Define display environments, first on top and second on bottom
-    SetDefDispEnv(&disp[0], 0,   0, DISPLAY_W, DISPLAY_H);
-    SetDefDispEnv(&disp[1], 0, 240, DISPLAY_W, DISPLAY_H);
+    // Buffer 1 sits at y = DISPLAY_H, not a hardcoded 240 - the two
+    // framebuffers stack exactly, so this stays correct if the display
+    // height ever changes again.
+    SetDefDispEnv(&disp[0], 0,          0, DISPLAY_W, DISPLAY_H);
+    SetDefDispEnv(&disp[1], 0, DISPLAY_H, DISPLAY_W, DISPLAY_H);
 
     // Define drawing environments, first on bottom and second on top
-    SetDefDrawEnv(&draw[0], 0, 240, DISPLAY_W, DISPLAY_H);
-    SetDefDrawEnv(&draw[1], 0,   0, DISPLAY_W, DISPLAY_H);
+    SetDefDrawEnv(&draw[0], 0, DISPLAY_H, DISPLAY_W, DISPLAY_H);
+    SetDefDrawEnv(&draw[1], 0,         0, DISPLAY_W, DISPLAY_H);
 
-    // Set and enable clear colour (green background)
-    setRGB0(&draw[0], 128, 128, 128);
-    setRGB0(&draw[1], 128, 128, 128);
+    // Set and enable clear colour (grey background)
+    // Clear colour is the FOG colour, not an independent grey. Geometry
+    // depth-cues toward FOG_COL_*, so the empty space behind it has to be
+    // the same colour or distance fades to one shade against a void of
+    // another - which reads instantly as a broken renderer. (That was the
+    // first fog cut's actual bug: the far colour tracked g_ambient_*, and
+    // house_demo authors no ambient light, so geometry faded to BLACK
+    // against this grey.) Derived from the same constants so they cannot
+    // drift apart again.
+    setRGB0(&draw[0], FOG_COL_R, FOG_COL_G, FOG_COL_B);
+    setRGB0(&draw[1], FOG_COL_R, FOG_COL_G, FOG_COL_B);
     draw[0].isbg = 1;
     draw[1].isbg = 1;
+
+    // DITHERING ON. SetDefDrawEnv leaves dtd at 0 and this project had never
+    // set it - so every Gouraud gradient in the engine has been banding since
+    // day one. The GPU shades in 24-bit and truncates to the framebuffer's
+    // 15-bit (5 bits per channel, 32 levels): a surface depth-cueing from
+    // RGB 200 down to 128 crosses about nine representable levels, so it
+    // draws nine hard bands instead of a gradient. dtd=1 makes the GPU
+    // dither that truncation into noise the eye integrates as smooth.
+    //
+    // This matters far more with fog than it did before it: fog turns every
+    // large surface into a long, shallow gradient, which is precisely the
+    // worst case for 15-bit truncation. Every PSn00bSDK example sets this.
+    // Free - it's a bit in the tpage word, not a pass.
+    draw[0].dtd = 1;
+    draw[1].dtd = 1;
 
     // Clear double buffer counter
     db = 0;
@@ -698,20 +913,27 @@ void init(void)
     PutDispEnv(&disp[db]);
     PutDrawEnv(&draw[db]);
 
-    // Load debug font
+    // Load debug font at x=960. This sits in the top-right corner of VRAM,
+    // OUTSIDE the texture packing region - py_convert_textures.py caps its
+    // packer at x=960 for exactly this reason. Before that cap existed the
+    // packer could walk a texture straight over the font (it was 64 units
+    // from doing so with the current four textures), which corrupts the
+    // debug overlay rather than erroring.
     FntLoad(960, 0);
 
     // Open up a debug font text stream of 800 characters (600 was within
     // ~30 chars of page 0's total once the CD/ERR diagnostics landed -
     // an overflow here silently truncates the LAST lines, which are
     // exactly the audio diagnostics we photograph hardware for).
-    FntOpen(0, 8, 320, 224, 0, 800);
+    // Height follows DISPLAY_H rather than a hardcoded 224 - the extra 16
+    // lines PAL gives us are worth having, page 0 is dense.
+    FntOpen(0, 8, DISPLAY_W, DISPLAY_H - 16, 0, 800);
 
     // Init pad (BIOS driver). Only padbuf[0] (controller 1) is actually
     // read by update() now - the BIOS pad driver still expects a second
     // buffer to be registered regardless, so padbuf[1] stays wired up
-    // but unused for control (see update()'s own comment for the single-
-    // controller, L2-modifier control scheme).
+    // but unused for control (see update() for the single-controller,
+    // SELECT-cycled control modes).
     InitPAD(padbuf[0], 34, padbuf[1], 34);
     StartPAD();
 
@@ -790,6 +1012,28 @@ void init(void)
     // player.obj has been baked in by py_convert_assets.py - draw_player()
     // no-ops on -1, so a not-yet-converted player just doesn't appear.
     playerModelIndex = find_model_index_by_name("player");
+
+    // Seed the frame clock LAST, after every slow boot step (CD init, stage
+    // load, SPU uploads) has finished. Seeding it earlier would hand the
+    // first frame a delta covering the entire boot - hundreds of vblanks -
+    // and fire the whole simulation forward on frame one.
+    // TARGET IS PAL. Forced rather than inherited: without this the console
+    // stays in whatever mode ResetGraph() left it, which follows the BIOS
+    // region - so the same disc runs at 50Hz on a PAL console and 60Hz on
+    // an NTSC one (or on an emulator set to NTSC), and the two behave
+    // differently. Set it explicitly and the build is the same everywhere.
+    //
+    // Delta-time makes the SIMULATION speed identical either way, so this
+    // is about display timing and testing consistency, not movement.
+    SetVideoMode(MODE_PAL);
+
+    // Read back rather than assuming: this stays correct if the mode above
+    // is ever changed or dropped, and it's what the overlay's HZ reports.
+    g_refresh_hz = (GetVideoMode() == MODE_PAL) ? 50 : 60;
+    g_prev_vblank = VSync(-1);
+    g_dt = DT_ONE;
+    g_dt_vblanks = 1;
+    g_time_ticks = 0;
 }
 
 
@@ -879,7 +1123,7 @@ MATRIX g_light_color_matrix = {
 // Global AMBIENT (GTE back colour): added to every lit vertex, and the floor
 // a one-sided face falls to when it faces away from every light. Overwritten
 // per stage by load_stage_lights() (authored ambient, or 0 if none).
-int g_ambient_r = 0, g_ambient_g = 0, g_ambient_b = 0;
+int g_ambient_r = 128, g_ambient_g = 128, g_ambient_b = 128;
 
 // ---- Live intensity editor (DEBUG mode, hold L2 + Up/Down) --------------
 // Redefined from the old multiplicative "dimmer": L2 now edits the lights'
@@ -893,6 +1137,179 @@ int g_ambient_r = 0, g_ambient_g = 0, g_ambient_b = 0;
 // 0 forever). A stage with NO authored directional still stays unlit no
 // matter what - the offset shifts existing lights, it never invents one.
 int g_light_intensity_offset = 0;   // signed, 256 == +/-1.0. L2+Up/Down.
+
+// ---- Distance FOG (DEBUG mode, hold L1+L2) -----------------------------
+// TWO CO-OPERATING MECHANISMS, because neither alone produces the thick
+// grey "Silent Hill" look on PS1 hardware:
+//
+//  1. GTE DEPTH CUE (the gradient). gte_rtps() already computes
+//     IR0 = (q*DQA + DQB)/4096 for every vertex it projects (q = H*65536/SZ,
+//     the same perspective divide that scales screen X/Y - see inline_c.h's
+//     gte_rtps docs), saturated to 0..4096. gte_dpcs() then interpolates the
+//     loaded RGB toward the FAR COLOUR by that IR0:
+//         result = colour + (far_colour - colour) * IR0/4096
+//     So the ramp is entirely DQA/DQB, chosen to put IR0 at 0 on fog_near
+//     and 4096 on fog_far. This gives a smooth per-vertex gradient and is
+//     free for Gouraud geometry (folded into the existing rtps loop in
+//     transform_object_vertices).
+//
+//     What it CANNOT do is fog textured geometry. For a textured prim the
+//     vertex colour is a TINT the GPU multiplies into the texel (128 ==
+//     neutral, 255 == 2x), not a replacement - so depth-cueing a textured
+//     wall toward light grey just BRIGHTENS it toward 2x-texel. It never
+//     goes grey. This is a hardware property of PS1 texture modulation, not
+//     something a better ramp fixes.
+//
+//  2. LAYERED OT FOG QUADS (the convergence). draw_fog_layers() inserts
+//     fog_layers full-screen semi-transparent fog-coloured quads at spaced
+//     OT depth buckets. Because the OT is walked back-to-front, geometry
+//     sitting deeper than a quad gets that quad painted OVER it; geometry
+//     nearer than all of them is untouched. Each quad is a 50/50 blend
+//     (semi-transparency mode 0, B/2+F/2), so depth n layers back is
+//     1 - 1/2^n of the way to the fog colour: 50%, 75%, 87.5%, 94%...
+//     This is what makes textured geometry actually converge, and it costs
+//     fog_layers primitives PER FRAME - not per triangle.
+//
+// The two are complementary: the depth cue gives fine per-vertex gradient
+// that quads can't (they're stepped), the quads give true convergence the
+// depth cue can't. Both read the same fog colour and the same near/far.
+//
+// Distances are in the SAME world units as camera.pos / stage object
+// positions (SZ is the camera-space Z the GTE projected), so fog_far
+// ~6000 is a little over one CAMERA_DISTANCE (4096) beyond the near edge.
+//
+// FOG COLOUR is a compile-time constant for now, deliberately identical to
+// the screen clear colour set in init() - if the two ever drift, geometry
+// fades to one colour against a void of another, which reads instantly as
+// broken (that was the first cut's bug: the far colour was slaved to
+// g_ambient_*, and a stage authoring no ambient light made it BLACK against
+// this grey background). init() now derives its clear colour from these, so
+// they cannot drift again.
+//
+// WHEN STAGE-GEN AUTHORS FOG: add enable/near/far/colour to STAGE_DEF, set
+// these globals in load_stage_lights(), and leave the L1+L2 editor writing
+// the same globals as a live override - exactly the pattern the light
+// intensities already use (authored value + live offset).
+// FOG_COL_R/G/B live up with DISPLAY_W/H rather than here, because init()
+// needs them for the screen clear colour and runs long before this block.
+
+uint8_t fog_enabled = 0;            // master toggle (L1+L2 + CROSS)
+int fog_near = 800;                 // SZ at which fog starts (IR0 = 0)
+int fog_far  = 6000;                // SZ at which fog is full (IR0 = 4096)
+int fog_layers = 3;                 // OT fog quads (L1+L2 + CIRCLE cycles)
+
+// ---- Fog-hidden geometry culling (L1+L2 + SQUARE) ----------------------
+// The payoff fog is supposed to earn. Geometry deep enough that fog has
+// gone opaque over it contributes nothing but GTE and GPU time - so don't
+// draw it. This is why PS1 games shipped fog at all: it isn't decoration,
+// it's what makes an aggressive draw distance invisible.
+//
+// GRANULARITY IS PER TRIANGLE, in draw_object_into_ot(). An earlier cut
+// culled whole objects and models visibly popped out of existence - one
+// frame a house, the next nothing. Per-triangle, a receding model dissolves
+// from its far side, and each disappearance is one small distant triangle
+// rather than an entire silhouette. object_is_culled() still rejects whole
+// objects, but only when every triangle would have failed anyway, so it is
+// now a pure fast path with no effect on what's visible.
+//
+// WHAT MAKES THE CULL INVISIBLE, precisely - this is worth understanding
+// before tuning, because the two geometry types behave completely
+// differently at the plane:
+//
+//   UNTEXTURED: the depth cue reaches IR0 = 4096 at fog_far, so the vertex
+//     colour IS the fog colour exactly. Residual zero, cull invisible.
+//
+//   TEXTURED: the vertex colour is a tint the GPU multiplies as
+//     texel * tint / 128 - and FOG_COL_* is 128, which is EXACTLY the
+//     neutral multiplier. A fully depth-cued textured surface therefore
+//     renders as its raw unmodified texel. The depth cue contributes
+//     literally nothing to textured geometry at this fog colour: every bit
+//     of textured fogging is coming from the OT quads instead. Residual at
+//     the plane is 0.5^fog_layers of the texel's difference from the fog -
+//     12.5% at 3 layers, 1.6% at 6.
+//
+// So: FOGRESID on the overlay is the number to watch. If culling pops,
+// raise fog_layers until FOGRESID is low enough that it doesn't. A stage
+// with no textured geometry can cull at any layer count.
+//
+// (Worth noting the 128 result is not a bug to fix here but a consequence
+// of a deliberate choice - a mid-grey fog is neutral to PS1 texture
+// modulation. A brighter fog colour would let the depth cue contribute to
+// textured surfaces too, at the cost of everything trending brighter with
+// distance rather than toward grey. The quads exist precisely so the fog
+// colour doesn't have to be chosen for the hardware's convenience.)
+uint8_t fog_cull_enabled = 0;
+int fogCulledCount = 0;             // whole objects, reset in draw_stage()
+int fogCulledTriCount = 0;          // triangles, reset in draw_stage()
+
+// ---- Fog density drift (L1+L2 + TRIANGLE) ------------------------------
+// Slow sine breathing on the fog's far edge. Deliberately ONE-SIDED: it
+// only ever pushes far OUTWARD from the authored value, never inward. That
+// is a safety property, not an aesthetic one - widening the span can only
+// REDUCE |DQA| (it's near*far/(h*span)), so drift can never walk a
+// rail-safe configuration into a railed one behind the editor's back.
+// Fog therefore breathes between "as authored" (thickest) and slightly
+// thinner, which is the right direction anyway: fog thinning and settling
+// reads as air moving, fog thickening past its authored density reads as
+// the renderer glitching.
+//
+// isin() takes 131072 == 360 degrees and returns 20.12 (4096 == 1.0).
+uint8_t fog_drift_enabled = 0;
+int g_fog_drift_phase = 0;          // advances once per frame in update()
+#define FOG_DRIFT_SPEED  180        // phase units/frame: 131072/180 ~= 728
+                                    // frames ~= 12s per cycle at 60Hz
+#define FOG_DRIFT_AMOUNT 384        // peak span widening, 4096 == 100%.
+                                    // 384 ~= 9% - enough to read as motion,
+                                    // small enough not to read as a bug
+
+// ---- Vertical gradient on the fog quads --------------------------------
+// Each quad is Gouraud rather than flat, ramping between two shades top to
+// bottom. Fog that is one flat colour everywhere reads as a grey filter
+// laid over the image; fog that is denser low and thinner high reads as
+// something the scene is actually sitting in. Costs nothing - POLY_G4 is
+// the same pass as POLY_F4, just more colour words.
+//
+// Offsets are signed and applied to FOG_COL_*, then clamped 0..255.
+#define FOG_GRAD_TOP    (-10)       // thinner/darker toward the skyline
+#define FOG_GRAD_BOTTOM (10)        // denser/brighter pooling low
+
+#define FOG_NEAR_MIN     64         // below this the perspective divide
+                                    // is already saturating (draw_object_
+                                    // into_ot rejects SZ < 64 anyway)
+#define FOG_FAR_MAX      32000      // far*65536 must stay inside int32 in
+                                    // setup_frame_fog's DQB staging
+#define FOG_STEP         32         // world units per held frame
+#define FOG_MAX_LAYERS   6          // past ~4 the blend is already >94%
+                                    // fog; the cap is about prim budget
+                                    // and diminishing returns, not maths
+
+// SPAN FLOOR. near and far may never meet - the ramp divides by
+// (far - near) - but a fixed floor is NOT enough: DQB is 16777216*far/span,
+// so the span has to scale with far or DQB overflows int32 and the ramp
+// inverts. Requiring span >= far/96 caps DQB at 16777216*96 = 1.61e9, which
+// clears int32 with room for the negative q*DQA term added to it.
+// (The first cut used a flat 64 here and wrapped DQB for any far > 8192.)
+#define FOG_SPAN_FLOOR(far_) (((far_) / 96) > 64 ? ((far_) / 96) : 64)
+
+// DQA MAGNITUDE RAIL. DQA is a 16-bit register so ±32767 is the obvious
+// limit, but the real limit is tighter: the GTE evaluates
+// MAC0 = q*DQA + DQB in a 32-bit accumulator, and q saturates at 0x1FFFF
+// (131071) for anything closer than ~2H. At |DQA| = 32767 that product
+// alone is 4.3e9 - MAC0 wraps, and fog INVERTS on near geometry. 16000
+// keeps 131071*|DQA| at 2.09e9, so even with DQB's positive contribution
+// the accumulator stays inside int32.
+#define FOG_DQA_RAIL     16000
+
+// Live GTE values, recomputed each frame by setup_frame_fog() - kept in
+// globals purely so the overlay can show what the hardware was actually
+// handed (the registers themselves are write-only).
+int  g_fog_dqa = 0;
+long g_fog_dqb = 0;
+uint8_t g_fog_dqa_saturated = 0;    // DQA hit FOG_DQA_RAIL this frame - the
+                                    // ramp is degenerate, see the overlay's
+                                    // FOGDQA marker
+int g_fog_layer_bucket[FOG_MAX_LAYERS]; // OT buckets the quads went into,
+                                        // for the overlay
 
 // Authored per-directional intensity (256 == 1.0), captured by
 // load_stage_lights(). Intensity is NO LONGER baked into the colour
@@ -1068,8 +1485,8 @@ uint8_t active_palette = 0;
 
 // Positions the shared camera behind + above the player for the
 // third-person view, at the current player_cam_yaw (which only changes
-// while the user deliberately pans with the right stick - it never
-// drifts on its own, so the world doesn't spin during normal movement).
+// while the user deliberately orbits with L1/R1 - it never drifts on
+// its own, so the world doesn't spin during normal movement).
 // Locked to the player's XZ position every frame, keeping player and
 // camera tied together. Called at the end of update() while PLAY mode
 // is active, right before main() calls update_camera_matrix().
@@ -1094,7 +1511,7 @@ void update_player_follow_camera(void)
     camera.pos.vz = player_pos.vz + rotOff.vz;
 
     // Face the pan yaw so the player stays centred; player_cam_pitch tips
-    // the view up/down (base 128/4096 ~ 11 deg down, right-stick Y nudges it).
+    // the view up/down (base 128/4096 ~ 11 deg down, L2/R2 nudge it).
     camera.rot.vx = (short)player_cam_pitch;
     camera.rot.vy = (short)player_cam_yaw;
     camera.rot.vz = 0;
@@ -1121,12 +1538,12 @@ static void update_play(unsigned short raw)
 
     // L1/R1 orbit the follow-cam yaw; L2/R2 pitch the view (clamped). Pitch
     // DECREASES toward the sky (base 128 tilts slightly down), so L2 = up.
-    if (!(raw & PAD_L1)) player_cam_yaw -= PLAYER_CAM_YAW_SPEED;   // orbit left
-    if (!(raw & PAD_R1)) player_cam_yaw += PLAYER_CAM_YAW_SPEED;   // orbit right
+    if (!(raw & PAD_L1)) player_cam_yaw -= dt_scale(PLAYER_CAM_YAW_SPEED);
+    if (!(raw & PAD_R1)) player_cam_yaw += dt_scale(PLAYER_CAM_YAW_SPEED);
     player_cam_yaw &= 4095;
 
-    if (!(raw & PAD_L2)) player_cam_pitch -= PLAYER_CAM_PITCH_SPEED; // look up
-    if (!(raw & PAD_R2)) player_cam_pitch += PLAYER_CAM_PITCH_SPEED; // look down
+    if (!(raw & PAD_L2)) player_cam_pitch -= dt_scale(PLAYER_CAM_PITCH_SPEED);
+    if (!(raw & PAD_R2)) player_cam_pitch += dt_scale(PLAYER_CAM_PITCH_SPEED);
     if (player_cam_pitch < PLAYER_CAM_PITCH_MIN) player_cam_pitch = PLAYER_CAM_PITCH_MIN;
     if (player_cam_pitch > PLAYER_CAM_PITCH_MAX) player_cam_pitch = PLAYER_CAM_PITCH_MAX;
 
@@ -1151,8 +1568,25 @@ static void update_play(unsigned short raw)
         // forward f = up, strafe s = right; the /128 keeps the same world
         // units as before now that full deflection is a fixed +/-128.
         int f = -my, s = mx;
-        player_pos.vx += ((fwdX * f + rgtX * s) / 128 * PLAYER_MOVE_SPEED) >> 12;
-        player_pos.vz += ((fwdZ * f + rgtZ * s) / 128 * PLAYER_MOVE_SPEED) >> 12;
+
+        // DELTA-TIMED, via accumulators rather than dt_scale(). The step is
+        // built in 20.12 - (fwd*f + rgt*s)/128 lands at ~4096 magnitude, so
+        // multiplying by PLAYER_MOVE_SPEED gives units-per-tick already in
+        // fixed point, no shift needed - and dt_advance() keeps whatever
+        // sub-unit remainder the frame leaves over.
+        //
+        // Why accumulators and not a plain multiply: diagonal movement,
+        // slow drift, and any future analogue stick deflection all produce
+        // steps with a real fractional part. Truncating that every frame
+        // makes the player travel measurably slower than their speed says,
+        // and makes the shortfall depend on frame rate - which is the exact
+        // class of bug this change exists to remove. The remainder is per
+        // axis, so each gets its own.
+        int stepFP_X = ((fwdX * f + rgtX * s) / 128) * PLAYER_MOVE_SPEED;
+        int stepFP_Z = ((fwdZ * f + rgtZ * s) / 128) * PLAYER_MOVE_SPEED;
+
+        player_pos.vx += dt_advance(&player_move_frac_x, stepFP_X);
+        player_pos.vz += dt_advance(&player_move_frac_z, stepFP_Z);
 
         // Face the direction of travel (OBJ files carry no look target, so
         // travel direction IS the look direction).
@@ -1171,20 +1605,24 @@ static void update_play(unsigned short raw)
 static void update_camera_mode(unsigned short raw)
 {
     // Translate on the world X/Z plane.
-    if (!(raw & PAD_UP))    camera.pos.vz += CAMERA_MOVE_SPEED; // forward
-    if (!(raw & PAD_DOWN))  camera.pos.vz -= CAMERA_MOVE_SPEED; // backward
-    if (!(raw & PAD_LEFT))  camera.pos.vx -= CAMERA_MOVE_SPEED; // strafe left
-    if (!(raw & PAD_RIGHT)) camera.pos.vx += CAMERA_MOVE_SPEED; // strafe right
+    // Delta-timed with dt_scale rather than accumulators: this is the
+    // free-fly debug camera, so a sub-unit truncation per frame is
+    // invisible and nothing else in the world has to agree with where it
+    // ended up. Simulation state uses dt_advance() instead.
+    if (!(raw & PAD_UP))    camera.pos.vz += dt_scale(CAMERA_MOVE_SPEED); // forward
+    if (!(raw & PAD_DOWN))  camera.pos.vz -= dt_scale(CAMERA_MOVE_SPEED); // backward
+    if (!(raw & PAD_LEFT))  camera.pos.vx -= dt_scale(CAMERA_MOVE_SPEED); // strafe left
+    if (!(raw & PAD_RIGHT)) camera.pos.vx += dt_scale(CAMERA_MOVE_SPEED); // strafe right
 
     // Y: L1 up, R1 down (view matrix negates camera.pos, so -vy reads up).
-    if (!(raw & PAD_L1)) camera.pos.vy -= CAMERA_MOVE_SPEED; // up
-    if (!(raw & PAD_R1)) camera.pos.vy += CAMERA_MOVE_SPEED; // down
+    if (!(raw & PAD_L1)) camera.pos.vy -= dt_scale(CAMERA_MOVE_SPEED); // up
+    if (!(raw & PAD_R1)) camera.pos.vy += dt_scale(CAMERA_MOVE_SPEED); // down
 
     // Look: L2/R2 yaw, TRIANGLE/CROSS pitch.
-    if (!(raw & PAD_R2)) camera.rot.vy += CAMERA_ROT_SPEED; // yaw right
-    if (!(raw & PAD_L2)) camera.rot.vy -= CAMERA_ROT_SPEED; // yaw left
-    if (!(raw & PAD_TRIANGLE)) camera.rot.vx -= CAMERA_ROT_SPEED; // pitch up
-    if (!(raw & PAD_CROSS))    camera.rot.vx += CAMERA_ROT_SPEED; // pitch down
+    if (!(raw & PAD_R2)) camera.rot.vy += dt_scale(CAMERA_ROT_SPEED); // yaw right
+    if (!(raw & PAD_L2)) camera.rot.vy -= dt_scale(CAMERA_ROT_SPEED); // yaw left
+    if (!(raw & PAD_TRIANGLE)) camera.rot.vx -= dt_scale(CAMERA_ROT_SPEED); // pitch up
+    if (!(raw & PAD_CROSS))    camera.rot.vx += dt_scale(CAMERA_ROT_SPEED); // pitch down
     camera.rot.vx &= 4095;
     camera.rot.vy &= 4095;
 
@@ -1197,11 +1635,122 @@ static void update_camera_mode(unsigned short raw)
 // D-pad yaws (L/R) and pitches (U/D) the global debug transform, L1/R1 roll
 // it, CROSS/CIRCLE drive FOV, TRIANGLE toggles lighting, SQUARE toggles
 // texturing, R2 toggles GTE hardware lighting vs the legacy headlamp.
-// HOLD L2 to instead aim/dim the sun (see the block below). 12-bit angles
+// HOLD L2 to instead edit the authored lights' intensity (see the block
+// below). 12-bit angles
 // wrap via a power-of-two mask so rotation stays continuous through the
 // 0/4096 boundary instead of snapping.
+// Clamps fog_near/fog_far into the range the CURRENT projection can
+// actually render, so the pad editor can never produce a degenerate ramp.
+// setup_frame_fog() still rails and flags independently - that's the
+// backstop for values which didn't come from this editor (stage-gen
+// authored fog, later).
+//
+// THE CONSTRAINT IS ON FAR, NOT ON SPAN. Starting from
+//     |DQA| = 256*near*far / (h*span),   span = far - near
+// and requiring |DQA| <= FOG_DQA_RAIL, let k = RAIL*h/256:
+//     far - near >= near*far/k   <=>   far*(k - near) >= near*k
+//     <=>  far >= near*k/(k - near)  =  near + near^2/(k - near)
+// So for any near below k there is a minimum FAR, and every larger far is
+// also fine - because span grows faster than the requirement does. That is
+// why this is a closed form and not a loop: an earlier iterative version
+// clamped span against a far that the clamp itself then moved, and for
+// near approaching k it converged too slowly to be correct.
+//
+// If near is so deep that no far works (k <= near), near itself is pulled
+// back to the deepest value that FOG_FAR_MAX can still serve, from the same
+// inequality solved the other way:
+//     near <= far*k/(k + far)  =  far - far^2/(k + far)
+//
+// Overflow: near^2 and FOG_FAR_MAX^2 are both <= 1.02e9 (int32 fine), and
+// the k*far form that WOULD overflow at 9.8e10 is exactly what the
+// "x - x^2/(k+x)" rearrangement avoids. h >= 8 keeps k >= 496.
+static void fog_clamp_range(void)
+{
+    int h = FOCAL_LENGTH + fov;
+    if (h < 8) h = 8;
+
+    int k = (FOG_DQA_RAIL / 256) * h;   // staged to keep the multiply small
+    if (k < 1) k = 1;
+
+    if (fog_near < FOG_NEAR_MIN) fog_near = FOG_NEAR_MIN;
+    if (fog_far  > FOG_FAR_MAX)  fog_far  = FOG_FAR_MAX;
+
+    // Deepest near this FOV can serve at all, then re-floor.
+    int nearMax = FOG_FAR_MAX - (FOG_FAR_MAX * FOG_FAR_MAX) / (k + FOG_FAR_MAX) - 1;
+    if (nearMax < FOG_NEAR_MIN) nearMax = FOG_NEAR_MIN;
+    if (fog_near > nearMax)     fog_near = nearMax;
+
+    // Minimum far for that near: the DQA rail bound, then the DQB span
+    // floor on top (which depends on far, hence the single correction
+    // pass - it only ever moves far by ~1%, so one pass settles it).
+    int farMin;
+    if (k <= fog_near + 1)
+        farMin = FOG_FAR_MAX;
+    else
+        farMin = fog_near + (fog_near * fog_near) / (k - fog_near) + 1;
+
+    int floorFar = fog_near + FOG_SPAN_FLOOR(farMin);
+    if (floorFar > farMin) farMin = floorFar;
+    floorFar = fog_near + FOG_SPAN_FLOOR(farMin);
+    if (floorFar > farMin) farMin = floorFar;
+
+    if (farMin > FOG_FAR_MAX) farMin = FOG_FAR_MAX;
+    if (fog_far < farMin)     fog_far = farMin;
+    if (fog_far > FOG_FAR_MAX) fog_far = FOG_FAR_MAX;
+}
+
+
 static void update_debug(unsigned short raw)
 {
+    // Hold L1+L2: LIVE FOG EDITOR. Checked BEFORE the L2-only branch so the
+    // combination is unambiguous, and deliberately a combination rather
+    // than a lone shoulder button: L2 alone already owns the intensity
+    // editor and L1 alone is the -Z roll control, so a single new modifier
+    // would have had to steal one of them. Holding both suspends roll for
+    // as long as it's held (the same trade the L2 editor makes with
+    // rotation/FOV) and nothing else.
+    //   Up/Down    - fog FAR distance  (where fog is full)
+    //   Left/Right - fog NEAR distance (where fog begins)
+    //   CROSS      - fog on/off (edge-detected)
+    // The render toggles stay live, as in the intensity editor.
+    if (!(raw & PAD_L1) && !(raw & PAD_L2))
+    {
+        if (!(raw & PAD_UP))    fog_far  += dt_scale(FOG_STEP);
+        if (!(raw & PAD_DOWN))  fog_far  -= dt_scale(FOG_STEP);
+        if (!(raw & PAD_RIGHT)) fog_near += dt_scale(FOG_STEP);
+        if (!(raw & PAD_LEFT))  fog_near -= dt_scale(FOG_STEP);
+
+        // Clamp both ends, then enforce the minimum span by pushing FAR
+        // out rather than pulling NEAR back - so walking near forward
+        // never silently teleports the whole ramp, it just shoves the far
+        // edge ahead of it.
+        // Both distances are bounded by what the live projection can
+        // express, not by fixed constants - a fixed floor is exactly what
+        // let DQB overflow in the first cut. See fog_clamp_range().
+        fog_clamp_range();
+
+        if (edge_pressed(raw, PAD_CROSS)) fog_enabled ^= 1;
+
+        // CIRCLE cycles the OT fog-quad layer count 0..FOG_MAX_LAYERS.
+        // 0 leaves the GTE depth cue running on its own, which is the
+        // direct A/B for what the quads are actually contributing -
+        // textured geometry stops converging and only brightens.
+        if (edge_pressed(raw, PAD_CIRCLE))
+            fog_layers = (fog_layers + 1) % (FOG_MAX_LAYERS + 1);
+
+        // TRIANGLE and SQUARE are rebound inside the fog editor - the
+        // lighting/texture toggles they carry elsewhere are still reachable
+        // from the L2 editor and from unmodified DEBUG, and fog needs its
+        // own switches more than this branch needs a third copy of theirs.
+        if (edge_pressed(raw, PAD_TRIANGLE)) fog_drift_enabled ^= 1;
+        if (edge_pressed(raw, PAD_SQUARE))   fog_cull_enabled ^= 1;
+
+        // R2 (lighting path) stays live - comparing GTE lighting against
+        // the headlamp with fog on is a thing you actually want to do.
+        if (edge_pressed(raw, PAD_R2))       sun_lighting ^= 1;
+        return;
+    }
+
     // Hold L2: LIVE INTENSITY EDITOR (only meaningful with GTE lighting on).
     // Up/Down moves the authored lights' intensity by eye - the model-
     // rotation and FOV controls below are suspended while L2 is held. Light
@@ -1215,8 +1764,8 @@ static void update_debug(unsigned short raw)
         // Each light's effective value clamps 0..2047 (~8x) in
         // setup_frame_lighting(); the offset itself clamps to the same
         // span so releasing/reversing always responds immediately.
-        if (!(raw & PAD_UP))    g_light_intensity_offset += 4;
-        if (!(raw & PAD_DOWN))  g_light_intensity_offset -= 4;
+        if (!(raw & PAD_UP))    g_light_intensity_offset += dt_scale(4);
+        if (!(raw & PAD_DOWN))  g_light_intensity_offset -= dt_scale(4);
         if (g_light_intensity_offset < -2047) g_light_intensity_offset = -2047;
         if (g_light_intensity_offset >  2047) g_light_intensity_offset =  2047;
 
@@ -1228,23 +1777,23 @@ static void update_debug(unsigned short raw)
     }
 
     // Pitch (X rotation): D-pad up/down.
-    if (!(raw & PAD_UP))   model_rot.vx -= ROT_SPEED;
-    if (!(raw & PAD_DOWN)) model_rot.vx += ROT_SPEED;
+    if (!(raw & PAD_UP))   model_rot.vx -= dt_scale(ROT_SPEED);
+    if (!(raw & PAD_DOWN)) model_rot.vx += dt_scale(ROT_SPEED);
     model_rot.vx &= 4095;
 
     // Yaw (Y rotation): D-pad left/right.
-    if (!(raw & PAD_LEFT))  model_rot.vy -= ROT_SPEED;
-    if (!(raw & PAD_RIGHT)) model_rot.vy += ROT_SPEED;
+    if (!(raw & PAD_LEFT))  model_rot.vy -= dt_scale(ROT_SPEED);
+    if (!(raw & PAD_RIGHT)) model_rot.vy += dt_scale(ROT_SPEED);
     model_rot.vy &= 4095;
 
     // Roll (Z rotation): L1/R1.
-    if (!(raw & PAD_L1)) model_rot.vz -= ROT_SPEED;
-    if (!(raw & PAD_R1)) model_rot.vz += ROT_SPEED;
+    if (!(raw & PAD_L1)) model_rot.vz -= dt_scale(ROT_SPEED);
+    if (!(raw & PAD_R1)) model_rot.vz += dt_scale(ROT_SPEED);
     model_rot.vz &= 4095;
 
     // FOV: CROSS widens, CIRCLE narrows.
-    if (!(raw & PAD_CROSS))  fov += fov_speed;
-    if (!(raw & PAD_CIRCLE)) fov -= fov_speed;
+    if (!(raw & PAD_CROSS))  fov += dt_scale(fov_speed);
+    if (!(raw & PAD_CIRCLE)) fov -= dt_scale(fov_speed);
     if (fov > 65535) fov = 0;
     if (fov < -65535) fov = 65536;
 
@@ -1259,7 +1808,7 @@ static void update_debug(unsigned short raw)
 
 // Reads ONE controller (padbuf[0]) and drives whichever mode is latched.
 // SELECT cycles the mode (edge-detected); each mode owns the whole pad, so
-// there are no held modifiers any more. START (ambience) and L3 (overlay
+// there are no held modifiers any more. START (ambience) and R2 (overlay
 // page) work in every mode. The follow-cam is only re-aimed in PLAY so the
 // CAMERA mode's free-fly position is never overwritten.
 void update(void)
@@ -1302,9 +1851,10 @@ void update(void)
     else                                  update_debug(raw);
 
     // ---- Mode-independent controls (fire in every mode) ----
-    // L3 click cycles the debug overlay page. Requires the DualShock in
-    // analog mode (red LED); in digital mode the L3 bit stays high and this
-    // simply never fires.
+    // R2 click cycles the debug overlay page (moved off L3 so a digital
+    // pad on real hardware can reach page 2). Note R2 double-duty: in
+    // DEBUG mode the same press also toggles sun_lighting, and in PLAY it
+    // is the held pitch control - accepted trade-off (see debug_page).
     if (edge_pressed(raw, PAD_R2))
         debug_page = (debug_page + 1) % DEBUG_PAGE_COUNT;
 
@@ -1497,6 +2047,324 @@ void setup_frame_lighting(void)
     gte_SetBackColor(g_ambient_r, g_ambient_g, g_ambient_b);
 }
 
+// Pushes this frame's depth-cue registers: the FAR COLOUR that fogged
+// geometry converges to, and the DQA/DQB pair that shapes the ramp.
+// Called once per frame (next to setup_frame_lighting) because the ramp
+// depends on H - the projection distance, live-driven by the FOV control -
+// as well as on the two distances the L1+L2 editor moves.
+//
+// DERIVATION. gte_rtps computes, per inline_c.h:
+//     q    = ((H*131072/SZ)+1)/2      (~ H*65536/SZ)
+//     IR0  = (q*DQA + DQB)/4096,  saturated 0..4096
+// We want IR0 = 0 at SZ == fog_near and IR0 = 4096 at SZ == fog_far.
+// Solving those two equations:
+//     DQA = -256 * fog_near * fog_far / (H * (fog_far - fog_near))
+//     DQB =  65536 * 256 * fog_far / (fog_far - fog_near)
+// DQA is negative because q SHRINKS with distance (it's ~1/SZ), so the
+// ramp has to run downhill in q to run uphill in depth. Note the fog is
+// therefore linear in 1/z, not in z - that is the hardware's behaviour,
+// not an approximation on our side, and it's why fog thickens fastest
+// just past fog_near.
+//
+// OVERFLOW. This is the part the first cut got wrong, so the staging is
+// spelled out. Every intermediate is bounded against the CLAMPED inputs
+// (near <= 31936, far <= 32000, span >= far/96, h >= 8):
+//
+//   near * far          <= 32000*32000  = 1.02e9   fits int32
+//   u = near*far/span   <= 96*near      = 3.07e6   (via the span floor)
+//   256 * u             <= 785e6                   fits int32
+//   dqa = 256*u/h       then railed to FOG_DQA_RAIL
+//   far * 65536         <= 32000*65536  = 2.09e9   fits int32 - this is
+//                                                  FOG_FAR_MAX's entire
+//                                                  reason for existing
+//   far*65536/span      <= 96*65536     = 6.29e6   (via the span floor)
+//   dqb = that * 256    <= 1.61e9                  fits int32
+//
+// Note u is formed as (near*far)/span BEFORE the 256 multiply. The obvious
+// ordering, (256*near/h)*far, is what overflowed in the first cut: with h
+// railed near 1 the first term reached 8.2e6 and the *far wrapped hard.
+// Nothing here needs a 64-bit divide, so no __udivdi3 enters the binary.
+void setup_frame_fog(void)
+{
+    if (!fog_enabled)
+        return;
+
+    // H (projection distance) is live-driven by the FOV control, which can
+    // legitimately reach 0 and below - and fov wraps at +/-65535, so it can
+    // arrive here as very nearly anything. A tiny H doesn't merely divide
+    // badly, it inflates DQA without bound. Floored at 8 rather than 1:
+    // below that the projection is degenerate anyway, and 8 is what keeps
+    // 256*u/h inside the rail's useful range instead of pinning it every
+    // frame the moment someone touches FOV.
+    int h = FOCAL_LENGTH + fov;
+    if (h < 8) h = 8;
+
+    // Local, defensively clamped copies. update_debug already keeps the
+    // globals in range, but this function is the one place these values
+    // reach hardware and the staging above is only sound for clamped
+    // inputs - so it re-clamps rather than trusting its caller.
+    int nearD = fog_near, farD = fog_far;
+
+    // DENSITY DRIFT. Applied to the LOCAL copy only - the globals stay
+    // exactly what the editor set, so the overlay keeps reporting the
+    // authored values and the drift can't accumulate into them.
+    //
+    // isin() returns -4096..4096; the +4096 shift makes this 0..8192, i.e.
+    // strictly non-negative, which is what enforces the one-directional
+    // widening described at fog_drift_enabled. Widening only ever lowers
+    // |DQA|, so no drifted value can rail a configuration the editor
+    // already cleared.
+    if (fog_drift_enabled)
+    {
+        int span = farD - nearD;
+        if (span > 0)
+        {
+            int wave = isin(g_fog_drift_phase) + 4096;      // 0 .. 8192
+            // span * FOG_DRIFT_AMOUNT <= 32000*384 = 12.3e6, and the extra
+            // /8192 keeps the whole term under one span - no overflow, and
+            // no runaway even at the widest legal span.
+            farD += ((span / 64) * ((wave * FOG_DRIFT_AMOUNT) >> 12)) >> 7;
+        }
+    }
+
+    if (nearD < FOG_NEAR_MIN) nearD = FOG_NEAR_MIN;
+    if (farD  > FOG_FAR_MAX)  farD  = FOG_FAR_MAX;
+    if (farD  < FOG_NEAR_MIN + 64) farD = FOG_NEAR_MIN + 64;
+
+    int span = farD - nearD;
+    int floorSpan = FOG_SPAN_FLOOR(farD);
+    if (span < floorSpan) span = floorSpan;
+
+    // DQA. Negative because q SHRINKS with distance (it's ~1/SZ), so the
+    // ramp runs downhill in q to run uphill in depth.
+    //
+    // Railing DQA is a REAL failure mode, not a theoretical one: |DQA|
+    // grows as near*far/(h*span), so a short span at a distant near edge
+    // (or a cranked-down FOV) pins it, and a pinned ramp collapses toward
+    // "fully fogged everywhere" - a flat screen of fog colour that looks
+    // like a broken renderer rather than a bad parameter. Flagged to the
+    // overlay (FOGDQA prints a trailing !) rather than silently clamped, so
+    // a photographed frame explains itself.
+    int u   = (nearD * farD) / span;
+    int dqa = -((256 * u) / h);
+
+    g_fog_dqa_saturated = (dqa < -FOG_DQA_RAIL);
+    if (dqa < -FOG_DQA_RAIL) dqa = -FOG_DQA_RAIL;
+    if (dqa > 0)             dqa = 0;   // a near edge past the far edge
+                                        // would flip the sign and fog the
+                                        // world backwards
+
+    // DQB: far*65536 first (fits by FOG_FAR_MAX), then /span, then *256.
+    long dqb = ((long)((farD * 65536) / span)) * 256;
+
+    g_fog_dqa = dqa;
+    g_fog_dqb = dqb;
+
+    gte_SetDQA(dqa);
+    gte_SetDQB(dqb);
+
+    // FAR COLOUR - what fully-fogged geometry converges to under the depth
+    // cue. The same constant the OT fog quads and the screen clear colour
+    // use; see the FOG_COL_* block for why all three must agree.
+    gte_SetFarColor(FOG_COL_R, FOG_COL_G, FOG_COL_B);
+}
+
+
+// Depth-cues the FLAT (per-face) colour cache. The Gouraud path does NOT
+// come through here - per-vertex fog is folded directly into
+// transform_object_vertices()' existing rtps loop, where it is free (see
+// that function's PIPELINE ORDER note). Flat shading has no such loop to
+// ride along on: one colour covers a whole triangle, so it needs a
+// representative depth of its own, which means a transform of its own.
+//
+// Uses corner v0 rather than a centroid - locating a centroid costs an
+// extra transform per triangle, and flat shading is already a per-triangle
+// approximation of exactly this kind.
+//
+// Must run AFTER compute_object_lighting() (it fogs the LIT colour, not the
+// raw material) and after transform_object_vertices() (this reuses the
+// GTE's SXY/SZ FIFOs, which would clobber the caches if they weren't
+// already stored). composed_matrix must be current for this object, which
+// transform_object_vertices() guarantees by re-pushing it.
+void apply_fog_to_faces(const MODEL_DEF *model)
+{
+    if (!fog_enabled || use_vertex_light)
+        return;
+
+    unsigned int triCount = model->triCount < MAX_MODEL_TRIS ? model->triCount : MAX_MODEL_TRIS;
+
+    for (unsigned int i = 0; i < triCount; i++)
+    {
+        gte_ldv0(&model->verts[model->tris[i].v0]);
+        gte_rtps();                                  // regenerates IR0 at
+                                                     // this face's depth
+        gte_ldrgb(&transformedFaceColors[i]);
+        gte_dpcs();
+        gte_strgb(&transformedFaceColors[i]);
+    }
+}
+
+
+// Inserts this frame's LAYERED FOG QUADS into the OT - the half of the fog
+// that makes TEXTURED geometry converge (see the FOG block up top for why
+// the depth cue alone cannot).
+//
+// Each layer is a full-screen fog-coloured POLY_G4 at 50% semi-transparency
+// dropped into an OT bucket. DrawOTag walks the OT back-to-front, so a quad
+// covers everything queued deeper than its bucket and nothing nearer:
+// geometry n layers back has been blended toward the fog colour n times,
+// i.e. 1 - 1/2^n of the way there (50%, 75%, 87.5%...). Textured or
+// untextured, lit or not - it's a flat GPU blend over the finished pixels,
+// so nothing escapes it.
+//
+// BUCKET PLACEMENT is derived through the GTE's OWN avsz3/stotz path, the
+// identical arithmetic draw_object_into_ot() uses to bucket a triangle.
+// That matters: OTZ's scale depends on ZSF3, which InitGeom sets and does
+// not expose, so any hand-derived mapping would be guesswork that silently
+// drifts from where geometry actually lands. Asking the hardware costs
+// three GTE ops per layer, once per frame.
+//
+// SPACING IS FAR-BIASED (sqrt). Each quad is a hard step - a surface
+// crossing one jumps 50% of the way to the fog colour in a single pixel -
+// so where the steps land is the whole ballgame.
+//
+// The governing insight is that a quad's step is only as visible as the
+// pixel it lands on is UNLIKE the fog colour. Where the depth cue has
+// already brought a surface to 90% fog, an extra 50% blend moves it 5% of
+// the original distance and vanishes. Where the cue is only at 25%, the
+// same blend is a 38% jump and reads as a wall of fog hanging in mid-air.
+// So the quads belong as DEEP as the coverage requirement allows.
+//
+// Measured worst-case step at near=800 far=6000, 3 layers:
+//
+//     even in 1/z      quads at 1020 1408 2284   worst step 37.7%
+//     even in z        quads at 2100 3400 4700   worst step 14.3%
+//     sqrt bias (used) quads at 3400 4476 5303   worst step  5.9%
+//
+// Note that even-in-1/z is the WORST of the three despite sounding like
+// the principled choice - IR0 is affine in 1/z, so spacing evenly in 1/z
+// is spacing evenly in fog OPACITY, which lands every quad squarely in the
+// region where geometry still differs most from the fog. It was tried
+// first and measured before it shipped.
+//
+// So: t = sqrt((i+1)/(L+1)), z = near + (far-near)*t. sqrt pulls every
+// layer toward far while still spreading them, which keeps the near-mid
+// range covered rather than cramming all three against the far plane.
+// isqrt32 is the codebase's existing helper; this is L calls per frame.
+// Forward declaration: isqrt32 is defined further down with the sphere-light
+// helpers it was originally written for, which is below this function.
+static unsigned int isqrt32(unsigned int v);
+
+void draw_fog_layers(void)
+{
+    // Cleared every frame, before the early-outs: the overlay reads three
+    // of these unconditionally, and stale buckets from a previous setting
+    // would misreport where the fog currently is.
+    for (int i = 0; i < FOG_MAX_LAYERS; i++)
+        g_fog_layer_bucket[i] = -1;
+
+    if (!fog_enabled || fog_layers <= 0)
+        return;
+
+    int layers = fog_layers;
+    if (layers > FOG_MAX_LAYERS) layers = FOG_MAX_LAYERS;
+
+    int nearD = fog_near, farD = fog_far;
+    if (nearD < 1) nearD = 1;
+    if (farD <= nearD) farD = nearD + 1;
+
+    // Gradient endpoint colours, clamped once rather than per corner.
+    int gradTopR = FOG_COL_R + FOG_GRAD_TOP,    gradBotR = FOG_COL_R + FOG_GRAD_BOTTOM;
+    int gradTopG = FOG_COL_G + FOG_GRAD_TOP,    gradBotG = FOG_COL_G + FOG_GRAD_BOTTOM;
+    int gradTopB = FOG_COL_B + FOG_GRAD_TOP,    gradBotB = FOG_COL_B + FOG_GRAD_BOTTOM;
+    if (gradTopR < 0) gradTopR = 0; if (gradTopR > 255) gradTopR = 255;
+    if (gradTopG < 0) gradTopG = 0; if (gradTopG > 255) gradTopG = 255;
+    if (gradTopB < 0) gradTopB = 0; if (gradTopB > 255) gradTopB = 255;
+    if (gradBotR < 0) gradBotR = 0; if (gradBotR > 255) gradBotR = 255;
+    if (gradBotG < 0) gradBotG = 0; if (gradBotG > 255) gradBotG = 255;
+    if (gradBotB < 0) gradBotB = 0; if (gradBotB > 255) gradBotB = 255;
+
+    for (int i = 0; i < layers; i++)
+    {
+        // Each quad needs its own prim slot AND a tpage prim to select the
+        // semi-transparency rate, so budget for both before allocating
+        // either - a half-inserted layer would leave the GPU in the wrong
+        // blend mode for everything drawn after it.
+        if (primBytesRemaining < (long)(sizeof(POLY_G4) + sizeof(DR_TPAGE)))
+        {
+            primOverflowCount++;
+            break;
+        }
+
+        // Depth of layer i: near + (far-near)*sqrt((i+1)/(L+1)), far-biased
+        // per the header comment. Fixed point, 4096 == 1.0:
+        //   t = sqrt(u) * 4096 = isqrt32(u * 4096^2)
+        // (i+1)*16777216 peaks at 1.0e8 for FOG_MAX_LAYERS, well inside
+        // int32; (far-near)*t peaks at 32000*4096 = 1.3e8, likewise.
+        // The (i+1)/(L+1) parameterisation never reaches 1.0, so the
+        // deepest quad still sits strictly inside fog_far.
+        unsigned int uFixed = ((unsigned int)(i + 1) * 16777216u) / (unsigned int)(layers + 1);
+        int t = (int)isqrt32(uFixed);           // 0..4096
+        if (t > 4096) t = 4096;
+
+        int layerZ = nearD + (((farD - nearD) * t) >> 12);
+
+        if (layerZ < 1)     layerZ = 1;
+        if (layerZ > 65535) layerZ = 65535;     // SZ registers are 16-bit
+
+        // Ask the hardware which OT bucket a triangle at that depth lands
+        // in - three equal corners make avsz3 return that same depth,
+        // scaled by whatever ZSF3 InitGeom chose.
+        int otz;
+        gte_ldsz3(layerZ, layerZ, layerZ);
+        gte_avsz3();
+        gte_stotz(&otz);
+
+        int bucket = otz >> OT_Z_SHIFT;
+        if (bucket < 0)           bucket = 0;
+        if (bucket > OT_LEN - 1)  bucket = OT_LEN - 1;
+        g_fog_layer_bucket[i] = bucket;
+
+        // POLY_G4 rather than POLY_F4: same primitive pass, but four corner
+        // colours instead of one, which buys the vertical gradient for
+        // free. Corner order matches setXY4's - TL, TR, BL, BR - so the top
+        // two carry the thin shade and the bottom two the dense one.
+        POLY_G4 *quad = (POLY_G4 *)nextpri;
+        setPolyG4(quad);
+        setRGB0(quad, gradTopR, gradTopG, gradTopB);
+        setRGB1(quad, gradTopR, gradTopG, gradTopB);
+        setRGB2(quad, gradBotR, gradBotG, gradBotB);
+        setRGB3(quad, gradBotR, gradBotG, gradBotB);
+        setSemiTrans(quad, 1);
+        setXY4(quad,
+            0,         0,
+            DISPLAY_W, 0,
+            0,         DISPLAY_H,
+            DISPLAY_W, DISPLAY_H);
+
+        addPrim(&ot[db][bucket], quad);
+        nextpri += sizeof(POLY_G4);
+        primBytesRemaining -= sizeof(POLY_G4);
+
+        // Semi-transparency RATE lives in the texture page register, not in
+        // the polygon, even for an untextured prim - so the mode has to be
+        // set by a DR_TPAGE ahead of the quad. abr=0 is B/2+F/2, the even
+        // blend the layer maths above assumes.
+        //
+        // Added to the SAME bucket AFTER the quad: addPrim prepends, so the
+        // last thing added is drawn FIRST, which puts the mode change ahead
+        // of the quad that needs it. Nothing downstream is disturbed -
+        // every textured prim carries its own setTPage, and untextured
+        // opaque prims ignore the rate entirely.
+        DR_TPAGE *tpage = (DR_TPAGE *)nextpri;
+        setDrawTPage(tpage, 0, 1, getTPage(0, 0, 0, 0));
+        addPrim(&ot[db][bucket], tpage);
+        nextpri += sizeof(DR_TPAGE);
+        primBytesRemaining -= sizeof(DR_TPAGE);
+    }
+}
+
+
 // Integer square root (bit-by-bit), used for sphere-light distances. Local
 // helper rather than an SDK call so there's no dependency question; inputs
 // are prescaled so they sit comfortably in 32 bits.
@@ -1630,10 +2498,20 @@ static void fill_sphere_light_slots(MATRIX *dmtx, MATRIX *cmtx)
 //       and read vz as a grayscale, two-sided (abs), camera-locked
 //       brightness with a +32 ambient floor - the engine's original look.
 //
-// MUST run AFTER transform_object_vertices() for the same object: the GTE
-// path's MulMatrix0 can disturb the rotation-matrix registers, and the
-// headlamp path reads composed_matrix via gte_rtv0 - projecting positions
-// first keeps both correct.
+// PIPELINE ORDER (changed when fog landed): this now runs BEFORE
+// transform_object_vertices() for the same object, the reverse of the
+// original arrangement. Fog needs each vertex's LIT colour available at the
+// moment that vertex is projected, because the depth-cue factor IR0 only
+// exists for the duration of one rtps - so lighting has to come first.
+//
+// The original ordering existed because this function's GTE path calls
+// MulMatrix0, which uses the GTE's rotation-matrix registers as scratch and
+// therefore trashes composed_matrix. That hazard is real and has NOT gone
+// away - transform_object_vertices() now re-pushes composed_matrix itself
+// before projecting, which removes the ordering dependency entirely rather
+// than trading one fragile order for another. The headlamp path's gte_rtv0
+// reads the rotation matrix but doesn't write it, so it is unaffected
+// either way.
 void compute_object_lighting(const MODEL_DEF *model)
 {
     unsigned int triCount  = model->triCount  < MAX_MODEL_TRIS  ? model->triCount  : MAX_MODEL_TRIS;
@@ -1759,12 +2637,48 @@ void transform_object_vertices(const MODEL_DEF *model)
 {
     unsigned int vertCount = model->vertCount < MAX_MODEL_VERTS ? model->vertCount : MAX_MODEL_VERTS;
 
-    for (unsigned int i = 0; i < vertCount; i++)
+    // Re-push this object's composed matrix. compute_object_lighting() now
+    // runs BEFORE this function (fog needs lit colours per vertex - see that
+    // function's PIPELINE ORDER note), and its GTE path calls MulMatrix0,
+    // which uses the rotation-matrix registers as scratch. Rather than
+    // depend on a fragile "lighting must not disturb X" contract, this
+    // function simply re-establishes what it needs. Two ctc2 bursts per
+    // object, against a per-vertex loop - not measurable.
+    gte_SetRotMatrix(&composed_matrix);
+    gte_SetTransMatrix(&composed_matrix);
+
+    if (fog_enabled && use_vertex_light)
     {
-        gte_ldv0(&model->verts[i]);
-        gte_rtps();
-        gte_stsxy(&transformedScreenXY[i]);
-        gte_stsz(&transformedScreenSZ[i]);
+        // FOGGED GOURAUD. The depth-cue rides along on the transform that
+        // was happening anyway: rtps leaves IR0 holding this vertex's fog
+        // factor, and dpcs consumes it immediately. No second transform
+        // pass, no extra rtps - fog on Gouraud geometry is close to free,
+        // which is the whole reason the pipeline order was flipped.
+        //
+        // The stsxy/stsz stores sit between rtps and dpcs deliberately:
+        // neither touches IR0, and getting the screen coords banked before
+        // the colour work means the dpcs cannot strand them.
+        for (unsigned int i = 0; i < vertCount; i++)
+        {
+            gte_ldv0(&model->verts[i]);
+            gte_rtps();
+            gte_stsxy(&transformedScreenXY[i]);
+            gte_stsz(&transformedScreenSZ[i]);
+
+            gte_ldrgb(&transformedVertColors[i]);
+            gte_dpcs();
+            gte_strgb(&transformedVertColors[i]);
+        }
+    }
+    else
+    {
+        for (unsigned int i = 0; i < vertCount; i++)
+        {
+            gte_ldv0(&model->verts[i]);
+            gte_rtps();
+            gte_stsxy(&transformedScreenXY[i]);
+            gte_stsz(&transformedScreenSZ[i]);
+        }
     }
 }
 
@@ -1778,8 +2692,15 @@ void transform_object_vertices(const MODEL_DEF *model)
 // rather than an approximate CPU formula, so culling can't disagree with
 // what the real projection would have produced.
 //
+// worldRadius is the model's bounding-sphere radius with the object's
+// authored SCALE already applied, in the same units as the camera-space
+// depths this works in. Only the fog cull uses it (the screen-bounds test
+// derives its own extent by projecting two edge points, which picks up
+// scale via composed_matrix for free); pass model->bsphereRadius unchanged
+// for an unscaled object.
+//
 // Returns nonzero if the object should be skipped entirely.
-int object_is_culled(const MODEL_DEF *model)
+int object_is_culled(const MODEL_DEF *model, int worldRadius)
 {
     // Two points offset from the bounding-sphere centre by its own
     // radius along model-space X and Y - bsphereCenter/bsphereRadius are
@@ -1811,6 +2732,41 @@ int object_is_culled(const MODEL_DEF *model)
 
     if (sz0 < 64 && sz1 < 64 && sz2 < 64)
         return 1;
+
+    // FOG CULL. Once an object sits entirely beyond fog_far, the depth cue
+    // has saturated over all of it and it is - for untextured geometry,
+    // exactly - the fog colour already on screen. Drawing it costs a full
+    // transform + lighting + per-triangle GPU pass to produce pixels
+    // indistinguishable from the ones underneath. This is the payoff fog
+    // is meant to buy; see fog_cull_enabled for the textured caveat.
+    //
+    // FAST PATH ONLY. The visible behaviour of the fog cull lives in
+    // draw_object_into_ot()'s per-triangle test - this rejects an object
+    // wholesale only when its NEAREST point is already past the plane,
+    // which means every one of its triangles would have failed that test
+    // too. Identical output, minus a transform and lighting pass. Do not
+    // "improve" this into an aggressive test: loosening it here reinstates
+    // exactly the whole-model popping the per-triangle version fixed.
+    //
+    // Tested against the object's NEAREST point (centre depth minus its
+    // bounding radius) so a large object straddling the plane is kept, not
+    // dropped - the same conservative bias as the screen-bounds test below.
+    //
+    // worldRadius, NOT model->bsphereRadius: the latter is in model-space
+    // units and stage objects carry an authored scale on top. Feeding the
+    // unscaled radius in would under-state the extent of any object scaled
+    // up and cull it while part of it was still this side of the plane -
+    // over-culling, which is a visible pop rather than merely wasted work.
+    // Callers pass the scaled figure; see draw_stage().
+    if (fog_enabled && fog_cull_enabled)
+    {
+        int nearestZ = (int)sz0 - worldRadius;
+        if (nearestZ > fog_far)
+        {
+            fogCulledCount++;
+            return 1;
+        }
+    }
 
     DVECTOR sxy[3];
     gte_stsxy3(&sxy[0], &sxy[1], &sxy[2]);
@@ -1884,6 +2840,37 @@ void draw_object_into_ot(const MODEL_DEF *model, MODEL_TEXTURE **triTextureCache
 
         if (sz0 < 64 || sz1 < 64 || sz2 < 64)
             continue;
+
+        // FOG CULL, PER TRIANGLE. Rejects individual triangles that sit
+        // entirely past the fog plane rather than dropping whole objects,
+        // so a receding model dissolves from its far side instead of
+        // vanishing all at once. Object-level rejection still exists in
+        // object_is_culled() purely as a fast path - it fires only when
+        // EVERY triangle would fail this test anyway, so the two agree by
+        // construction and the visible result is this test's alone.
+        //
+        // Tested against the triangle's NEAREST corner: a triangle
+        // straddling the plane is kept, so the surviving surface always
+        // extends at least to the plane rather than tearing back from it.
+        //
+        // Holes are the obvious worry - culling back-side triangles of a
+        // closed mesh opens it up - but what shows through a hole is the
+        // fog-coloured background, at a depth where the fog is supposed to
+        // be opaque. The hole is invisible under exactly the same condition
+        // that makes the cull invisible, so it costs nothing extra. See
+        // fog_cull_enabled for what that condition actually is.
+        if (fog_enabled && fog_cull_enabled)
+        {
+            uint32_t nearestSZ = sz0;
+            if (sz1 < nearestSZ) nearestSZ = sz1;
+            if (sz2 < nearestSZ) nearestSZ = sz2;
+
+            if (nearestSZ > (uint32_t)fog_far)
+            {
+                fogCulledTriCount++;
+                continue;
+            }
+        }
 
         // gte_ldsz3 feeds these 3 cached SZ values back into the GTE's
         // own SZ pipeline registers (no re-transform needed), so
@@ -2117,6 +3104,8 @@ void draw_stage(void)
 {
     visibleObjectCount = 0;
     culledObjectCount = 0;
+    fogCulledCount = 0;
+    fogCulledTriCount = 0;
 
     if (activeStageIndex >= stageRegistryCount)
         return;
@@ -2145,7 +3134,19 @@ void draw_stage(void)
 
         update_object_world_and_compose(&objPos, &objRot, &objScale);
 
-        if (object_is_culled(model))
+        // Bounding radius in world units: the model-space radius stretched
+        // by the object's LARGEST scale axis. Largest rather than average
+        // because the sphere has to contain the object on every axis, and
+        // an over-large radius only ever keeps an object that could have
+        // been dropped. Scales are 4096 == 1.0; radius is well inside
+        // int16, so radius*scale stays comfortably in int32.
+        int maxScale = objScale.vx;
+        if (objScale.vy > maxScale) maxScale = objScale.vy;
+        if (objScale.vz > maxScale) maxScale = objScale.vz;
+        if (maxScale < 0) maxScale = -maxScale;
+        int worldRadius = (model->bsphereRadius * maxScale) >> 12;
+
+        if (object_is_culled(model, worldRadius))
         {
             culledObjectCount++;
             continue;
@@ -2153,11 +3154,14 @@ void draw_stage(void)
 
         visibleObjectCount++;
 
-        // Positions first, then lighting: compute_object_lighting()'s GTE
-        // path can disturb the rotation-matrix registers, so project the
-        // vertices (which need composed_matrix) before lighting runs.
-        transform_object_vertices(model);
+        // Lighting FIRST, then positions. Reversed when fog landed: the
+        // depth cue needs each vertex's lit colour on hand at the instant
+        // that vertex is projected, since IR0 only survives its own rtps.
+        // transform_object_vertices() re-pushes composed_matrix itself, so
+        // it no longer cares that MulMatrix0 ran before it.
         compute_object_lighting(model);
+        transform_object_vertices(model);   // per-vertex fog folded in here
+        apply_fog_to_faces(model);          // flat-shading path only
 
         MODEL_TEXTURE **triTextureCache = modelTriTextureCache[modelIndex];
         unsigned int objectPalette = obj->palette + active_palette;
@@ -2170,7 +3174,7 @@ void draw_stage(void)
 // Draws the runtime-summoned player through the same compose/cull/draw
 // pipeline as stage objects, but OUTSIDE draw_stage()'s stage-object loop
 // (the player isn't authored into any stage). No-ops until the player has
-// been summoned (R2 schema) AND its model actually baked into
+// been summoned (first PLAY-mode frame) AND its model actually baked into
 // modelRegistry[] (playerModelIndex >= 0). Shares the same OT/prim arena,
 // so it depth-sorts against the stage naturally. Uses identity scale
 // (4096) and the live active_palette, matching stage objects' palette nudge.
@@ -2187,7 +3191,9 @@ void draw_player(void)
 
     update_object_world_and_compose(&pos, &rot, &scale);
 
-    if (object_is_culled(model))
+    // Player draws at identity scale (4096), so its world radius is just
+    // the model-space one.
+    if (object_is_culled(model, model->bsphereRadius))
     {
         culledObjectCount++;
         return;
@@ -2195,207 +3201,309 @@ void draw_player(void)
 
     visibleObjectCount++;
 
-    // Positions first, then lighting (see draw_stage() for why).
-    transform_object_vertices(model);
+    // Lighting first, then positions (see draw_stage() for why).
     compute_object_lighting(model);
+    transform_object_vertices(model);
+    apply_fog_to_faces(model);
 
     MODEL_TEXTURE **triTextureCache = modelTriTextureCache[playerModelIndex];
     draw_object_into_ot(model, triTextureCache, active_palette);
 }
 
 
-// Print debug text to the screen. The readouts are split across
-// DEBUG_PAGE_COUNT pages, cycled by the L3 click (see update()); only the
-// active page's block prints each frame, so the overlay no longer buries
-// the viewport. Every page shares a common header (schema + page number),
-// then prints its own block:
-//   page 0 - RENDER   (frame/stage/visibility/model counts)
-//   page 1 - TRANSFORM+CAMERA+PLAYER (fov/rotation/camera/player state)
-//   page 2 - AUDIO    (sfx/spu/music)
+// ======================== DEBUG OVERLAY ==================================
+// One function per page, dispatched by debug_text() at the bottom. Split
+// out of a single 20-line block when the PAL move to 256 lines made the
+// wrapping obvious: the font window is 40 COLUMNS wide, so any line longer
+// than that silently wraps to two, and page 0 was rendering ~30 lines into
+// a ~30 line window. Anything added tipped the last lines off the bottom -
+// which were the audio diagnostics the hardware photos exist to capture.
+//
+// RULES FOR ADDING A READOUT:
+//   - Keep each rendered line under 40 characters. Not the format string,
+//     the RESULT - "%d" is 1 character here and 5 on screen.
+//   - Put it on the page that owns it and let that page stay short. Pages
+//     are cheap; a page that needs scrolling is not.
+//   - If a page passes ~20 lines it wants splitting, not compressing.
+//
+// Page order is deliberate: the three you tune against each other
+// (RENDER / WORLD / LIGHT) come first, FOG next since it reads against
+// WORLD's camera distances, then the two audio pages last because they're
+// consulted rather than watched.
+// =========================================================================
+
+static const char *debug_page_name(int page)
+{
+    switch (page)
+    {
+        case 0:  return "RENDER";
+        case 1:  return "WORLD";
+        case 2:  return "LIGHT";
+        case 3:  return "FOG";
+        case 4:  return "AUDIO";
+        default: return "AUDIOHW";
+    }
+}
+
+
+// ---- Page 1: RENDER - what the frame cost and what was in it ----
+static void debug_page_render(int counter)
+{
+    // Frame time. VB is raw vblanks this frame - 1 is full rate, 2 is half,
+    // 3 is a third. DT is what everything actually multiplied by (256 == one
+    // 60Hz tick), already normalised for PAL and clamped for hitches, so on
+    // a 50Hz machine a 1-vblank frame reads VB=1 DT=307. DT pinned at its
+    // 1024 rail means the frame is taking 4+ vblanks and the simulation is
+    // deliberately running slow to stay safe. HZ is the detected refresh.
+    FntPrint(-1, "FRAME=%d VB=%d DT=%d HZ=%d\n",
+        counter, g_dt_vblanks, g_dt, g_refresh_hz);
+
+    FntPrint(-1, "STAGE=%s\n",
+        (activeStageIndex < stageRegistryCount)
+            ? stageRegistry[activeStageIndex].name : "(none)");
+    FntPrint(-1, "OBJ=%d/%d UNRES=%d\n",
+        activeStageObjectCount,
+        (activeStageIndex < stageRegistryCount)
+            ? stageRegistry[activeStageIndex].objectCount : 0,
+        stageUnresolvedCount);
+
+    // VIS/CULL are this frame's frustum verdict; PRIMOVF is triangles
+    // dropped because the primitive arena ran out, which is a budget
+    // failure rather than a culling decision - nonzero here means geometry
+    // is silently missing from the scene.
+    FntPrint(-1, "VIS=%d CULL=%d PRIMOVF=%d\n",
+        visibleObjectCount, culledObjectCount, primOverflowCount);
+
+    FntPrint(-1, "MODELS=%d TEX=%d PAL=%d\n",
+        modelRegistryCount, textureTableCount, active_palette);
+}
+
+
+// ---- Page 2: WORLD - where everything is ----
+static void debug_page_world(void)
+{
+    // Live projection distance: update_camera_matrix() pushes
+    // FOCAL_LENGTH+fov into gte_SetGeomScreen() once per frame, so this
+    // tracks real GTE state (fov driven by CROSS/CIRCLE in DEBUG).
+    FntPrint(-1, "FOV=%d\n", FOCAL_LENGTH + fov);
+    FntPrint(-1, "MODELROT=%d,%d,%d\n",
+        model_rot.vx, model_rot.vy, model_rot.vz);
+    FntPrint(-1, "POSOFS=%d,%d,%d\n",
+        model_pos.vx, model_pos.vy, model_pos.vz);
+
+    FntPrint(-1, "CAMPOS=%d,%d,%d\n",
+        camera.pos.vx, camera.pos.vy, camera.pos.vz);
+    FntPrint(-1, "CAMROTY=%d\n", camera.rot.vy);
+
+    // Player state: whether summoned, its model resolution, position and
+    // orbit yaw. MODEL=-1 means player.obj hasn't been baked yet.
+    FntPrint(-1, "PLAYER=%s MODEL=%d\n",
+        playerSpawned ? "SPAWNED" : "(none)", playerModelIndex);
+    FntPrint(-1, "PLAYERPOS=%d,%d,%d\n",
+        player_pos.vx, player_pos.vy, player_pos.vz);
+    FntPrint(-1, "CAMYAW=%d PITCH=%d\n",
+        player_cam_yaw, player_cam_pitch);
+}
+
+
+// ---- Page 3: LIGHT - shading path and light state ----
+static void debug_page_lighting(void)
+{
+    FntPrint(-1, "VTXLIGHT=%d TEX=%d\n", use_vertex_light, use_texture);
+    FntPrint(-1, "PATH=%s\n", sun_lighting ? "GTE" : "HEADLAMP");
+
+    // Effective per-light intensity (authored + the L2 offset, clamped the
+    // same way setup_frame_lighting applies it), in the 256==1.0 scale
+    // stage-gen's Intensity field bakes to - so INT=128 here is Intensity
+    // 0.5 in the tool.
+    {
+        int effL[3];
+        for (int li = 0; li < 3; li++)
+        {
+            int e = (li < authored_light_count)
+                ? g_light_dir_int[li] + g_light_intensity_offset
+                : 0;
+            if (e < 0)    e = 0;
+            if (e > 2047) e = 2047;
+            effL[li] = e;
+        }
+        FntPrint(-1, "INT=%d,%d,%d OFS=%d\n",
+            effL[0], effL[1], effL[2], g_light_intensity_offset);
+    }
+
+    FntPrint(-1, "SRC=%s(%d) SPH=%d\n",
+        stage_lights_active ? "AUTHORED" : "NONE",
+        authored_light_count, g_sphere_light_count);
+    FntPrint(-1, "AMBIENT=%d,%d,%d\n", g_ambient_r, g_ambient_g, g_ambient_b);
+    FntPrint(-1, "\n");
+    FntPrint(-1, "L2: U/D=intensity R2=path\n");
+}
+
+
+// ---- Page 4: FOG ----
+static void debug_page_fog(void)
+{
+    FntPrint(-1, "FOG=%s NEAR=%d FAR=%d\n",
+        fog_enabled ? "ON" : "OFF", fog_near, fog_far);
+
+    // RESID is the percentage of a TEXTURED surface still showing through
+    // at the cull plane, i.e. how big a pop the cull can produce. It is
+    // 100/2^layers, because at this fog colour the depth cue does nothing
+    // for textured geometry and the quads do all the work (see
+    // fog_cull_enabled). Untextured geometry culls cleanly regardless.
+    FntPrint(-1, "LAYERS=%d DRIFT=%d CULL=%d\n",
+        fog_layers, fog_drift_enabled, fog_cull_enabled);
+    FntPrint(-1, "CULLED TRI=%d OBJ=%d RESID=%d%%\n",
+        fogCulledTriCount, fogCulledCount,
+        100 >> (fog_layers > 6 ? 6 : fog_layers));
+
+    // DQA/DQB are what setup_frame_fog() actually handed the GTE this
+    // frame. A '!' after DQA means it hit FOG_DQA_RAIL and the ramp is
+    // degenerate (span too short for the distance, or FOV cranked down) -
+    // widen the near/far gap. LB is the OT buckets the fog quads went
+    // into: if those read 0 or OT_LEN-1 the fog range has fallen outside
+    // where geometry is actually landing, which is the first thing to
+    // check when layers are on but nothing looks foggy.
+    FntPrint(-1, "DQA=%d%s DQB=%d\n",
+        g_fog_dqa, g_fog_dqa_saturated ? "!" : "", (int)g_fog_dqb);
+    FntPrint(-1, "LB=%d,%d,%d\n",
+        g_fog_layer_bucket[0], g_fog_layer_bucket[1], g_fog_layer_bucket[2]);
+    FntPrint(-1, "\n");
+    FntPrint(-1, "L1+L2: U/D=far L/R=near\n");
+    FntPrint(-1, "       X=on O=layers\n");
+    FntPrint(-1, "       ^=drift []=cull\n");
+}
+
+
+// ---- Page 5: AUDIO - load-side summary ----
+static void debug_page_audio(void)
+{
+    // Stage-authored sounds (sfx.c): how many the stage authored vs. how
+    // many actually made it off the CD into SPU RAM (missing .vag on disc,
+    // bad header, SPU RAM/voice budget), and how many have latched silent
+    // via muteAfterPlay. ON/OFF is the START-toggled master ambience.
+    // ERR is the FIRST failure step of the CD tier (SND_ERR_* in sound.h:
+    // 1=CdInit dead 2=search 3=size 4=read 5=magic 6=parse 7=SPU alloc
+    // 8=voice; 0=no failure). SRC=C<n>/E<m> is how many loaded sounds came
+    // from the CD vs. the EXE-embedded fallback - E>0 with audio playing
+    // means the CD path failed (see ERR) and tier 2 rescued it.
+    FntPrint(-1, "SFX=%s (START)\n", sfx_stage_playing() ? "ON" : "OFF");
+    FntPrint(-1, "LOADED=%d/%d UNRES=%d MUTED=%d\n",
+        sfx_stage_loaded_count(), sfx_stage_sound_count(),
+        sfx_stage_unresolved_count(), sfx_stage_muted_count());
+    FntPrint(-1, "ERR=%d SRC=C%d/E%d\n",
+        sfx_stage_first_error(),
+        sfx_stage_src_cd_count(), sfx_stage_src_emb_count());
+
+    // SPU RAM budget: bytes of waveform data resident vs. the ~508 KB
+    // usable. As more sounds are added, watch this climb toward 100 - an
+    // upload that would push past it is refused by the SPU bump allocator
+    // (the sound just won't load) rather than corrupting another sample.
+    // CD=OK/FAIL is CdInit()'s boot result, (n) how many attempts it took.
+    // FAIL = every audio load was dead before it started.
+    FntPrint(-1, "SPU=%d/%dB (%d%%)\n",
+        sound_spu_used(), sound_spu_capacity(),
+        (int)((sound_spu_used() * 100) / sound_spu_capacity()));
+    FntPrint(-1, "CD=%s(%d)\n",
+        sound_cd_ready() ? "OK" : "FAIL", sound_cd_init_attempts());
+
+    // Music sequencer. LOAD=N means the SONG.VAB/SONG.SEQ pair didn't make
+    // it off the disc (or failed to parse) - the game runs silently. ERR:
+    // where the CD tier died (same SND_ERR_* steps; +10 = the SEQ failed
+    // rather than the VAB, e.g. 2=VAB not found, 12=SEQ not found).
+    FntPrint(-1, "MUSIC=%s LOAD=%s V=%d/%d\n",
+        music_playing() ? "ON" : "OFF",
+        music_loaded() ? "Y" : "N",
+        music_voices_active(), MUSIC_VOICE_COUNT);
+    FntPrint(-1, "BANK=%dB ERR=%d SRC=%s\n",
+        music_spu_used(), music_last_error(),
+        music_source() == 2 ? "EMB" : (music_source() == 1 ? "CD" : "-"));
+}
+
+
+// ---- Page 6: AUDIOHW - hardware deep-dive ----
+// Everything needed to sort a "silent on hardware" report into load-side
+// vs. playback-side from one photographed frame, paired with page 5's
+// ERR/SRC codes.
+static void debug_page_audio_hw(void)
+{
+    // Load-side pipeline state: INIT = CdInit attempts, RETRY = failed
+    // reads that were retried (>0 with clean audio = the retry tier saved
+    // it), EMBED = files baked into this EXE (0 = embed tier missing!).
+    // ISOERR = libpsxcd's parser status from the last CdSearchFile
+    // (1=seek 2=read 3=not-iso 4=LID OPEN; 0=okay). PVD = boot-time raw
+    // read of ISO sector 16 through our own hardened reader (1=OK
+    // 2=read-fail 3=garbage). PVD=1 + ISOERR!=0 = raw reads work and the
+    // SDK parser is what dies - the discriminator for a hardware ERR=2.
+    FntPrint(-1, "CD RDY=%d INIT=%d RETRY=%d\n",
+        sound_cd_ready(), sound_cd_init_attempts(), sound_cd_retries());
+    FntPrint(-1, "EMBED=%d ISOERR=%d PVD=%d\n",
+        sound_embed_count(), sound_cd_iso_error(), sound_pvd_status());
+    FntPrint(-1, "SFX ERR=%d SRC=C%d/E%d\n",
+        sfx_stage_first_error(),
+        sfx_stage_src_cd_count(), sfx_stage_src_emb_count());
+    FntPrint(-1, "MUS ERR=%d SRC=%s\n",
+        music_last_error(),
+        music_source() == 2 ? "EMB" : (music_source() == 1 ? "CD" : "-"));
+
+    // Playback-side: raw SPU registers. Healthy expectations (verified
+    // against DuckStation before the hardware burn):
+    //   SPUCNT = 0xC021-ish: bit15 enable + bit14 unmute, bit0 CD audio in.
+    //   STAT   oscillates (bit11 = capture-buffer half toggles while the
+    //          SPU runs - a liveness heartbeat).
+    //   MVOL   = 0x3fff,0x3fff (sound_init's master volume).
+    //   CURVOL = ~0x7ffe,0x7ffe CONSTANT - this is the RAMPED MASTER
+    //          volume, NOT a waveform meter; pinned at max is correct.
+    //   ENDX   bits latch/clear as voices hit end flags / re-key.
+    //   ENV    nonzero on keyed voices - THE audio-energy signal.
+    // SPU RAM loaded + voices keyed + SPUCNT 0xC0xx + MVOL 3fff but ENV
+    // stuck at 0 = playback-side fault.
+    FntPrint(-1, "SPUCNT=%x STAT=%x\n", SPU_CTRL, SPU_STAT);
+    FntPrint(-1, "MVOL=%x,%x CDVOL=%x,%x\n",
+        SPU_MASTER_VOL_L, SPU_MASTER_VOL_R,
+        SPU_CD_VOL_L, SPU_CD_VOL_R);
+    FntPrint(-1, "CURVOL=%x,%x ENDX=%x:%x\n",
+        SPU_CURRENT_VOL_L, SPU_CURRENT_VOL_R,
+        SPU_CHAN_STATUS2, SPU_CHAN_STATUS1);
+
+    // Live ADSR envelope level per voice: a keyed-on voice with waveform
+    // data under it shows nonzero here even if the mix never reaches the
+    // DAC - separates "voice never keyed / no data" from "mixed but muted
+    // downstream". 0-7 are sfx, 8-15 the first half of the music pool.
+    FntPrint(-1, "ENV0-3=%x %x %x %x\n",
+        SPU_CH_ADSR_VOL(0), SPU_CH_ADSR_VOL(1),
+        SPU_CH_ADSR_VOL(2), SPU_CH_ADSR_VOL(3));
+    FntPrint(-1, "ENV4-7=%x %x %x %x\n",
+        SPU_CH_ADSR_VOL(4), SPU_CH_ADSR_VOL(5),
+        SPU_CH_ADSR_VOL(6), SPU_CH_ADSR_VOL(7));
+    FntPrint(-1, "ENV8-11=%x %x %x %x\n",
+        SPU_CH_ADSR_VOL(8),  SPU_CH_ADSR_VOL(9),
+        SPU_CH_ADSR_VOL(10), SPU_CH_ADSR_VOL(11));
+    FntPrint(-1, "ENV12-15=%x %x %x %x\n",
+        SPU_CH_ADSR_VOL(12), SPU_CH_ADSR_VOL(13),
+        SPU_CH_ADSR_VOL(14), SPU_CH_ADSR_VOL(15));
+}
+
+
+// Prints the active overlay page. Pages are cycled by an R2 click (see
+// update()); only the active page prints, so the overlay never buries the
+// viewport. The shared header carries mode + page number + page NAME, so a
+// photographed frame identifies itself without counting pages.
 void debug_text(int counter)
 {
-    // Common header, always shown so the active mode and page are
-    // visible regardless of which page's block is printing below.
-    FntPrint(-1, "MODE=%s  PAGE %d/%d (SELECT=mode L3=page)\n",
-        control_mode == MODE_PLAY   ? "PLAY"
-            : control_mode == MODE_CAMERA ? "CAMERA" : "DEBUG",
-        debug_page + 1, DEBUG_PAGE_COUNT);
+    FntPrint(-1, "%s PG%d/%d %s (SEL=mode R2=pg)\n",
+        control_mode == MODE_PLAY     ? "PLAY"
+            : control_mode == MODE_CAMERA ? "CAM" : "DEBUG",
+        debug_page + 1, DEBUG_PAGE_COUNT, debug_page_name(debug_page));
 
-    if (debug_page == 0)
+    switch (debug_page)
     {
-        // ---- Page 0: RENDER ----
-        FntPrint(-1, "OBJ MODEL TEST (GTE)\n");
-        FntPrint(-1, "FRAME=%d\n", counter);
-        FntPrint(-1, "STAGE=%s OBJECTS=%d/%d UNRESOLVED=%d\n",
-            (activeStageIndex < stageRegistryCount) ? stageRegistry[activeStageIndex].name : "(none)",
-            activeStageObjectCount,
-            (activeStageIndex < stageRegistryCount) ? stageRegistry[activeStageIndex].objectCount : 0,
-            stageUnresolvedCount);
-        FntPrint(-1, "VISIBLE=%d CULLED=%d PRIM_OVERFLOW=%d\n",
-            visibleObjectCount, culledObjectCount, primOverflowCount);
-        FntPrint(-1, "MODELS_BAKED=%d\n", modelRegistryCount);
-        
-        // Live projection distance: update_camera_matrix() pushes
-        // FOCAL_LENGTH+fov into gte_SetGeomScreen() once per frame, so this
-        // readout tracks the real GTE state (fov driven by CROSS/CIRCLE in
-        // the debug schema).
-        FntPrint(-1, "FOV=%d\n", FOCAL_LENGTH+fov);
-        FntPrint(-1, "ROTX=%d ROTY=%d ROTZ=%d\n", model_rot.vx, model_rot.vy, model_rot.vz);
-        FntPrint(-1, "DEBUGPOSOFFSET=%d,%d,%d\n", model_pos.vx, model_pos.vy, model_pos.vz);
-        FntPrint(-1, "CAMPOS=%d,%d,%d CAMROTY=%d\n",
-            camera.pos.vx, camera.pos.vy, camera.pos.vz, camera.rot.vy);
-        FntPrint(-1, "VERTEXLIGHTING=%d TEXTURED=%d LIGHT=%s (R2)\n",
-                 use_vertex_light, use_texture, sun_lighting ? "GTE" : "HEADLAMP");
-        // Effective per-light intensity (authored + the L2 offset, clamped
-        // the same way setup_frame_lighting applies it), in the 256==1.0
-        // scale stage-gen's Intensity field bakes to - so INT=128 here is
-        // Intensity 0.5 in the tool.
-        {
-            int effL[3];
-            for (int li = 0; li < 3; li++)
-            {
-                int e = (li < authored_light_count)
-                    ? g_light_dir_int[li] + g_light_intensity_offset
-                    : 0;
-                if (e < 0)    e = 0;
-                if (e > 2047) e = 2047;
-                effL[li] = e;
-            }
-            FntPrint(-1, "LIGHT INT=%d,%d,%d OFS=%d SRC=%s(%d) SPH=%d (L2:U/D)\n",
-                     effL[0], effL[1], effL[2], g_light_intensity_offset,
-                     stage_lights_active ? "AUTHORED" : "NONE", authored_light_count,
-                     g_sphere_light_count);
-        }
-        FntPrint(-1, "TEXTURES_LOADED=%d ACTIVE_PALETTE=%d\n", textureTableCount, active_palette);
-        // Player state: whether summoned, its model resolution, XZ position
-        // and orbit yaw. MODEL=-1 means player.obj hasn't been baked yet.
-        FntPrint(-1, "PLAYER=%s MODEL=%d\n",
-            playerSpawned ? "SPAWNED" : "(none)", playerModelIndex);
-        FntPrint(-1, "PLAYERPOS=%d,%d,%d CAMYAW=%d\n",
-            player_pos.vx, player_pos.vy, player_pos.vz, player_cam_yaw);
-
-        // Stage-authored sounds (sfx.c): how many the stage authored vs. how
-        // many actually made it off the CD into SPU RAM, the analogue of the
-        // model-name UNRESOLVED count (missing .vag on disc, bad header, SPU
-        // RAM/voice budget), and how many have latched silent via
-        // muteAfterPlay. ON/OFF is the START-toggled master ambience.
-        // ERR is the FIRST failure step of the CD tier (SND_ERR_* in
-        // sound.h: 1=CdInit dead 2=search 3=size 4=read 5=magic 6=parse
-        // 7=SPU alloc 8=voice; 0=no failure). SRC=C<n>/E<m> is how many
-        // loaded sounds came from the CD vs. the EXE-embedded fallback -
-        // E>0 with audio playing means the CD path failed (see ERR) and
-        // tier 2 rescued it. Together they make one photographed frame
-        // both the diagnosis AND the proof of what saved it.
-        FntPrint(-1, "SFX=%s (START toggles) LOADED=%d/%d UNRES=%d MUTED=%d ERR=%d SRC=C%d/E%d\n",
-            sfx_stage_playing() ? "ON" : "OFF",
-            sfx_stage_loaded_count(), sfx_stage_sound_count(),
-            sfx_stage_unresolved_count(), sfx_stage_muted_count(),
-            sfx_stage_first_error(),
-            sfx_stage_src_cd_count(), sfx_stage_src_emb_count());
-
-        // SPU RAM budget: bytes of waveform data resident vs. the ~508 KB usable
-        // (512 KB minus the reserved capture area). PCT is used*100/capacity. As
-        // more sound effects are added, watch this climb toward 100 - an upload
-        // that would push past it is refused by the SPU bump allocator (the sound
-        // just won't load) rather than corrupting another sample.
-        // CD=OK/FAIL is CdInit()'s boot result, (n) how many attempts it
-        // took (sound.c now retries - emulators pass on try 1, a real
-        // drive may need more). FAIL = every audio load below was dead
-        // before it started - the first thing to check when hardware is
-        // silent but DuckStation isn't.
-        FntPrint(-1, "SPU RAM=%d/%d B (%d%%) CD=%s(%d)\n",
-            sound_spu_used(), sound_spu_capacity(),
-            (int)((sound_spu_used() * 100) / sound_spu_capacity()),
-            sound_cd_ready() ? "OK" : "FAIL",
-            sound_cd_init_attempts());
-
-        // Music sequencer: playing/loaded state, voices currently keyed on (of
-        // the 16-voice music pool), and the bank's share of the SPU RAM figure
-        // above. LOADED=N means the SONG.VAB/SONG.SEQ pair didn't make it off
-        // the disc (or failed to parse) - the game runs silently, same as WIND.
-        // ERR: where the CD tier died (same SND_ERR_* steps as SFXERR;
-        // +10 = the SEQ failed rather than the VAB, e.g. 2=VAB not
-        // found, 12=SEQ not found; 0=no failure). SRC: which tier the
-        // playing pair actually came from (- = neither worked).
-        FntPrint(-1, "MUSIC=%s LOADED=%s V=%d/%d BANK=%dB ERR=%d SRC=%s\n",
-            music_playing() ? "ON" : "OFF",
-            music_loaded() ? "Y" : "N",
-            music_voices_active(), MUSIC_VOICE_COUNT,
-            music_spu_used(), music_last_error(),
-            music_source() == 2 ? "EMB" : (music_source() == 1 ? "CD" : "-"));
-    }
-    else if (debug_page == 1)
-    {
-        // ---- Page 2: AUDIO DEEP-DIVE ----
-        // Everything needed to sort a "silent on hardware" report into
-        // load-side vs. playback-side from one photographed frame,
-        // paired with page 1's ERR/SRC codes.
-
-        // Load-side pipeline state (mirrors + extends page 1's tags):
-        // INIT = CdInit attempts, RETRY = failed read attempts that were
-        // retried (>0 with clean audio = the retry tier saved it),
-        // EMBED = files baked into this EXE (0 = embed tier missing!).
-        // ISOERR = libpsxcd's parser status from the last CdSearchFile
-        // (1=seek 2=read 3=not-iso 4=LID OPEN; 0=okay). PVD = boot-time
-        // raw read of ISO sector 16 through our own hardened reader
-        // (1=OK 2=read-fail 3=garbage). PVD=1 + ISOERR!=0 = raw reads
-        // work, the SDK parser is what dies - the discriminator for the
-        // hardware ERR=2 result.
-        FntPrint(-1, "CD READY=%d INIT=%d RETRY=%d EMBED=%d ISOERR=%d PVD=%d\n",
-            sound_cd_ready(), sound_cd_init_attempts(),
-            sound_cd_retries(), sound_embed_count(),
-            sound_cd_iso_error(), sound_pvd_status());
-        FntPrint(-1, "SFX ERR=%d SRC=C%d/E%d  MUS ERR=%d SRC=%s\n",
-            sfx_stage_first_error(),
-            sfx_stage_src_cd_count(), sfx_stage_src_emb_count(),
-            music_last_error(),
-            music_source() == 2 ? "EMB" : (music_source() == 1 ? "CD" : "-"));
-
-        // Playback-side: raw SPU registers. Healthy expectations
-        // (verified against DuckStation before the hardware burn):
-        //   SPUCNT = 0xC021-ish: bit15 enable + bit14 unmute (0xC000),
-        //            bit0 CD audio in, bits4-5 leftover transfer mode.
-        //   STAT   oscillates (bit11 = capture-buffer half toggles
-        //          while the SPU runs - a liveness heartbeat).
-        //   MVOL   = 0x3fff,0x3fff (sound_init's master volume).
-        //   CURVOL = ~0x7ffe,0x7ffe CONSTANT - this is the RAMPED
-        //            MASTER volume, NOT a waveform meter; pinned at max
-        //            is correct. (Do not read a steady value as fault.)
-        //   ENDX   bits latch/clear as voices hit end flags / re-key.
-        //   ENV    nonzero on keyed voices - THE audio-energy signal.
-        // SPU RAM loaded + voices keyed + SPUCNT 0xC0xx + MVOL 3fff but
-        // ENV stuck at 0 = playback-side fault (branch F of the plan).
-        FntPrint(-1, "SPUCNT=%x STAT=%x MVOL=%x,%x\n",
-            SPU_CTRL, SPU_STAT,
-            SPU_MASTER_VOL_L, SPU_MASTER_VOL_R);
-        FntPrint(-1, "CDVOL=%x,%x CURVOL=%x,%x ENDX=%x:%x\n",
-            SPU_CD_VOL_L, SPU_CD_VOL_R,
-            SPU_CURRENT_VOL_L, SPU_CURRENT_VOL_R,
-            SPU_CHAN_STATUS2, SPU_CHAN_STATUS1);
-
-        // Live ADSR envelope level per sfx voice (0..7): a keyed-on
-        // voice with waveform data under it shows nonzero here even if
-        // the mix never reaches the DAC - separates "voice never keyed/
-        // no data" from "mixed but muted downstream".
-        FntPrint(-1, "ENV0-7=%x %x %x %x %x %x %x %x\n",
-            SPU_CH_ADSR_VOL(0), SPU_CH_ADSR_VOL(1),
-            SPU_CH_ADSR_VOL(2), SPU_CH_ADSR_VOL(3),
-            SPU_CH_ADSR_VOL(4), SPU_CH_ADSR_VOL(5),
-            SPU_CH_ADSR_VOL(6), SPU_CH_ADSR_VOL(7));
-
-        // Same for the first half of the music pool (8..15; enough to
-        // see the sequencer breathing without burning page space).
-        FntPrint(-1, "ENV8-15=%x %x %x %x %x %x %x %x\n",
-            SPU_CH_ADSR_VOL(8),  SPU_CH_ADSR_VOL(9),
-            SPU_CH_ADSR_VOL(10), SPU_CH_ADSR_VOL(11),
-            SPU_CH_ADSR_VOL(12), SPU_CH_ADSR_VOL(13),
-            SPU_CH_ADSR_VOL(14), SPU_CH_ADSR_VOL(15));
-        return;
-    }
-    else
-    {
-        // ---- (spare page slot) ----
-        return;
+        case 0:  debug_page_render(counter); break;
+        case 1:  debug_page_world();         break;
+        case 2:  debug_page_lighting();      break;
+        case 3:  debug_page_fog();           break;
+        case 4:  debug_page_audio();         break;
+        default: debug_page_audio_hw();      break;
     }
 }
 
@@ -2409,6 +3517,12 @@ int main(int argc, const char *argv[])
 
     while (1)
     {
+        // FIRST thing in the frame. Everything downstream - input, player,
+        // fog drift, and every entity system added later - reads the same
+        // g_dt for this frame, so nothing can disagree about how much time
+        // just passed.
+        update_frame_time();
+
         update();
 
         // Camera-only matrix rebuild - once per frame, shared by every
@@ -2421,6 +3535,23 @@ int main(int argc, const char *argv[])
         // compute_object_lighting() instead.
         if (sun_lighting)
             setup_frame_lighting();
+
+        // Frame-global GTE depth-cue registers (far colour + DQA/DQB ramp).
+        // Separate from the lighting block above because fog is orthogonal
+        // to the lighting path - the headlamp fogs too. No-ops when fog is
+        // off, so an untouched build behaves exactly as before.
+        // Fog drift phase. Advanced unconditionally so the fog is never
+        // caught mid-breath when it's toggled back on - it picks up where
+        // the world would have been, rather than snapping to phase 0.
+        // 131072 == 360 degrees for isin(); wrapped with & to stay positive.
+        //
+        // Delta-timed like everything else: fog should breathe at a fixed
+        // wall-clock rate, not slow to half speed the moment the scene gets
+        // heavy. This is the "timers" case from the same family as entity
+        // cooldowns - anything phase-based wants g_dt, not a per-frame step.
+        g_fog_drift_phase = (g_fog_drift_phase + dt_scale(FOG_DRIFT_SPEED)) & 0x1FFFF;
+
+        setup_frame_fog();
 
         // Reset THIS frame's OT (ClearOTagR wires every bucket to link
         // to the next, all initially empty) and rewind the primitive
@@ -2439,8 +3570,14 @@ int main(int argc, const char *argv[])
 
         // Draw the runtime-summoned third-person player (if any) into the
         // same OT, right after the stage objects so it depth-sorts against
-        // them. No-ops until summoned via the R2 schema.
+        // them. No-ops until PLAY mode has summoned it.
         draw_player();
+
+        // Layered fog quads go in LAST, after every object has claimed its
+        // OT bucket - they only need the OT populated, not any particular
+        // object. This is the half of the fog that textured geometry
+        // actually responds to. No-op when fog is off.
+        draw_fog_layers();
 
         // Kick off the GPU's own back-to-front walk of everything
         // draw_stage() just queued into ot[db], starting from the

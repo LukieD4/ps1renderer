@@ -96,12 +96,14 @@
 				PLAYS is stage-authorable via a mode=music sound entity
 				(main.c falls back to \SONG when no stage authors one).
 			-->
+			<file name="FLUXPATH.SEQ"		type="data" source="${PROJECT_SOURCE_DIR}/assets/sound/music/FLUXPATH.seq" />
+			<file name="FLUXPATH.VAB"		type="data" source="${PROJECT_SOURCE_DIR}/assets/sound/music/FLUXPATH.vab" />
 			<file name="LAVENDAR.SEQ"		type="data" source="${PROJECT_SOURCE_DIR}/assets/sound/music/LAVENDAR.seq" />
 			<file name="LAVENDAR.VAB"		type="data" source="${PROJECT_SOURCE_DIR}/assets/sound/music/LAVENDAR.vab" />
 			<file name="SIAMISS.SEQ"		type="data" source="${PROJECT_SOURCE_DIR}/assets/sound/music/SIAMISS.seq" />
 			<file name="SIAMISS.VAB"		type="data" source="${PROJECT_SOURCE_DIR}/assets/sound/music/SIAMISS.vab" />
-			<file name="SONG.SEQ"		type="data" source="${PROJECT_SOURCE_DIR}/assets/sound/music/SONG.seq" />
-			<file name="SONG.VAB"		type="data" source="${PROJECT_SOURCE_DIR}/assets/sound/music/SONG.vab" />
+			<file name="TEST303.SEQ"		type="data" source="${PROJECT_SOURCE_DIR}/assets/sound/music/TEST303.seq" />
+			<file name="TEST303.VAB"		type="data" source="${PROJECT_SOURCE_DIR}/assets/sound/music/TEST303.vab" />
 			<file name="TESTING.SEQ"		type="data" source="${PROJECT_SOURCE_DIR}/assets/sound/music/TESTING.seq" />
 			<file name="TESTING.VAB"		type="data" source="${PROJECT_SOURCE_DIR}/assets/sound/music/TESTING.vab" />
 			<file name="TESTING2.SEQ"		type="data" source="${PROJECT_SOURCE_DIR}/assets/sound/music/TESTING2.seq" />

@@ -21,12 +21,33 @@
         </div>
         <button class="btn btn--sm" id="btn-load-song" title="Load song (.OstSong)">Load</button>
         <button class="btn btn--sm" id="btn-save-song" title="Save song (.OstSong)">Save</button>
-        <button class="btn btn--sm btn--export" id="btn-export" title="Export SEQ + VAB for PS1">Export</button>
+        <button class="btn btn--sm btn--export" id="btn-export" title="Export SEQ + VAB for PS1">Ex. VAB/SQ</button>
+        <button class="btn btn--sm btn--export" id="btn-export-wav" title="Render and export a WAV mixdown">Ex. WAV</button>
         <input type="file" id="song-file-input" class="hidden-input" accept=".OstSong,.ostsong,application/json,.json" />
       </div>
       <div class="segmented viewswitch" id="viewswitch">
         <div class="segmented__option is-active" data-view="arrange">Arrange</div>
         <div class="segmented__option" data-view="live">Live</div>
+      </div>
+      <div class="stampgroup" id="stampgroup">
+        <button class="tbtn tbtn--text" id="btn-stamp" title="Stamp tool — click the roll to drop a pattern (Shift+S)">Stamp</button>
+        <select class="select select--mini" id="stamp-pattern" title="Pattern to stamp">
+          <optgroup label="Chords">
+            <option value="chord-major">Major triad</option>
+            <option value="chord-minor">Minor triad</option>
+            <option value="chord-maj7">Major 7th</option>
+            <option value="chord-min7">Minor 7th</option>
+            <option value="power">Power chord</option>
+            <option value="octave">Octave</option>
+          </optgroup>
+          <optgroup label="Runs">
+            <option value="arp-up">Arpeggio up</option>
+            <option value="arp-down">Arpeggio down</option>
+            <option value="arp-updown">Arpeggio up/down</option>
+            <option value="chromatic-run">Chromatic run</option>
+            <option value="triplet">Triplet</option>
+          </optgroup>
+        </select>
       </div>
     </div>
 
@@ -228,6 +249,7 @@
   <script src="js/scheduler.js"></script>
   <script src="js/seqvab.js"></script>
   <script src="js/midi.js"></script>
+  <script src="js/wav.js"></script>
   <script src="js/app.js"></script>
 </body>
 </html>

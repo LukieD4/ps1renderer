@@ -27,6 +27,25 @@
   var NN = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"];
   function noteName(m) { return NN[((m % 12) + 12) % 12] + (Math.floor(m / 12) - 1); }
 
+  // ---- Stamp patterns ------------------------------------------------------
+  // Each pattern is a list of { step, pitch, vel } offsets relative to the
+  // clicked cell: step is measured in snap-grid units (0 = the clicked
+  // column), pitch is semitones relative to the clicked row, vel is 0..1.
+  // Chords stamp all notes on step 0; runs spread notes across steps.
+  var STAMP_PATTERNS = {
+    "chord-major":  { notes: [0, 4, 7].map(function (p) { return { step: 0, pitch: p, vel: 0.85 }; }) },
+    "chord-minor":  { notes: [0, 3, 7].map(function (p) { return { step: 0, pitch: p, vel: 0.85 }; }) },
+    "chord-maj7":   { notes: [0, 4, 7, 11].map(function (p) { return { step: 0, pitch: p, vel: 0.85 }; }) },
+    "chord-min7":   { notes: [0, 3, 7, 10].map(function (p) { return { step: 0, pitch: p, vel: 0.85 }; }) },
+    "power":        { notes: [0, 7].map(function (p) { return { step: 0, pitch: p, vel: 0.9 }; }) },
+    "octave":       { notes: [0, 12].map(function (p) { return { step: 0, pitch: p, vel: 0.85 }; }) },
+    "arp-up":       { notes: [0, 4, 7, 12].map(function (p, i) { return { step: i, pitch: p, vel: 0.85 }; }) },
+    "arp-down":     { notes: [12, 7, 4, 0].map(function (p, i) { return { step: i, pitch: p, vel: 0.85 }; }) },
+    "arp-updown":   { notes: [0, 4, 7, 12, 7, 4].map(function (p, i) { return { step: i, pitch: p, vel: 0.85 }; }) },
+    "chromatic-run":{ notes: [0, 1, 2, 3, 4].map(function (p, i) { return { step: i, pitch: p, vel: 0.8 }; }) },
+    "triplet":      { notes: [0, 0, 0].map(function (p, i) { return { step: i / 3, pitch: 0, vel: 0.85 }; }) }
+  };
+
   function PianoRoll(canvas, cb) {
     this.canvas = canvas;
     this.ctx = canvas.getContext("2d");
@@ -40,6 +59,8 @@
     this.selected = null;       // selected note ref
     this.selectedNotes = [];    // marquee multi-selection (refs into track.notes)
     this._drag = null;
+    this.stampMode = false;     // when true, clicking empty space stamps a pattern instead of a single note
+    this.stampPattern = "chord-major";
     this._bindEvents();
     this.resize();
   }
@@ -348,7 +369,7 @@
           return;
         }
         var hint = self._noteAt(x, y);
-        cv.style.cursor = x < GUTTER ? "pointer" : (hint ? (hint.edge ? "ew-resize" : "move") : "crosshair");
+        cv.style.cursor = x < GUTTER ? "pointer" : (hint ? (hint.edge ? "ew-resize" : "move") : (self.stampMode ? "copy" : "crosshair"));
         return;
       }
       var d = self._drag, n = d.note;
@@ -427,9 +448,15 @@
       if (d.mode === "pan") return;
       if (d.mode === "marquee") { self.draw(); return; } // selection finalized live
       if (d.mode === "maybe") {
-        // plain click on empty space: create a note
         var tr = self.track(); if (!tr) return;
         if (self.cb.onEdit) self.cb.onEdit();
+        if (self.stampMode) {
+          // plain click on empty space: stamp the selected pattern
+          self._stampAt(d.x0, d.y0);
+          if (self.cb.onPreview) self.cb.onPreview(self.yToPitch(d.y0));
+          self._change(); self.draw(); return;
+        }
+        // plain click on empty space: create a note
         var pitch = self.yToPitch(d.y0);
         var startT = Math.max(0, self.snapTick(self.xToTick(d.x0)));
         var n = { start: startT, dur: self.snap, pitch: pitch, vel: 0.85 };
@@ -582,6 +609,24 @@
     this.draw();
   };
   PianoRoll.prototype.setSnap = function (t) { this.snap = t; };
+  PianoRoll.prototype.setStampMode = function (on) { this.stampMode = !!on; this.canvas.style.cursor = ""; };
+  PianoRoll.prototype.setStampPattern = function (key) { if (STAMP_PATTERNS[key]) this.stampPattern = key; };
+  PianoRoll.prototype._stampAt = function (x0, y0) {
+    var tr = this.track(); if (!tr) return;
+    var pat = STAMP_PATTERNS[this.stampPattern]; if (!pat) return;
+    var basePitch = this.yToPitch(y0);
+    var baseTick = Math.max(0, this.snapTick(this.xToTick(x0)));
+    var placed = [];
+    pat.notes.forEach(function (o) {
+      var pitch = Math.max(0, Math.min(127, basePitch + o.pitch));
+      var start = Math.max(0, baseTick + Math.round(o.step * this.snap));
+      var n = { start: start, dur: this.snap, pitch: pitch, vel: o.vel };
+      tr.notes.push(n);
+      placed.push(n);
+    }, this);
+    this.selected = placed[placed.length - 1] || null;
+    this.selectedNotes = placed;
+  };
   PianoRoll.prototype.zoom = function (f) { this.pxPerTick = Math.max(0.02, Math.min(1.2, this.pxPerTick * f)); this.draw(); };
 
   root.PS1AUDIO = root.PS1AUDIO || {};

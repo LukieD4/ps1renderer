@@ -48,6 +48,7 @@
 <header class="wrap">
   <h1>PS1 Renderer — Control Sheet</h1>
   <p class="sub">Digital controller · latched modes · nothing held. Current mode shows top-left on the debug overlay.</p>
+  <p class="sub">All movement is delta-timed — held-button rates are per 1/60s and stay constant whether the scene runs at 60, 30 or 20fps, on NTSC or PAL. <code>VB</code>/<code>DT</code> on overlay page 1 show the frame's vblank count and the delta everything scaled by.</p>
 </header>
 
 <div class="wrap">
@@ -93,7 +94,15 @@
         <tr><td class="btn">✕ / ○</td><td class="act">FOV widen / narrow</td></tr>
         <tr><td class="btn">△</td><td class="act">Toggle vertex lighting</td></tr>
         <tr><td class="btn">□</td><td class="act">Toggle texturing</td></tr>
+        <tr><td class="btn">Hold L2 + ↑↓</td><td class="act">Light intensity offset</td></tr>
+        <tr><td class="btn">Hold L1+L2 + ↑↓</td><td class="act">Fog FAR distance</td></tr>
+        <tr><td class="btn">Hold L1+L2 + ←→</td><td class="act">Fog NEAR distance</td></tr>
+        <tr><td class="btn">Hold L1+L2 + ✕</td><td class="act">Toggle fog on / off</td></tr>
+        <tr><td class="btn">Hold L1+L2 + ○</td><td class="act">Cycle fog quad layers (0–6)</td></tr>
+        <tr><td class="btn">Hold L1+L2 + △</td><td class="act">Toggle fog density drift</td></tr>
+        <tr><td class="btn">Hold L1+L2 + □</td><td class="act">Toggle fog-hidden geometry cull</td></tr>
       </table>
+      <div class="note">Held modifiers suspend the unmodified bindings they overlap: L2 pauses model rotation and FOV, L1+L2 additionally pauses roll. Near/far clamp themselves to what the current FOV can render, so the sliders simply stop rather than producing a broken ramp. Fog reads out on overlay page 1 (FOG / FOGDQA / LB); a <code>!</code> after FOGDQA means the ramp railed, and <code>LB</code> shows which OT buckets the fog quads landed in. Layers 0 leaves only the GTE depth cue running — the direct A/B for what the quads contribute on textured geometry. The cull drops individual triangles past <code>FAR</code>, so distant models dissolve from their far side rather than vanishing whole. <code>FOGCULL TRI/OBJ</code> shows what it saved; <code>RESID</code> is how much of a textured surface still shows through at the cull plane — if you can see popping, raise <code>LAYERS</code> until <code>RESID</code> drops.</div>
     </div>
 
     <div class="card global">
@@ -101,9 +110,9 @@
       <table>
         <tr><td class="btn">SELECT</td><td class="act">Cycle control mode</td></tr>
         <tr><td class="btn">START</td><td class="act">Toggle stage ambience</td></tr>
-        <tr><td class="btn">L3 (click)</td><td class="act">Cycle debug overlay page</td></tr>
+        <tr><td class="btn">R2 (click)</td><td class="act">Cycle debug overlay page</td></tr>
       </table>
-      <div class="note">L3 is a stick click — only fires on a DualShock in analog mode. There's one overlay page today, so a digital pad loses nothing.</div>
+      <div class="note">Six overlay pages, named in the header so a photographed frame identifies itself: <code>RENDER</code> (frame time, stage, culling, prims) · <code>WORLD</code> (camera, player, transforms) · <code>LIGHT</code> · <code>FOG</code> · <code>AUDIO</code> · <code>AUDIOHW</code> (CD pipeline + raw SPU registers). In DEBUG mode a bare R2 also flips the lighting path — the page count is even so a full lap returns it to where it started.</div>
     </div>
 
   </div>

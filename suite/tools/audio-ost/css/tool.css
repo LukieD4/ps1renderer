@@ -299,6 +299,9 @@ body[data-view="arrange"] .view--live { display: none; }
 .tbtn--rec.is-armed { border-color: var(--danger); color: var(--danger); background: rgba(242,99,99,0.12); }
 .tbtn--rec.is-armed { animation: recpulse 1.1s ease-in-out infinite; }
 @keyframes recpulse { 50% { box-shadow: 0 0 8px rgba(242,99,99,0.6); } }
+.stampgroup { display: inline-flex; align-items: center; gap: 4px; }
+#btn-stamp.is-active { border-color: var(--accent); color: var(--accent); background: rgba(94,234,212,0.1); }
+#stamp-pattern { min-width: 132px; }
 .tbtn--text { width: auto; padding: 0 10px; font-family: var(--font-display); font-size: 12px; }
 .tbtn--text.is-active { border-color: var(--accent); color: var(--accent); background: rgba(94,234,212,0.1); }
 .tempo { display: inline-flex; align-items: center; gap: 5px; }

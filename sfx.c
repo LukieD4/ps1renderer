@@ -17,7 +17,9 @@
 // frame countdown computed at load time from the sample's real length:
 //   samples = (body_bytes / 16) * 28    (SPU-ADPCM: 16-byte block = 28 samples)
 //   rate    = (pitch * 44100) >> 12     (inverse of getSPUSampleRate())
-//   frames  = samples * 60 / rate       (+ a small pad for the release tail)
+//   frames  = samples * fps / rate      (+ a small pad for the release tail;
+//                                        fps = 60 NTSC / 50 PAL, read from the
+//                                        GPU video mode at load like music.c)
 // ticked once per displayed frame by sfx_tick(), same VSync cadence as
 // music_tick(). A looping VAG played in ONCE mode is keyed off by this
 // timer at the end of its first pass, so mode always wins over the flags
@@ -29,6 +31,7 @@
 #include <psxspu.h>
 #include <psxcd.h>
 #include <psxetc.h>
+#include <psxgpu.h>   // GetVideoMode(): PAL/NTSC frame rate for playFrames
 
 #include "sound.h"
 #include "sfx.h"
@@ -294,10 +297,13 @@ static int sfx_load_vag(const char *cdPath, SFX_SLOT *slot)
 
     // One-playthrough length in frames, for the ONCE/INTERVAL countdown
     // (see this file's header comment for the math). freq is straight
-    // from the header, already defaulted above if it was 0.
+    // from the header, already defaulted above if it was 0. The tick
+    // cadence is the DISPLAYED frame rate, so use the real video mode
+    // (60 NTSC / 50 PAL) - a flat 60 ran PAL countdowns ~20% long.
     {
         uint32_t samples = (body_bytes / 16u) * 28u;
-        slot->playFrames = (samples * 60u) / freq + SFX_END_PAD_FRAMES;
+        uint32_t fps = (GetVideoMode() == MODE_PAL) ? 50u : 60u;
+        slot->playFrames = (samples * fps) / freq + SFX_END_PAD_FRAMES;
     }
 
     slot->body_bytes = body_bytes;

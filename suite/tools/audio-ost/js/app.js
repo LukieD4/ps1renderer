@@ -542,6 +542,59 @@
         .catch(function (e) { toast("Export failed: " + e.message, true); });
     } catch (e) { toast("Export failed: " + e.message, true); }
   });
+
+  // Delivery size cap: prompt to compress (downsample) if the exported WAV
+  // would land over this. 9.5MB, not the full 10MB, to leave headroom.
+  var WAV_SIZE_PROMPT_BYTES = 9.5 * 1024 * 1024;
+  var WAV_SIZE_HARD_CAP_BYTES = 10 * 1024 * 1024;
+
+  $("btn-export-wav").addEventListener("click", function () {
+    var notes = song.tracks.reduce(function (a, t) { return a + t.notes.length; }, 0);
+    if (!notes) { toast("Nothing to export — add some notes first", true); return; }
+    var btn = this; btn.disabled = true;
+    var base = sanitizeName(song.name);
+    toast("Rendering " + base + ".wav…");
+    engine.renderOffline(song, P.scheduler, { secPerTick: S.secPerTick })
+      .then(function (buffer) {
+        // Bandaid trim: this song never loops, so lop a hardcoded 2s off the
+        // exported WAV's tail. Encoding-only — doesn't touch note/ADSR timing.
+        var trimmed = P.wav.trimEndSeconds(buffer, 2.0);
+        var finalBuffer = trimmed;
+        var compressed = false;
+
+        var estBytes = P.wav.estimateBytes(trimmed);
+        if (estBytes > WAV_SIZE_PROMPT_BYTES) {
+          var mb = (estBytes / 1024 / 1024).toFixed(1);
+          var wantsCompress = window.confirm(
+            base + ".wav is ~" + mb + "MB, over your specified 9.5MB limit.\n\n" +
+            "Compress it (downsample sample rate, then mono if needed) to fit under 10MB?\n\n" +
+            "OK = compress and export smaller file\nCancel = export the full-size WAV anyway"
+          );
+          if (wantsCompress) {
+            var shrunk = P.wav.shrinkToFit(trimmed, WAV_SIZE_HARD_CAP_BYTES - 64 * 1024); // small safety margin
+            finalBuffer = shrunk.buffer;
+            compressed = shrunk.steps.length > 0;
+            if (!compressed) toast("Couldn't shrink further — exporting as-is", true);
+          }
+        }
+
+        var wavBytes = P.wav.encode(finalBuffer);
+        return saveWithPicker(base + ".wav", wavBytes, "WAV audio", ".wav", "audio/wav")
+          .then(function (ok) {
+            if (!ok) { toast("Export cancelled"); return; }
+            var sizeMsg = (wavBytes.length / 1024 / 1024).toFixed(1) + "MB";
+            if (compressed) {
+              toast("Exported " + base + ".wav (" + sizeMsg + ", compressed to " + finalBuffer.sampleRate + "Hz"
+                + (finalBuffer.numberOfChannels === 1 ? "/mono" : "") + ")");
+            } else {
+              toast("Exported " + base + ".wav (" + sizeMsg + ")");
+            }
+          });
+      })
+      .catch(function (e) { toast("WAV export failed: " + e.message, true); })
+      .then(function () { btn.disabled = false; });
+  });
+
   $("btn-load-song").addEventListener("click", function () { $("song-file-input").click(); });
   $("song-file-input").addEventListener("change", function () { var f = this.files[0]; if (!f) return; var r = new FileReader(); r.onload = function () { try { loadSongObject(S.fromJSON(r.result), "Loaded " + f.name); } catch (e) { toast("Load failed: " + e.message, true); } }; r.readAsText(f); this.value = ""; });
 
@@ -549,6 +602,27 @@
   function togglePlay() { if (transport.playing) transport.stop(); else transport.play(); }
   $("btn-play").addEventListener("click", togglePlay);
   $("btn-record").addEventListener("click", function () { var on = !transport.recording; transport.setRecording(on, currentSnapTicks()); this.classList.toggle("is-armed", on); toast(on ? "Recording armed — press play" : "Recording off"); });
+
+  // ---- Stamp tool ---------------------------------------------------------
+  // Like FL Studio's stamp: pick a pattern from the dropdown, toggle Stamp
+  // on, then click the roll to drop the whole pattern at once instead of a
+  // single note.
+  roll.setStampPattern($("stamp-pattern").value);
+  $("btn-stamp").addEventListener("click", function () {
+    var on = !roll.stampMode;
+    roll.setStampMode(on);
+    this.classList.toggle("is-active", on);
+    toast(on ? "Stamp armed — click the roll to place a pattern" : "Stamp off");
+  });
+  $("stamp-pattern").addEventListener("change", function () { roll.setStampPattern(this.value); });
+  window.addEventListener("keydown", function (e) {
+    if (e.code !== "KeyS" || !e.shiftKey) return;
+    var t = e.target, tag = t && t.tagName;
+    var typing = tag === "TEXTAREA" || tag === "SELECT" || (t && t.isContentEditable) ||
+                 (tag === "INPUT" && (t.type === "text" || t.type === "number"));
+    if (typing) return;
+    $("btn-stamp").click();
+  });
   $("bpm-input").addEventListener("input", function () { var b = Math.max(20, Math.min(300, parseInt(this.value, 10) || 120)); song.bpm = b; });
   function currentSnapTicks() { var v = parseInt($("snap-select").value, 10); return v === 0 ? 1 : (song.ppq * 4) / v; }
   $("snap-select").addEventListener("change", function () { roll.setSnap(currentSnapTicks()); });

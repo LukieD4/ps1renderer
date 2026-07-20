@@ -61,13 +61,45 @@ BLOB_HEADER_H_PATH = GENERATED_DIR / "tex_blob_table.h"
 VRAM_WIDTH = 1024
 VRAM_HEIGHT = 512
 
+# ------------------------------------------------------------------
+# VRAM MAP. This must agree with main.c - DISPLAY_W/DISPLAY_H there
+# define the framebuffer footprint everything else packs around.
+#
+#   x:0-319    y:0-255    framebuffer 0      | 320x256 each, PAL
+#   x:0-319    y:256-511  framebuffer 1      | (see DISPLAY_H)
+#   x:320-335  y:0-511    CLUT strip
+#   x:336-639  y:0-511    free
+#   x:640-959  y:0-511    textures
+#   x:960-1023 y:0-...    debug font (FntLoad(960, 0) in main.c)
+#
+# PAL MOVED THE CLUTS. At 240 lines the two framebuffers only reached
+# row 479, so the CLUT strip lived at x:0, y:480-511 - underneath them.
+# At 256 lines they fill the column to row 511 and that strip is inside
+# framebuffer 1. The CLUTs now live in the dead column between the
+# framebuffers and the textures, which is 304 units of otherwise unused
+# VRAM and gives the strip 512 palette rows instead of 32.
+#
+# If main.c ever returns to a 240-line display, this map is the other
+# half of that change - it does not follow automatically.
+# ------------------------------------------------------------------
+FB_WIDTH = 320            # must match DISPLAY_W in main.c
+
 TEX_REGION_X = 640
 TEX_REGION_Y = 0
-TEX_REGION_HEIGHT = 400   # leaves y:400-511 for the CLUT strip below
+TEX_REGION_HEIGHT = VRAM_HEIGHT - TEX_REGION_Y   # full height now that the
+                                                 # CLUT strip has moved out
+                                                 # of the bottom of VRAM
 
-CLUT_REGION_X = 0
-CLUT_REGION_Y = 480
-CLUT_REGION_HEIGHT = VRAM_HEIGHT - CLUT_REGION_Y  # 32 rows
+# Right edge of the texture packer. NOT VRAM_WIDTH: the debug font is
+# loaded at x=960 by main.c, and without this cap the packer walks
+# textures straight over it - silently, corrupting the overlay rather
+# than failing the build. With the current four 64-unit textures it was
+# one texture away from doing so.
+TEX_REGION_MAX_X = 960
+
+CLUT_REGION_X = FB_WIDTH  # first column clear of the framebuffers
+CLUT_REGION_Y = 0
+CLUT_REGION_HEIGHT = VRAM_HEIGHT - CLUT_REGION_Y  # 512 rows
 
 
 # ------------------------------------------------------------------
@@ -241,7 +273,7 @@ def discover_tims():
 def pack_tims(discovered):
     items = sorted(discovered, key=lambda e: e["image_height"], reverse=True)
 
-    max_tex_x = VRAM_WIDTH
+    max_tex_x = TEX_REGION_MAX_X
     max_tex_y = TEX_REGION_Y + TEX_REGION_HEIGHT
 
     cursor_x = TEX_REGION_X
@@ -262,11 +294,11 @@ def pack_tims(discovered):
         img_w = item["image_width_units"]
         img_h = item["image_height"]
 
-        if img_w > (VRAM_WIDTH - TEX_REGION_X):
+        if img_w > (TEX_REGION_MAX_X - TEX_REGION_X):
             raise SystemExit(
                 f"'{item['base_name']}' image is wider ({img_w} units) "
                 f"than the entire packing region "
-                f"({VRAM_WIDTH - TEX_REGION_X} units) - cannot place."
+                f"({TEX_REGION_MAX_X - TEX_REGION_X} units) - cannot place."
             )
 
         if cursor_x + img_w > max_tex_x:
@@ -278,7 +310,7 @@ def pack_tims(discovered):
             raise SystemExit(
                 f"Ran out of VRAM packing space placing '{item['base_name']}' "
                 f"({img_w}x{img_h} units) - reserved region is "
-                f"{VRAM_WIDTH - TEX_REGION_X}x{TEX_REGION_HEIGHT}. Reduce "
+                f"{TEX_REGION_MAX_X - TEX_REGION_X}x{TEX_REGION_HEIGHT}. Reduce "
                 f"texture sizes/count, or adjust TEX_REGION_HEIGHT."
             )
 

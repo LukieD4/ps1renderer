@@ -352,6 +352,100 @@
     this.voices = []; this._peak = 0; this._emitVoices();
   };
 
+  // ---- Offline mixdown (WAV export) --------------------------------------
+  // Renders the whole song through the SAME Voice graph the live preview
+  // uses (identical ADSR quantization, pitch, pan, filter, reverb send) but
+  // against an OfflineAudioContext, so the WAV is what you hear in Live/
+  // Arrange, just captured to a buffer instead of the speakers.
+  //
+  // scheduler: window.PS1AUDIO.scheduler ({collectNotes, isAudible})
+  // Returns a Promise<AudioBuffer>.
+  //
+  // Export RANGE: when the loop (gold markers) is enabled, that's the region
+  // being previewed/auditioned, so it's what gets rendered — NOT the gray
+  // song-end marker (song.lengthTicks), which just bounds the sheet and is
+  // often left past the last note. Loop off -> falls back to [0, lengthTicks).
+  //
+  // TAIL: instead of a flat padding constant (which either clips a long
+  // release/reverb or, more often, leaves seconds of true silence baked into
+  // the file), the tail is derived from the actual last-sounding note: its
+  // end time plus that instrument's own (quantized) release time, plus a
+  // small allowance for the reverb send if any instrument uses one.
+  SpuEngine.prototype.renderOffline = function (sng, scheduler, opts) {
+    opts = opts || {};
+    var OfflineCtx = window.OfflineAudioContext || window.webkitOfflineAudioContext;
+    if (!OfflineCtx) return Promise.reject(new Error("OfflineAudioContext not supported in this browser"));
+
+    var sampleRate = opts.sampleRate || (this.ctx ? this.ctx.sampleRate : 44100);
+    var secPerTick = opts.secPerTick; // required: function(bpm,ppq)->sec
+    if (typeof secPerTick !== "function") return Promise.reject(new Error("renderOffline: opts.secPerTick(bpm,ppq) is required"));
+    var spTick = secPerTick(sng.bpm, sng.ppq);
+
+    var rangeStart = 0, rangeEnd = sng.lengthTicks;
+    if (sng.loop && sng.loop.enabled && sng.loop.end > sng.loop.start) {
+      rangeStart = sng.loop.start; rangeEnd = sng.loop.end;
+    }
+
+    var events = scheduler.collectNotes(sng, rangeStart, rangeEnd);
+
+    // Real tail: latest (note end + that instrument's quantized release),
+    // clamped to the render range's own end so an empty/near-empty range
+    // doesn't inherit padding from notes that aren't actually being exported.
+    var reverbTail = 0, latestTailSec = 0;
+    for (var e = 0; e < events.length; e++) {
+      var etr = events[e].track, en = events[e].note;
+      if (!etr.instrument) continue;
+      var relSec = spuQuantizeADSR(etr.instrument.adsr).release;
+      var endSec = (en.start - rangeStart + Math.max(1, en.dur)) * spTick;
+      var tailSecForNote = endSec + relSec;
+      if (tailSecForNote > latestTailSec) latestTailSec = tailSecForNote;
+      if (etr.instrument.reverbSend) reverbTail = Math.max(reverbTail, 1.8); // matches makeImpulse() length below
+    }
+    var rangeSec = (rangeEnd - rangeStart) * spTick;
+    var tailSec = opts.tailSec != null ? opts.tailSec : Math.max(0, Math.max(latestTailSec, rangeSec) - rangeSec) + reverbTail;
+    var totalSec = Math.max(0.1, rangeSec + tailSec);
+    var frames = Math.max(1, Math.ceil(totalSec * sampleRate));
+
+    var octx = new OfflineCtx(2, frames, sampleRate);
+
+    // Minimal duck-typed "engine" so the existing Voice constructor works
+    // unmodified against the offline context.
+    var oeng = {
+      ctx: octx,
+      master: octx.createGain(),
+      reverb: octx.createConvolver(),
+      reverbReturn: octx.createGain(),
+      voices: [],
+      maxVoices: this.maxVoices,
+      _lastPitch: null,
+      _emitVoices: function () {},
+      _removeVoice: function (v) { var i = this.voices.indexOf(v); if (i >= 0) this.voices.splice(i, 1); }
+    };
+    oeng.master.gain.value = this.master ? this.master.gain.value : 0.8;
+    oeng.master.connect(octx.destination);
+    oeng.reverb.buffer = makeImpulse(octx, 1.8, 2.6);
+    oeng.reverbReturn.gain.value = this.reverbReturn ? this.reverbReturn.gain.value : 0.9;
+    oeng.reverb.connect(oeng.reverbReturn);
+    oeng.reverbReturn.connect(oeng.master);
+
+    for (var i = 0; i < events.length; i++) {
+      var tr = events[i].track, n = events[i].note;
+      if (!tr.instrument) continue;
+      var vol = tr.volume != null ? tr.volume : 1;
+      var pitch = n.pitch + (tr.transpose || 0);
+      var startTime = (n.start - rangeStart) * spTick;
+      var endTime = startTime + Math.max(1, n.dur) * spTick;
+      var v = new Voice(oeng, tr.instrument, pitch, Math.max(0, Math.min(1, n.vel * vol)), startTime, endTime);
+      oeng.voices.push(v);
+    }
+
+    return octx.startRendering ? octx.startRendering() : new Promise(function (resolve, reject) {
+      octx.oncomplete = function (e) { resolve(e.renderedBuffer); };
+      octx.onerror = reject;
+      octx.startRendering();
+    });
+  };
+
   root.PS1AUDIO = root.PS1AUDIO || {};
   root.PS1AUDIO.SpuEngine = SpuEngine;
   root.PS1AUDIO.MAX_VOICES = MAX_VOICES;
