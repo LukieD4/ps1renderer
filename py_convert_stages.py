@@ -20,18 +20,42 @@ STAGES_DIR = ROOT_DIR / "assets" / "stage"
 GENERATED_DIR = ROOT_DIR / "generated"
 
 # ------------------------------------------------------------------
-# Fixed-point conventions, matching main.c / py_convert_assets.py:
-#   pos/rot in stage.json are authored directly in ENGINE fixed-point
-#   units (NOT re-scaled here) - e.g. the house_demo camera pos
-#   [0,0,-4096] matches CAMERA_DISTANCE, and rot 1024 matches the
-#   12-bit "1024 == 90 degrees" angle format model_rot/camera.rot
-#   already use. This mirrors how the demo stage.json was hand-authored.
-#   scale, on the other hand, is authored as a human multiplier (1.0 ==
-#   normal size) and IS upscaled here to 4096-per-1.0 fixed point - the
-#   same fixed point RotMatrix()'s own m[][] output uses - so main.c can
-#   apply it as a cheap column-scale on the rotation matrix (see
-#   update_object_world_and_compose() in main.c) instead of touching
-#   every vertex per object per frame.
+# Fixed-point conventions, matching main.c / py_convert_assets.py. The
+# three quantities are authored in THREE DIFFERENT units - this is the
+# thing to get right:
+#
+#   pos   - ENGINE fixed-point units already (NOT re-scaled here).
+#           stage-gen applied its *1024 viewport->engine upscale at export
+#           (stage_export.js), so e.g. house_demo's camera pos
+#           [0,0,-4096] is 4 viewport units and matches CAMERA_DISTANCE.
+#
+#   rot   - DEGREES, converted HERE to the runtime's 12-bit angle format
+#           (4096 == 360 degrees, so 1024 == 90 degrees) - the format
+#           RotMatrix() consumes and model_rot/camera.rot use.
+#           stage_export.js remaps the viewport Euler angles per axis but
+#           deliberately leaves them in degrees, with an explicit note that
+#           "a separate downstream script converts degrees to the PS1
+#           runtime's fixed-point angle format" - that script is this one.
+#
+#           THIS WAS THE BUG. An earlier version of this file assumed rot
+#           was already in engine units (like pos) and merely masked it
+#           with ROT_MASK. A camera authored at -90 degrees therefore baked
+#           as (-90 & 4095) == 4006, which the runtime reads as
+#           4006/4096*360 ~= 352 degrees, i.e. about -8 degrees. So stage
+#           cameras loaded at the right POSITION but very nearly no
+#           rotation - the symptom being "the camera ignores its rotation".
+#           Every authored rotation was affected (objects too), it was just
+#           least visible on the demo stages, whose objects are all at
+#           rot 0. Note the coneAngle conversion further down always did
+#           the degrees->12-bit scale correctly, which is the convention
+#           this now matches.
+#
+#   scale - a human multiplier (1.0 == normal size), upscaled here to
+#           4096-per-1.0 fixed point - the same fixed point RotMatrix()'s
+#           own m[][] output uses - so main.c can apply it as a cheap
+#           column-scale on the rotation matrix (see
+#           update_object_world_and_compose() in main.c) instead of
+#           touching every vertex per object per frame.
 # ------------------------------------------------------------------
 SCALE_UPSCALE = 4096
 ROT_MASK = 4095  # 12-bit angle wraparound, same as "model_rot.vx &= 4095" in main.c
@@ -65,6 +89,56 @@ LIGHT_TYPES = {"directional": 0, "spherical": 1, "spot": 2, "ambient": 3, "debug
 LIGHT_INTENSITY_SCALE = 256
 
 ANGLE_FULL = 4096  # 12-bit angle: 4096 == 360 degrees (cone angle conversion)
+
+# Trigger actions: stage.json's action string -> the STAGE_TRIGGER action
+# byte main.c switches on. Keep in sync with the TRIGGER_ACTION_* defines
+# this script writes into stage_common.h.
+#
+# 'none' is listed but never actually reaches here - stage-gen filters
+# inert triggers out at export, since a volume that does nothing is an
+# authoring marker, not runtime data. It is accepted anyway so a
+# hand-written stage.json carrying one converts rather than failing, and so
+# the byte values stay stable if a future action is inserted.
+TRIGGER_ACTIONS = {"none": 0, "switchScene": 1}
+
+# Post-process tint blend mode -> the GPU's semi-transparency (ABR) bits.
+# These ARE the hardware values, not an arbitrary enum: the PS1 GPU has
+# exactly four blend modes and this is their encoding, so main.c can pass the
+# byte to getTPage()/setSemiTrans() rather than translating it again.
+#   0: B/2 + F/2   1: B + F   2: B - F   3: B + F/4
+POSTFX_TINT_MODES = {"blend50": 0, "additive": 1, "subtractive": 2, "quarter": 3}
+
+# ------------------------------------------------------------------
+# Fog - a stage-LEVEL block (like camera), not an array of entities.
+# stage-gen exports a single "fog" object (see stage_export.js); this
+# bakes it into STAGE_DEF.fog, which main.c's load_stage_fog() reads at
+# stage load. Every field here is an authored DEFAULT the runtime loads;
+# the DEBUG-mode L1+L2 pad editor still overrides it live.
+#
+# Defaults are main.c's compiled-in fog globals VERBATIM (fog_enabled=0,
+# fog_near=800, fog_far=6000, FOG_COL_*=128, fog_layers=3, cull/drift off),
+# so a stage.json with no "fog" block converts to fog that is byte-identical
+# to the hardcoded defaults - which is exactly the fog those older stages
+# ran with. near/far are in ENGINE units already (stage-gen applied its
+# *1024 at export), so they are baked raw here, same as camera.pos.
+#
+# near/far are NOT clamped here: main.c's load_stage_fog() calls
+# fog_clamp_range() - the same function the pad editor uses - at load time,
+# so the runtime is the single authority on what range its projection can
+# render. Baking raw keeps this converter dumb and keeps the clamp in one
+# place. FOG_MAX_LAYERS is enforced (a small integer ceiling, not a
+# projection-dependent one) so the baked layer count can index main.c's
+# fixed g_fog_layer_bucket[FOG_MAX_LAYERS] safely.
+FOG_MAX_LAYERS = 6  # keep in sync with main.c's FOG_MAX_LAYERS
+FOG_DEFAULTS = {
+    "enabled": False,
+    "near": 800,
+    "far": 6000,
+    "color": [128, 128, 128],
+    "layers": 3,
+    "cull": False,
+    "drift": False,
+}
 
 
 def sanitize_identifier(name):
@@ -127,6 +201,25 @@ def as_vec3(values, label, path):
     return tuple(int(round(float(v))) for v in values)
 
 
+def as_angle_vec3(values, label, path):
+    """
+    Parse an authored rotation (DEGREES, per stage_export.js) into the
+    runtime's 12-bit angle format: 4096 == 360 degrees, wrapped to 0..4095.
+
+    Deliberately converts from float BEFORE rounding, rather than reusing
+    as_vec3()'s integer result - a fractional degree is meaningful once
+    scaled by 4096/360 (0.5 degrees is ~6 angle units), and stage-gen may
+    author non-integer angles even though it currently rounds them.
+
+    Wrapping with ROT_MASK rather than clamping is correct here: angles are
+    cyclic, so -90 degrees must become 3072 (== 270 degrees), the same
+    representation main.c's own "model_rot.vx &= 4095" produces.
+    """
+    if not (isinstance(values, list) and len(values) == 3):
+        raise SystemExit(f"{path}: '{label}' must be a 3-element array, got {values!r}")
+    return tuple(int(round(float(v) * ANGLE_FULL / 360.0)) & ROT_MASK for v in values)
+
+
 def as_scale_vec3(values, path):
     if not (isinstance(values, list) and len(values) == 3):
         raise SystemExit(f"{path}: 'scale' must be a 3-element array, got {values!r}")
@@ -172,8 +265,10 @@ for stage_dir in stage_dirs:
 
     camera = stage.get("camera", {})
     cam_pos = as_vec3(camera.get("pos", [0, 0, 0]), "camera.pos", stage_path)
-    cam_rot_raw = as_vec3(camera.get("rot", [0, 0, 0]), "camera.rot", stage_path)
-    cam_rot = tuple(v & ROT_MASK for v in cam_rot_raw)
+    # Authored in DEGREES -> the runtime's 12-bit angle format. See the
+    # fixed-point conventions block up top for why this conversion has to
+    # happen here (and what breaks when it doesn't).
+    cam_rot = as_angle_vec3(camera.get("rot", [0, 0, 0]), "camera.rot", stage_path)
 
     objects = stage.get("objects", [])
 
@@ -191,18 +286,65 @@ for stage_dir in stage_dirs:
 
         model_name = obj["model"]
         palette = int(obj.get("palette", 0))
+        # Solid to the player at runtime. DEFAULTS TRUE on a missing key, which
+        # matters for stage.json files exported before the field existed: that
+        # geometry was authored as if it were solid (there was nothing else it
+        # could be), so reading its absence as "passable" would silently ship
+        # walls the player falls through. The tool always emits the key
+        # explicitly, so a False here is only ever a deliberate authored one.
+        collide = 1 if obj.get("collide", True) else 0
         pos = as_vec3(obj.get("pos", [0, 0, 0]), f"objects[{obj_index}].pos", stage_path)
-        rot_raw = as_vec3(obj.get("rot", [0, 0, 0]), f"objects[{obj_index}].rot", stage_path)
-        rot = tuple(v & ROT_MASK for v in rot_raw)
+        rot = as_angle_vec3(obj.get("rot", [0, 0, 0]), f"objects[{obj_index}].rot", stage_path)
         scale = as_scale_vec3(obj.get("scale", [1, 1, 1]), stage_path)
 
         escaped_model = model_name.replace("\\", "\\\\").replace('"', '\\"')
 
+        # Optional skeletal-animation authoring. TWO input shapes are accepted:
+        #
+        #   NESTED (what the stage-gen tool exports, and the preferred form):
+        #     "anim": { "clip": "Run", "loop": true, "speed": 1.0,
+        #               "autoplay": true }
+        #
+        #   FLAT (older / hand-authored stages): a string "anim" clip name plus
+        #     sibling keys "animSpeed", "animStart", "animLoop", "animPlaying".
+        #
+        # Read whichever is present; absent keys give sane defaults - no named
+        # clip (runtime plays clip 0), 1.0x speed, no start offset, looping,
+        # autoplay on. The nested schema carries no start offset today, so a
+        # per-object desync offset can still be supplied via a flat "animStart"
+        # (or a nested "start") alongside it. animStart is authored in SECONDS
+        # and converted to the runtime's DT_ONE tick unit (256 == 1/60s, so
+        # 1s == 15360 ticks).
+        anim_raw = obj.get("anim")
+        if isinstance(anim_raw, dict):
+            clip_name      = anim_raw.get("clip")
+            anim_speed_val = anim_raw.get("speed", 1.0)
+            anim_loop_val  = anim_raw.get("loop", True)
+            anim_play_val  = anim_raw.get("autoplay", True)
+            anim_start_val = anim_raw.get("start", obj.get("animStart", 0.0))
+        else:
+            clip_name      = anim_raw  # string clip name, or None
+            anim_speed_val = obj.get("animSpeed", 1.0)
+            anim_loop_val  = obj.get("animLoop", True)
+            anim_play_val  = obj.get("animPlaying", obj.get("autoplay", True))
+            anim_start_val = obj.get("animStart", 0.0)
+
+        if clip_name:
+            esc_anim = str(clip_name).replace("\\", "\\\\").replace('"', '\\"')
+            anim_field = f'"{esc_anim}"'
+        else:
+            anim_field = "0"
+        anim_speed   = int(round(float(anim_speed_val) * 4096))
+        anim_start   = int(round(float(anim_start_val) * 15360))
+        anim_loop    = 1 if anim_loop_val else 0
+        anim_playing = 1 if anim_play_val else 0
+
         output.append(
-            f'    {{ "{escaped_model}", {palette}, '
+            f'    {{ "{escaped_model}", {palette}, {collide}, '
             f"{{ {pos[0]}, {pos[1]}, {pos[2]} }}, "
             f"{{ {rot[0]}, {rot[1]}, {rot[2]} }}, "
-            f"{{ {scale[0]}, {scale[1]}, {scale[2]} }} }},\n"
+            f"{{ {scale[0]}, {scale[1]}, {scale[2]} }}, "
+            f"{anim_field}, {anim_speed}, {anim_start}, {anim_loop}, {anim_playing} }},\n"
         )
         object_count += 1
 
@@ -221,10 +363,31 @@ for stage_dir in stage_dirs:
     sound_count = 0
 
     if sounds:
+        seen_sound_ids = set()
         output.append(f"\nconst STAGE_SOUND {ident}_sounds[] = {{\n")
         for snd_index, snd in enumerate(sounds):
             if "sample" not in snd:
                 raise SystemExit(f"{stage_path}: sounds[{snd_index}] is missing required 'sample'")
+
+            # Stable per-emitter handle that triggers reference. Defaults to
+            # the array INDEX rather than 0 when absent, so a stage.json
+            # predating sound IDs still gets distinct ids instead of every
+            # emitter answering to 0 - a trigger referencing "sound 0" would
+            # otherwise fire whichever happened to be first.
+            sound_id = int(round(float(snd.get("soundId", snd_index))))
+            if sound_id < 0:
+                sound_id = snd_index
+
+            # The runtime resolves an id to the FIRST matching slot
+            # (sfx_play_by_id), so a duplicate silently shadows every later
+            # emitter sharing it - enforce the uniqueness the C headers
+            # promise, at export, where it's fixable.
+            if sound_id in seen_sound_ids:
+                raise SystemExit(
+                    f"{stage_path}: sounds[{snd_index}].soundId {sound_id} is not "
+                    f"unique within this stage"
+                )
+            seen_sound_ids.add(sound_id)
 
             pos = as_vec3(snd.get("pos", [0, 0, 0]), f"sounds[{snd_index}].pos", stage_path)
 
@@ -283,7 +446,7 @@ for stage_dir in stage_dirs:
             else:
                 cd_path2_c = '"' + cd_path2.replace("\\", "\\\\") + '"'
             output.append(
-                f'    {{ "{escaped_cd_path}", {cd_path2_c}, '
+                f'    {{ {sound_id}, "{escaped_cd_path}", {cd_path2_c}, '
                 f"{{ {pos[0]}, {pos[1]}, {pos[2]} }}, "
                 f"{volume_spu}, {radius}, "
                 f"{mode}, {directional}, {mute_after}, {autoplay}, {fade_on_enter}, "
@@ -367,9 +530,269 @@ for stage_dir in stage_dirs:
         output.append("};\n\n")
         output.append(f"const unsigned int {ident}_lightCount = {light_count};\n")
 
+    # ------------------------------------------------------------------
+    # Spawns - optional "spawns" array (exported by stage-gen's spawn
+    # entities, the third kind to graduate after sound and light). Same
+    # optional/NULL handling as sounds and lights: a stage with none carries
+    # a NULL pointer + count 0 and emits no <ident>_spawns[] array.
+    #
+    # main.c's load_stage_spawn() places the PLAY-mode player at the spawn
+    # with the LOWEST spawnId (stage-gen already sorts them, but the runtime
+    # does not depend on that - it scans for the minimum). Everything else
+    # is addressable data for later systems (checkpoints, stage-transition
+    # arrival points).
+    #
+    # Summon entities are NOT included here - they share the spawnId
+    # namespace but are NPC placements, not player starts.
+    # ------------------------------------------------------------------
+    spawns = stage.get("spawns", [])
+    spawn_count = 0
+
+    if spawns:
+        seen_spawn_ids = set()
+        output.append(f"\nconst STAGE_SPAWN {ident}_spawns[] = {{\n")
+        for spawn_index, sp in enumerate(spawns):
+            spawn_id = int(round(float(sp.get("spawnId", 0))))
+            if spawn_id < 0:
+                raise SystemExit(
+                    f"{stage_path}: spawns[{spawn_index}].spawnId must be >= 0, got {spawn_id}"
+                )
+            # A door arriving at a duplicated spawnId lands on whichever the
+            # runtime's scan finds first - enforce the uniqueness the C
+            # headers promise, at export.
+            if spawn_id in seen_spawn_ids:
+                raise SystemExit(
+                    f"{stage_path}: spawns[{spawn_index}].spawnId {spawn_id} is not "
+                    f"unique within this stage"
+                )
+            seen_spawn_ids.add(spawn_id)
+            pos = as_vec3(sp.get("pos", [0, 0, 0]), f"spawns[{spawn_index}].pos", stage_path)
+            rot = as_angle_vec3(sp.get("rot", [0, 0, 0]), f"spawns[{spawn_index}].rot", stage_path)
+
+            output.append(
+                f"    {{ {spawn_id}, "
+                f"{{ {pos[0]}, {pos[1]}, {pos[2]} }}, "
+                f"{{ {rot[0]}, {rot[1]}, {rot[2]} }} }},\n"
+            )
+            spawn_count += 1
+        output.append("};\n\n")
+        output.append(f"const unsigned int {ident}_spawnCount = {spawn_count};\n")
+
+    # ------------------------------------------------------------------
+    # Triggers - optional "triggers" array (exported by stage-gen's trigger
+    # entities, the fourth kind to graduate). Same optional/NULL handling as
+    # sounds/lights/spawns.
+    #
+    # stage-gen only exports triggers with a real action (action:none is an
+    # authoring marker with nothing for the runtime to do), so anything
+    # arriving here is expected to act. The volume is a centre + half-extent
+    # AABB in engine units; the exporter did the scale -> half-extent
+    # conversion, since scale IS the extent for a unit-cube helper.
+    #
+    # targetStage is baked as a plain string and resolved at RUNTIME against
+    # stageRegistry[] by name - the same resolve-late treatment model names
+    # and sound samples get, so a door doesn't depend on stage ordering and a
+    # typo degrades to "never fires" plus an overlay count rather than a
+    # failed convert. Validating it here would mean this script needed to
+    # know the full stage list before emitting any single stage, which is a
+    # much tighter coupling than the payoff justifies.
+    # ------------------------------------------------------------------
+    triggers = stage.get("triggers", [])
+    trigger_count = 0
+
+    if triggers:
+        output.append(f"\nconst STAGE_TRIGGER {ident}_triggers[] = {{\n")
+        for tr_index, tr in enumerate(triggers):
+            action_name = tr.get("action", "none")
+            if action_name not in TRIGGER_ACTIONS:
+                raise SystemExit(
+                    f"{stage_path}: triggers[{tr_index}].action {action_name!r} "
+                    f"must be one of {sorted(TRIGGER_ACTIONS)}"
+                )
+            action = TRIGGER_ACTIONS[action_name]
+
+            pos = as_vec3(tr.get("pos", [0, 0, 0]), f"triggers[{tr_index}].pos", stage_path)
+            half = as_vec3(
+                tr.get("halfExtent", [512, 512, 512]),
+                f"triggers[{tr_index}].halfExtent",
+                stage_path,
+            )
+            # A zero/negative half-extent can never contain a point, so the
+            # trigger would be silently dead. Clamp to 1 and let it be tiny
+            # rather than impossible - a too-small volume is debuggable in a
+            # way that "the box has no interior" is not.
+            half = tuple(max(1, abs(v)) for v in half)
+
+            target_stage = (tr.get("targetStage") or "").strip()
+            escaped_target = target_stage.replace("\\", "\\\\").replace('"', '\\"')
+            target_c = f'"{escaped_target}"' if target_stage else "0"
+
+            target_spawn = max(0, int(round(float(tr.get("targetSpawnId", 0)))))
+            once = 1 if tr.get("once", True) else 0
+
+            # Sound fired in THIS stage as the door opens; -1 = none. Not
+            # cross-checked against this stage's sounds here - stage-gen
+            # already collapses a dangling reference to -1 at export, and the
+            # runtime treats an unmatched id as silence, so a hand-written
+            # stage.json degrades the same way a typo'd model name does.
+            on_enter_sound = int(round(float(tr.get("onEnterSoundId", -1))))
+            if on_enter_sound < 0:
+                on_enter_sound = -1
+
+            # Require a CROSS press while inside rather than firing on entry.
+            # Defaults TRUE when absent, matching stage-gen's schema default:
+            # a stage.json predating the field converts to press-to-activate,
+            # the same as a freshly authored trigger would.
+            user_interact = 1 if tr.get("userInteract", True) else 0
+
+            output.append(
+                f"    {{ {action}, "
+                f"{{ {pos[0]}, {pos[1]}, {pos[2]} }}, "
+                f"{{ {half[0]}, {half[1]}, {half[2]} }}, "
+                f"{target_c}, {target_spawn}, {on_enter_sound}, "
+                f"{user_interact}, {once} }},\n"
+            )
+            trigger_count += 1
+        output.append("};\n\n")
+        output.append(f"const unsigned int {ident}_triggerCount = {trigger_count};\n")
+
+    # ------------------------------------------------------------------
+    # Post-process volumes. Same centre + half-extent volume shape as
+    # triggers; the payload is what differs. stage-gen already dropped any
+    # volume with every effect disabled, clamped the layer count, and
+    # upscaled falloff - this transcribes and maps the blend-mode string to
+    # its hardware ABR value.
+    #
+    # Float amounts (blur/ghost) are authored 0-1 and baked to 0-4096 fixed
+    # point, the same 12-bit scale main.c uses for every other fractional
+    # quantity, so the runtime never sees a float.
+    # ------------------------------------------------------------------
+    postfx = stage.get("postfx", [])
+    if not isinstance(postfx, list):
+        raise SystemExit(f"{stage_path}: 'postfx' must be an array, got {postfx!r}")
+
+    postfx_count = 0
+    if postfx:
+        output.append(f"\nconst STAGE_POSTFX {ident}_postfx[] = {{\n")
+        for pi, fx in enumerate(postfx):
+            if not isinstance(fx, dict):
+                raise SystemExit(f"{stage_path}: postfx[{pi}] must be an object, got {fx!r}")
+
+            pos = as_vec3(fx.get("pos", [0, 0, 0]), f"postfx[{pi}].pos", stage_path)
+            half = as_vec3(fx.get("halfExtent", [1, 1, 1]), f"postfx[{pi}].halfExtent", stage_path)
+            half = [h if h >= 1 else 1 for h in half]
+            falloff = max(0, int(fx.get("falloff", 0)))
+            # Master intensity: authored as a percentage, baked to the same
+            # 12-bit fixed point (4096 == 1.0 == 100%) every other fractional
+            # quantity in main.c uses. Capped at 4x rather than 1x - the
+            # editor deliberately allows over-driving a volume, and the
+            # runtime clamps the RESULT, not the input.
+            intensity = max(0, min(16384, int(int(fx.get("intensity", 100)) * 4096 / 100)))
+
+            mode_name = fx.get("tintMode", "blend50")
+            if mode_name not in POSTFX_TINT_MODES:
+                raise SystemExit(
+                    f"{stage_path}: postfx[{pi}].tintMode {mode_name!r} is not one of "
+                    f"{sorted(POSTFX_TINT_MODES)}"
+                )
+            tint_mode = POSTFX_TINT_MODES[mode_name]
+
+            col = fx.get("tintColor", [128, 64, 96])
+            if not isinstance(col, list) or len(col) != 3:
+                raise SystemExit(f"{stage_path}: postfx[{pi}].tintColor must be [r,g,b], got {col!r}")
+            r, g, b = (max(0, min(255, int(c))) for c in col)
+
+            tint = 1 if fx.get("tint") else 0
+            strength = max(1, min(8, int(fx.get("tintStrength", 1))))
+            blur = 1 if fx.get("blur") else 0
+            blur_amt = max(0, min(4096, int(float(fx.get("blurAmount", 0.5)) * 4096)))
+            ghost = 1 if fx.get("ghost") else 0
+            ghost_amt = max(0, min(4096, int(float(fx.get("ghostAmount", 0.5)) * 4096)))
+            palette = 1 if fx.get("palette") else 0
+            palette_row = max(0, int(fx.get("paletteRow", 0)))
+
+            output.append(
+                f"    {{ {{ {pos[0]}, {pos[1]}, {pos[2]} }}, "
+                f"{{ {half[0]}, {half[1]}, {half[2]} }}, {falloff}, {intensity}, "
+                f"{tint}, {r}, {g}, {b}, {tint_mode}, {strength}, "
+                f"{blur}, {blur_amt}, {ghost}, {ghost_amt}, "
+                f"{palette}, {palette_row} }},\n"
+            )
+            postfx_count += 1
+        output.append("};\n\n")
+        output.append(f"const unsigned int {ident}_postfxCount = {postfx_count};\n")
+
+    # ------------------------------------------------------------------
+    # Authored collision boxes. Already world-space, already halved, already
+    # in engine units - stage-gen did all of that (see stage_export.js's
+    # collider block for why the bake happens there rather than here). This is
+    # a near-verbatim transcription; the only work is validating shapes and
+    # forcing a minimum extent so a box can never be silently inert.
+    # ------------------------------------------------------------------
+    colliders = stage.get("colliders", [])
+    if not isinstance(colliders, list):
+        raise SystemExit(f"{stage_path}: 'colliders' must be an array, got {colliders!r}")
+
+    collider_count = 0
+    if colliders:
+        output.append(f"\nconst STAGE_COLLIDER {ident}_colliders[] = {{\n")
+        for ci, col in enumerate(colliders):
+            if not isinstance(col, dict):
+                raise SystemExit(f"{stage_path}: colliders[{ci}] must be an object, got {col!r}")
+            cid = int(col.get("colliderId", -1))
+            pos = as_vec3(col.get("pos", [0, 0, 0]), f"colliders[{ci}].pos", stage_path)
+            half = as_vec3(col.get("halfExtent", [1, 1, 1]), f"colliders[{ci}].halfExtent", stage_path)
+            # A zero or negative half-extent makes a box that can never contain
+            # anything - it would ship looking authored while being inert.
+            half = [h if h >= 1 else 1 for h in half]
+            enabled = 1 if col.get("enabled", True) else 0
+            output.append(
+                f"    {{ {cid}, "
+                f"{{ {pos[0]}, {pos[1]}, {pos[2]} }}, "
+                f"{{ {half[0]}, {half[1]}, {half[2]} }}, "
+                f"{enabled} }},\n"
+            )
+            collider_count += 1
+        output.append("};\n\n")
+        output.append(f"const unsigned int {ident}_colliderCount = {collider_count};\n")
+
+    # ------------------------------------------------------------------
+    # Fog - a single stage-level block, baked into STAGE_DEF.fog (in the
+    # registry line below), NOT a per-stage array. Unlike sounds/lights it
+    # is emitted for EVERY stage: main.c has no fallback fog, so an omitted
+    # block would let the previously-loaded stage's fog leak across a runtime
+    # stage switch (same reasoning that makes authored lights authoritative
+    # with no recovery sun). Absent fields fall back to main.c's own
+    # compiled-in defaults (FOG_DEFAULTS), so a stage.json without a "fog"
+    # block bakes fog identical to the hardcoded runtime values.
+    # ------------------------------------------------------------------
+    fog = stage.get("fog", {})
+    if not isinstance(fog, dict):
+        raise SystemExit(f"{stage_path}: 'fog' must be an object, got {fog!r}")
+
+    fog_enabled = 1 if fog.get("enabled", FOG_DEFAULTS["enabled"]) else 0
+    fog_cull = 1 if fog.get("cull", FOG_DEFAULTS["cull"]) else 0
+    fog_drift = 1 if fog.get("drift", FOG_DEFAULTS["drift"]) else 0
+
+    fog_near = int(round(float(fog.get("near", FOG_DEFAULTS["near"]))))
+    fog_far = int(round(float(fog.get("far", FOG_DEFAULTS["far"]))))
+
+    fog_layers = int(fog.get("layers", FOG_DEFAULTS["layers"]))
+    fog_layers = max(0, min(FOG_MAX_LAYERS, fog_layers))
+
+    fog_color = fog.get("color", FOG_DEFAULTS["color"])
+    if not (isinstance(fog_color, list) and len(fog_color) == 3):
+        raise SystemExit(f"{stage_path}: 'fog.color' must be a 3-element [r,g,b] array, got {fog_color!r}")
+    fog_r, fog_g, fog_b = (max(0, min(255, int(round(float(c))))) for c in fog_color)
+
     stage_c_path = GENERATED_DIR / f"stage_{ident}.c"
     stage_c_path.write_text("".join(output), newline="\n")
-    print(f"Generated: {stage_c_path} ({object_count} object(s), {sound_count} sound(s), {light_count} light(s))")
+    print(
+        f"Generated: {stage_c_path} ({object_count} object(s), {sound_count} sound(s), "
+        f"{light_count} light(s), {spawn_count} spawn(s), {trigger_count} trigger(s), "
+        f"{collider_count} collider(s), {postfx_count} postfx, "
+        f"fog {'on' if fog_enabled else 'off'})"
+    )
 
     stage_entries.append({
         "name": stage_name,
@@ -378,6 +801,13 @@ for stage_dir in stage_dirs:
         "cam_rot": cam_rot,
         "sound_count": sound_count,
         "light_count": light_count,
+        "spawn_count": spawn_count,
+        "trigger_count": trigger_count,
+        "has_colliders": collider_count > 0,
+        "has_postfx": postfx_count > 0,
+        "collider_count": collider_count,
+        "fog": (fog_enabled, fog_cull, fog_drift, fog_layers,
+                fog_near, fog_far, fog_r, fog_g, fog_b),
     })
 
 # ------------------------------------------------------------------
@@ -393,11 +823,91 @@ header_lines.append("#ifndef STAGE_COMMON_H\n#define STAGE_COMMON_H\n\n")
 header_lines.append("typedef struct\n{\n")
 header_lines.append("    const char *model;     // resolved against modelRegistry[] by name at stage-load time\n")
 header_lines.append("    unsigned char palette; // base palette row for this placed instance (see active_palette in main.c)\n")
+header_lines.append("    unsigned char collide; // 1 = solid to the player; main.c composes a world AABB from the model's bboxMin/bboxMax. Packs with palette - keep the two adjacent, ahead of the VECTORs.\n")
 header_lines.append("    VECTOR  pos;           // world position, same fixed-point space as CAMERA.pos\n")
 header_lines.append("    SVECTOR rot;           // 12-bit fixed-point XYZ angle, same format as model_rot\n")
 header_lines.append("    VECTOR  scale;         // per-axis scale, 4096 == 1.0 (same fixed point RotMatrix() m[][] uses)\n")
+header_lines.append("\n")
+header_lines.append("    // Skeletal-animation authoring (all optional in stage.json; ignored on\n")
+header_lines.append("    // models with no rig). See main.c load_stage() / animation.c.\n")
+header_lines.append("    const char   *anim;      // clip NAME to play (resolved via anim_find_clip at load); NULL = clip 0\n")
+header_lines.append("    int           animSpeed; // playback rate, 4096 == 1.0x\n")
+header_lines.append("    int           animStart; // initial play-time offset in ticks (256 == 1/60s) - desyncs identical NPCs\n")
+header_lines.append("    unsigned char animLoop;  // 1 = loop, 0 = play once then hold the final frame\n")
+header_lines.append("    unsigned char animPlaying;// 1 = start playing on spawn (autoplay), 0 = sit paused on the first frame\n")
 header_lines.append("} STAGE_OBJECT;\n\n")
+header_lines.append("/* Post-process tint blend mode = the GPU's semi-transparency (ABR) bits.\n")
+header_lines.append(" * These are the HARDWARE values, not an arbitrary enum. */\n")
+header_lines.append("#define POSTFX_TINT_BLEND50     0  /* B/2 + F/2 - glass, haze, general wash */\n")
+header_lines.append("#define POSTFX_TINT_ADDITIVE    1  /* B + F     - fire, light, heat */\n")
+header_lines.append("#define POSTFX_TINT_SUBTRACTIVE 2  /* B - F     - shadow, grime, dread */\n")
+header_lines.append("#define POSTFX_TINT_QUARTER     3  /* B + F/4   - subtle bloom */\n\n")
+header_lines.append("/* Region that changes HOW THE FRAME IS RENDERED while the player is inside.\n")
+header_lines.append(" *\n")
+header_lines.append(" * The PS1 has no programmable shaders, so every effect here is assembled\n")
+header_lines.append(" * from fixed-function parts: full-screen semi-transparent quads (the same\n")
+header_lines.append(" * mechanism the fog layers use), CLUT row swaps, and quads TEXTURED FROM\n")
+header_lines.append(" * the displayed framebuffer (VRAM is unified, so the previous frame is\n")
+header_lines.append(" * directly addressable - no copy).\n")
+header_lines.append(" *\n")
+header_lines.append(" * Volume is an AXIS-ALIGNED box, centre +/- halfExtent, exactly like\n")
+header_lines.append(" * STAGE_TRIGGER - rotation is not carried, so a rotated volume behaves as\n")
+header_lines.append(" * its axis-aligned equivalent.\n")
+header_lines.append(" *\n")
+header_lines.append(" * falloff is the distance OUTSIDE the box over which the effect ramps in\n")
+header_lines.append(" * (0 = hard edge). It is what stops a volume reading as a light switch.\n")
+header_lines.append(" *\n")
+header_lines.append(" * OVERLAPPING VOLUMES BLEND. Continuous amounts are weighted by each\n")
+header_lines.append(" * volume's falloff weight and summed; paletteRow CANNOT be averaged\n")
+header_lines.append(" * (row 2 and row 5 do not make row 3.5), so it takes the value of the\n")
+header_lines.append(" * highest-weighted volume instead.\n")
+header_lines.append(" *\n")
+header_lines.append(" * blurAmount/ghostAmount are 12-bit fixed point (4096 == 1.0), matching\n")
+header_lines.append(" * every other fractional quantity in main.c - the runtime never sees a\n")
+header_lines.append(" * float. tintStrength is a LAYER COUNT, because the GPU's blend modes are\n")
+header_lines.append(" * fixed ratios: 'stronger' means drawing the quad again, and each layer is\n")
+header_lines.append(" * a full-screen fill. That is the real cost of this whole feature. */\n")
 header_lines.append("typedef struct\n{\n")
+header_lines.append("    VECTOR pos;                // volume CENTRE, same fixed-point space as STAGE_OBJECT.pos\n")
+header_lines.append("    VECTOR halfExtent;         // half-size per axis; always >= 1\n")
+header_lines.append("    int falloff;               // ramp-in distance outside the box, world units; 0 = hard edge\n")
+header_lines.append("    int intensity;             // master scale on this volume's whole contribution, 4096 == 100%\n")
+header_lines.append("    unsigned char tint;        // 1 = draw the full-screen tint quad(s)\n")
+header_lines.append("    unsigned char tintR, tintG, tintB;\n")
+header_lines.append("    unsigned char tintMode;    // POSTFX_TINT_* above (the GPU's ABR bits)\n")
+header_lines.append("    unsigned char tintStrength;// number of full-screen quads, 1..8\n")
+header_lines.append("    unsigned char blur;        // 1 = spatial blur (offset feedback quads sampling the displayed buffer)\n")
+header_lines.append("    unsigned short blurAmount; // 0..4096\n")
+header_lines.append("    unsigned char ghost;       // 1 = temporal trails (zero-offset feedback, same mechanism as blur)\n")
+header_lines.append("    unsigned short ghostAmount;// 0..4096\n")
+header_lines.append("    unsigned char palette;     // 1 = push a global CLUT row offset (free at runtime)\n")
+header_lines.append("    unsigned char paletteRow;\n")
+header_lines.append("} STAGE_POSTFX;\n\n")
+header_lines.append("/* Authored collision box, baked to WORLD space by stage-gen.\n")
+header_lines.append(" *\n")
+header_lines.append(" * The editor treats these as children of a model instance (so a box\n")
+header_lines.append(" * follows its building around while authoring), but that relationship has\n")
+header_lines.append(" * done its job by export time - what ships is a flat, world-space,\n")
+header_lines.append(" * axis-aligned centre + half-extent list. main.c copies them straight into\n")
+header_lines.append(" * its collider table with no composition and no model lookup.\n")
+header_lines.append(" *\n")
+header_lines.append(" * An instance with NO authored boxes falls back to one automatic box per\n")
+header_lines.append(" * model primitive, composed at load from MODEL_DEF.collMin/collMax. So a\n")
+header_lines.append(" * simple prop needs no authoring, and complex geometry (a building with a\n")
+header_lines.append(" * doorway) gets hand-placed boxes instead.\n")
+header_lines.append(" *\n")
+header_lines.append(" * colliderId is a stable, stage-unique handle. It exists so collision can be\n")
+header_lines.append(" * TOGGLED at runtime - `enabled` here is only the INITIAL state, and main.c\n")
+header_lines.append(" * keeps a live copy a future trigger action can flip to open a barrier or\n")
+header_lines.append(" * seal a door. Automatic fallback boxes are not addressable and carry -1. */\n")
+header_lines.append("typedef struct\n{\n")
+header_lines.append("    int colliderId;            // stage-unique handle for runtime toggling; -1 = automatic fallback box\n")
+header_lines.append("    VECTOR pos;                // box CENTRE, world space, same fixed point as STAGE_OBJECT.pos\n")
+header_lines.append("    VECTOR halfExtent;         // half-size per axis; always >= 1 so the box has an interior\n")
+header_lines.append("    unsigned char enabled;     // INITIAL solid state (main.c keeps a live, toggleable copy)\n")
+header_lines.append("} STAGE_COLLIDER;\n\n")
+header_lines.append("typedef struct\n{\n")
+header_lines.append("    unsigned int soundId;      // stable per-emitter handle other entities reference (e.g. a trigger's onEnterSoundId); unique within the stage\n")
 header_lines.append('    const char *cdPath;        // full CD path - "\\\\WIND.VAG;1" for sfx modes (sfx.c), the "\\\\NAME.VAB;1" bank for music mode (music.c)\n')
 header_lines.append('    const char *cdPath2;       // music mode only: the "\\\\NAME.SEQ;1" score path; NULL for every other mode\n')
 header_lines.append("    VECTOR pos;                // emitter world position, same fixed-point space as STAGE_OBJECT.pos\n")
@@ -430,6 +940,56 @@ header_lines.append("    unsigned short penumbra;   // spot edge softness, 0..40
 header_lines.append("    unsigned char isStatic;    // 1 = bake-destined (static), 0 = dynamic; both lit live until the bake exists\n")
 header_lines.append("    unsigned char disabled;    // 1 = authored off: still present in the data, skipped by load_stage_lights (immune to the DEBUG L2 editor, unlike intensity 0)\n")
 header_lines.append("} STAGE_LIGHT;\n\n")
+header_lines.append("/* Player/actor spawn point. main.c's load_stage_spawn() places the\n")
+header_lines.append(" * PLAY-mode player at the entry with the LOWEST spawnId on stage load;\n")
+header_lines.append(" * the rest are addressable markers for later systems (checkpoints,\n")
+header_lines.append(" * stage-transition arrival points). Summon entities share stage-gen's\n")
+header_lines.append(" * spawnId namespace but are NPC placements and are NOT baked here. */\n")
+header_lines.append("typedef struct\n{\n")
+header_lines.append("    unsigned int spawnId;  // unique within the stage; lowest one is the player start\n")
+header_lines.append("    VECTOR  pos;           // world position, same fixed-point space as STAGE_OBJECT.pos\n")
+header_lines.append("    SVECTOR rot;           // 12-bit facing; .vy is the yaw the player spawns looking along\n")
+header_lines.append("} STAGE_SPAWN;\n\n")
+header_lines.append("/* Trigger action byte (matches TRIGGER_ACTIONS in py_convert_stages.py). */\n")
+header_lines.append("#define TRIGGER_ACTION_NONE         0\n")
+header_lines.append("#define TRIGGER_ACTION_SWITCH_SCENE 1\n\n")
+header_lines.append("/* Volume that performs an action when the player enters it. The volume is\n")
+header_lines.append(" * an AXIS-ALIGNED box: centre `pos` +/- `halfExtent` per axis. stage-gen's\n")
+header_lines.append(" * helper is a unit cube scaled by the entity's scale, so scale IS the\n")
+header_lines.append(" * extent; the exporter halves it because a centre+half-extent test is one\n")
+header_lines.append(" * subtract and one compare per axis. Entity ROTATION is not carried - a\n")
+header_lines.append(" * rotated trigger behaves as its axis-aligned equivalent (an OBB test is\n")
+header_lines.append(" * real work nothing has needed yet).\n")
+header_lines.append(" *\n")
+header_lines.append(" * targetStage is a stage NAME resolved against stageRegistry[] at runtime\n")
+header_lines.append(" * (resolve-late, like model names), or NULL when unset. */\n")
+header_lines.append("typedef struct\n{\n")
+header_lines.append("    unsigned char action;      // TRIGGER_ACTION_* above\n")
+header_lines.append("    VECTOR pos;                // volume CENTRE, same fixed-point space as STAGE_OBJECT.pos\n")
+header_lines.append("    VECTOR halfExtent;         // half-size per axis; always >= 1 so the box has an interior\n")
+header_lines.append("    const char *targetStage;   // switchScene: destination stage name, else NULL\n")
+header_lines.append("    unsigned int targetSpawnId;// switchScene: which spawn to arrive at in that stage\n")
+header_lines.append("    int onEnterSoundId;        // STAGE_SOUND.soundId to fire in THIS stage as the door opens, or -1 for none\n")
+header_lines.append("    unsigned char userInteract;// 1 = player must press CROSS while inside; 0 = fires the moment they walk in\n")
+header_lines.append("    unsigned char once;        // 1 = fire a single time, 0 = re-fire on every entry\n")
+header_lines.append("} STAGE_TRIGGER;\n\n")
+header_lines.append("/* Stage-level distance fog. A single block per stage (like the camera),\n")
+header_lines.append(" * NOT an array - fog has no position and there is exactly one per stage.\n")
+header_lines.append(" * main.c's load_stage_fog() copies these into its fog_* globals and calls\n")
+header_lines.append(" * fog_clamp_range() (so nearZ/farZ are baked raw here - the runtime clamps\n")
+header_lines.append(" * them into its projection's renderable range). The DEBUG-mode L1+L2 pad\n")
+header_lines.append(" * editor still overrides all of this live; these are the authored defaults\n")
+header_lines.append(" * the stage loads with. r/g/b also drive the SCREEN CLEAR colour, so the\n")
+header_lines.append(" * void behind geometry matches the shade geometry depth-cues toward. */\n")
+header_lines.append("typedef struct\n{\n")
+header_lines.append("    unsigned char enabled;  // master fog toggle (fog_enabled)\n")
+header_lines.append("    unsigned char cull;     // skip geometry entirely past farZ (fog_cull_enabled)\n")
+header_lines.append("    unsigned char drift;    // slow one-sided breathing on the far edge (fog_drift_enabled)\n")
+header_lines.append("    unsigned char layers;   // full-screen OT fog quads, 0..FOG_MAX_LAYERS (fog_layers)\n")
+header_lines.append("    int nearZ;              // SZ at which fog begins, engine units (fog_near; clamped at load)\n")
+header_lines.append("    int farZ;               // SZ at which fog is full, engine units (fog_far; clamped at load)\n")
+header_lines.append("    unsigned char r, g, b;  // fog colour 0-255 (FOG_COL_*), also the screen clear colour\n")
+header_lines.append("} STAGE_FOG;\n\n")
 header_lines.append("typedef struct\n{\n")
 header_lines.append("    const char *name;\n")
 header_lines.append("    VECTOR  cameraPos;\n")
@@ -440,6 +1000,15 @@ header_lines.append("    const STAGE_SOUND *sounds; // NULL when the stage autho
 header_lines.append("    unsigned int soundCount;\n")
 header_lines.append("    const STAGE_LIGHT *lights; // NULL when the stage authors no lights\n")
 header_lines.append("    unsigned int lightCount;\n")
+header_lines.append("    const STAGE_SPAWN *spawns; // NULL when the stage authors no spawn points\n")
+header_lines.append("    unsigned int spawnCount;\n")
+header_lines.append("    const STAGE_TRIGGER *triggers; // NULL when the stage authors no active triggers\n")
+header_lines.append("    unsigned int triggerCount;\n")
+header_lines.append("    const STAGE_COLLIDER *colliders; // NULL when the stage authors no boxes (objects fall back to automatic per-primitive AABBs)\n")
+header_lines.append("    unsigned int colliderCount;\n")
+header_lines.append("    const STAGE_POSTFX *postfx; // NULL when the stage authors no post-process volumes\n")
+header_lines.append("    unsigned int postfxCount;\n")
+header_lines.append("    STAGE_FOG fog;             // stage-level fog block (always present, even when disabled)\n")
 header_lines.append("} STAGE_DEF;\n\n")
 header_lines.append("extern const unsigned int stageRegistryCount;\n")
 header_lines.append("extern const STAGE_DEF stageRegistry[];\n\n")
@@ -466,11 +1035,37 @@ for entry in stage_entries:
         lights_ref = f'{entry["ident"]}_lights, {entry["ident"]}_lightCount'
     else:
         lights_ref = "0, 0"  # no lights authored - no <ident>_lights[] array was emitted
+    if entry["spawn_count"] > 0:
+        spawns_ref = f'{entry["ident"]}_spawns, {entry["ident"]}_spawnCount'
+    else:
+        spawns_ref = "0, 0"  # no spawns authored - no <ident>_spawns[] array was emitted
+    if entry["trigger_count"] > 0:
+        triggers_ref = f'{entry["ident"]}_triggers, {entry["ident"]}_triggerCount'
+    else:
+        triggers_ref = "0, 0"  # no active triggers - no <ident>_triggers[] array was emitted
+
+    if entry.get("has_postfx"):
+        postfx_ref = f'{entry["ident"]}_postfx, {entry["ident"]}_postfxCount'
+    else:
+        postfx_ref = "0, 0"  # no post-process volumes authored
+
+    if entry.get("has_colliders"):
+        colliders_ref = f'{entry["ident"]}_colliders, {entry["ident"]}_colliderCount'
+    else:
+        # No authored boxes: main.c falls back to the automatic per-primitive
+        # AABB for every collidable object in this stage.
+        colliders_ref = "0, 0"
+    fog = entry["fog"]  # (enabled, cull, drift, layers, nearZ, farZ, r, g, b)
+    fog_ref = (
+        f"{{ {fog[0]}, {fog[1]}, {fog[2]}, {fog[3]}, "
+        f"{fog[4]}, {fog[5]}, {fog[6]}, {fog[7]}, {fog[8]} }}"
+    )
     registry_lines.append(
         f'    {{ "{escaped_name}", '
         f'{{ {entry["cam_pos"][0]}, {entry["cam_pos"][1]}, {entry["cam_pos"][2]} }}, '
         f'{{ {entry["cam_rot"][0]}, {entry["cam_rot"][1]}, {entry["cam_rot"][2]} }}, '
-        f'{entry["ident"]}_objects, {entry["ident"]}_objectCount, {sounds_ref}, {lights_ref} }},\n'
+        f'{entry["ident"]}_objects, {entry["ident"]}_objectCount, {sounds_ref}, {lights_ref}, '
+        f'{spawns_ref}, {triggers_ref}, {colliders_ref}, {postfx_ref}, {fog_ref} }},\n'
     )
 registry_lines.append("};\n")
 

@@ -96,9 +96,108 @@ const ps1LightUniforms = {
   },
 };
 
+// ==========================================================================
+// PS1 FOG PARITY PREVIEW
+// ==========================================================================
+//
+// Shares the lighting preview's plumbing exactly: shared uniform objects
+// REFERENCED (never copied) by every PS1 material, refreshed once per frame
+// in the render loop. Like the lighting preview, this is active only in PS1
+// shading mode - the editor mode's MeshBasicMaterial would need Three's own
+// THREE.Fog, which is linear in DISTANCE, and main.c's ramp is linear in
+// 1/z. Two visibly different curves labelled "fog" in one tool is worse than
+// one curve in one mode.
+//
+// WHAT IS ACTUALLY EMULATED, and why it is worth the shader work rather than
+// a THREE.Fog approximation:
+//
+//  1. THE GTE DEPTH CUE, exactly. gte_rtps computes IR0 = (q*DQA + DQB)/4096
+//     where q = H*65536/SZ, and DQA/DQB are chosen to put IR0 at 0 on
+//     fog_near and 4096 on fog_far - so the ramp is linear in 1/z, NOT in z.
+//     Fog therefore thickens fastest just past Near, which is the single
+//     most visible difference from a naive linear fog and the thing an
+//     author is actually dialling in when they scrub Near.
+//     gte_dpcs then does colour + (farColour - colour) * IR0/4096, which is
+//     applied here to the LIT vertex colour, before texture modulation -
+//     the same order the hardware uses.
+//
+//     That ordering is what reproduces main.c's most counter-intuitive
+//     documented behaviour for free: at the neutral #808080 fog colour, a
+//     fully depth-cued textured surface renders as its RAW TEXEL, because
+//     the vertex colour is a tint the GPU applies as texel * tint / 128 and
+//     128 IS the neutral multiplier. The depth cue contributes literally
+//     nothing to textured geometry at that colour. An author who did not
+//     believe that comment can now watch it happen.
+//
+//  2. THE LAYERED OT QUADS, which is where textured fogging actually comes
+//     from. Layer i sits at near + (far-near)*sqrt((i+1)/(L+1)) - the
+//     far-biased spacing draw_fog_layers() uses, which spaces evenly in fog
+//     OPACITY rather than in depth. Each is a 50/50 blend, and the OT is
+//     walked back-to-front, so a fragment is covered by every quad NEARER
+//     than it: k quads deep == 1 - 0.5^k of the way to the fog colour.
+//     The quads carry the vertical Gouraud gradient too (FOG_GRAD_TOP/
+//     BOTTOM), which is why this reads as air the scene sits in rather than
+//     a grey filter over the image.
+//
+//  3. THE CULL, as a discard past Far. Previewing this is the point: the
+//     residual at the cull plane is 0.5^layers of a texel's difference from
+//     the fog colour, so whether it pops is a property of THIS stage's
+//     textures and layer count. That is a judgement call, and judgement
+//     calls need to be seen, not computed.
+//
+// NOT emulated: DQA/DQB fixed-point rails (the panel's clamp keeps the
+// author out of that territory in the first place), 15-bit truncation, and
+// dithering. This previews the fog MODEL, not the console's rasterizer -
+// same scope line the lighting preview draws.
+const PS1_MAX_FOG_LAYERS = 6; // mirrors main.c's FOG_MAX_LAYERS
+
+const ps1FogUniforms = {
+  uFogEnabled: { value: 0 },
+  uFogCull: { value: 0 },
+  // Viewport units, matching vViewDepth. uFogFar is the DRIFT-ADJUSTED far
+  // (drift only ever widens it); uFogCullFar is the AUTHORED far, because
+  // main.c's cull and quad placement both read fog_far raw - setup_frame_fog
+  // is the only thing drift touches. Keeping them separate is what stops the
+  // cull plane breathing along with the ramp.
+  uFogNear: { value: 0.78125 },
+  uFogFar: { value: 5.859375 },
+  uFogCullFar: { value: 5.859375 },
+  uFogColor: { value: new THREE.Color(0.5, 0.5, 0.5) },
+  uFogGradTop: { value: new THREE.Color(0.5, 0.5, 0.5) },
+  uFogGradBottom: { value: new THREE.Color(0.5, 0.5, 0.5) },
+  uFogLayerZ: { value: new Array(PS1_MAX_FOG_LAYERS).fill(0) },
+  uFogLayerCount: { value: 0 },
+  // Drawing-buffer height in device pixels, for the quads' vertical
+  // gradient (gl_FragCoord.y is in device pixels, not CSS pixels).
+  uFogViewportH: { value: 1 },
+};
+
+// Authored fog, as handed over by app.js. Kept verbatim so the per-frame
+// refresh can re-derive drift/layers without app.js having to re-push.
+let stageFog = null;
+
+// Drift phase in TURNS (0..1). main.c advances a 12-bit phase by
+// FOG_DRIFT_SPEED per frame - 131072/180 ~= 728 frames, i.e. ~12.1s per
+// cycle at 60Hz. The viewport advances by wall-clock instead of frame count
+// so the breathing runs at the same real-world rate here as on a console,
+// regardless of what framerate the browser happens to manage.
+const FOG_DRIFT_PERIOD_SECONDS = 131072 / 180 / 60; // ~12.13s
+let fogDriftPhase = 0;
+
+// The editor's own background, restored whenever fog isn't painting over it.
+const EDITOR_BACKGROUND = 0x1a1a1e;
+
 // modelName -> triangle count of the parsed template (computed once at
 // load time in loadModelIntoStage, displayed in the sidebar model list).
 const modelTriCounts = new Map();
+
+// modelName -> string[] of animation clip NAMES carried by the source .glb
+// (from gltf.animations, captured once at load time in loadModelIntoStage).
+// An empty array means "loaded but static"; a missing key means "not loaded
+// this session". app.js reads this to flag animated models in the tree and to
+// populate the Animation properties dropdown. Names, not AnimationClips: the
+// editor never plays them, it only authors which one the runtime should use.
+const modelAnimations = new Map();
 
 // modelName -> parsed template Object3D (never added to `stage` directly, only cloned)
 const modelTemplates = new Map();
@@ -262,7 +361,22 @@ export function initViewer(canvasEl, gizmoCanvasEl) {
   });
 
   transformControls.addEventListener('objectChange', () => {
-    if (!currentTransformTarget || !transformChangeCallback) return;
+    if (!currentTransformTarget) return;
+
+    // COLLIDER DRAG. Routed out before any of the snapping below, all of
+    // which is instance behaviour: surface-snap raycasts a dragged object
+    // onto other objects' faces, and seam-snap pulls bounding boxes flush.
+    // Both would fight a collision box, which is meant to sit wherever the
+    // author puts it - usually INSIDE the geometry, which is precisely where
+    // surface-snap would refuse to leave it.
+    if (colliderTargetIds.has(currentTransformTarget)) {
+      if (colliderChangeCallback) {
+        colliderChangeCallback(currentTransformTarget, getColliderTransform(currentTransformTarget));
+      }
+      return;
+    }
+
+    if (!transformChangeCallback) return;
 
     // SURFACE-SNAP DRAG: the white center square of the translate gizmo
     // (TransformControls' 'XYZ' handle) normally moves the object in the
@@ -423,6 +537,12 @@ function renderLoop() {
   // scrubbing its intensity field) relights the viewport live with zero
   // extra plumbing through app.js.
   if (ps1LightingEnabled) updatePS1LightsFromEntities();
+
+  // Fog uniforms, same per-frame reasoning as the lights above plus one of
+  // its own: drift is time-varying, so this HAS to be per-frame rather than
+  // event-driven. dt is the already-clamped frame delta, so a tab-switch
+  // stall can't fling the drift phase forward either.
+  refreshFogUniforms(dt);
 
   renderer.render(stage, editCamera);
   renderAxisGizmo();
@@ -1012,6 +1132,49 @@ export async function loadModelIntoStage(modelName, glbArrayBuffer, resolveByNam
   });
   const group = gltf.scene;
 
+  // Capture the clip names the .glb ships with BEFORE we drop the rest of the
+  // gltf. GLTFLoader parses TItglTF animation channels into gltf.animations
+  // (an array of THREE.AnimationClip); we keep only the names, deduped and in
+  // authored order, since the editor authors clip SELECTION, not playback. A
+  // static model yields [] here, which is what flags it as non-animated.
+  const clipNames = [];
+  if (Array.isArray(gltf.animations)) {
+    for (const clip of gltf.animations) {
+      const nm = clip && clip.name ? String(clip.name) : '';
+      if (nm && !clipNames.includes(nm)) clipNames.push(nm);
+    }
+  }
+  modelAnimations.set(modelName, clipNames);
+
+  // FREEZE any rig to its bind pose. The editor is a STATIC placement tool: it
+  // never poses the armature (no AnimationMixer, and template.clone() wouldn't
+  // rebind a skeleton anyway). But a SkinnedMesh still gets GPU-skinned by
+  // whatever material draws it - and three's built-in MeshBasicMaterial (the
+  // editor's default shading) auto-injects the skinning chunks, so it skinned
+  // testnpc against an unposed/unbound skeleton and COLLAPSED it in the
+  // viewport. The PS1 preview shader has no skinning code, so it drew the raw
+  // bind-pose geometry - which is why "PS1 view" looked right and the default
+  // editor view didn't (and why in-game, with real CPU skinning, is fine too).
+  //
+  // Fix: swap every SkinnedMesh for a plain Mesh sharing its geometry (glTF
+  // stores vertices in bind pose), material and local transform. Both shading
+  // modes then render the identical rest pose - the same thing PS1 view already
+  // showed correctly - and clone(true) below only ever copies plain meshes.
+  const skinnedMeshes = [];
+  group.traverse((child) => { if (child.isSkinnedMesh) skinnedMeshes.push(child); });
+  for (const sm of skinnedMeshes) {
+    const frozen = new THREE.Mesh(sm.geometry, sm.material);
+    frozen.name = sm.name;
+    frozen.position.copy(sm.position);
+    frozen.quaternion.copy(sm.quaternion);
+    frozen.scale.copy(sm.scale);
+    frozen.visible = sm.visible;
+    frozen.renderOrder = sm.renderOrder;
+    const parent = sm.parent || group;
+    parent.add(frozen);
+    sm.removeFromParent();
+  }
+
   // Collect every material name the parsed model references. In glTF each
   // primitive has exactly ONE material and GLTFLoader makes one mesh per
   // primitive, so a multi-material Blender object arrives as several
@@ -1077,6 +1240,12 @@ export async function loadModelIntoStage(modelName, glbArrayBuffer, resolveByNam
 
   modelTemplates.set(modelName, group);
 
+  // Drop any cached collider bounds for this model: reloading a model
+  // (reopening the assets folder, or re-exporting the .glb mid-session)
+  // replaces the template, and stale bounds would draw collider boxes for
+  // the OLD geometry - a wrong preview being worse than none.
+  modelLocalBounds.delete(modelName);
+
   // Triangle count for the sidebar model list (QOL): computed once here
   // rather than per-render, since template geometry never changes after
   // load. Handles both indexed and non-indexed BufferGeometries.
@@ -1099,6 +1268,425 @@ export async function loadModelIntoStage(modelName, glbArrayBuffer, resolveByNam
  */
 export function getModelTriCount(modelName) {
   return modelTriCounts.has(modelName) ? modelTriCounts.get(modelName) : null;
+}
+
+/**
+ * Animation clip names carried by a loaded model's .glb, in authored order.
+ * Returns [] for a loaded-but-static model and [] for one not loaded this
+ * session (callers that need to tell those apart can pair this with
+ * hasAnimations / the model's presence in state.models). Display + authoring
+ * use only - the editor never plays these.
+ */
+export function getModelAnimations(modelName) {
+  return modelAnimations.has(modelName) ? modelAnimations.get(modelName) : [];
+}
+
+/**
+ * True if the model loaded this session and its .glb carried at least one
+ * animation clip. Drives the red "animated" marker in the instance tree and
+ * whether the Animation properties section shows for a selected instance.
+ */
+export function hasAnimations(modelName) {
+  const clips = modelAnimations.get(modelName);
+  return Array.isArray(clips) && clips.length > 0;
+}
+
+// ==========================================================================
+// Collider overlay - preview of the runtime's stageColliders[]
+// ==========================================================================
+//
+// Wireframe boxes showing exactly what main.c's build_stage_colliders() will
+// bake for every instance with Collide ticked. See COLLISION_ACTION_PLAN.md.
+//
+// WHY THIS DOESN'T USE Box3().setFromObject() - the single most important
+// thing in this section. setFromObject() fits a box around the ROTATED
+// GEOMETRY, which is TIGHTER than what the runtime produces. The runtime
+// takes the model's local AABB and rotates THAT, then refits - so at any
+// angle that isn't a multiple of 90 degrees, the runtime's box is fatter
+// (a 45-degree-rotated wall gets a collider ~41% wider than the wall).
+//
+// An overlay built on setFromObject() would therefore agree with the console
+// on every axis-aligned prop and quietly disagree on every rotated one -
+// which is the exact failure mode an overlay exists to prevent. So this
+// mirrors the runtime's math instead: local AABB -> transform by the
+// instance's basis -> refit, using the same absolute-value-weighted formula.
+//
+// The two live in different unit spaces (viewport units here, 20.12 with the
+// (x,-y,-z) flip on the console), but the flip is applied consistently to
+// both the model's vertices and its placement, so the SHAPE logic is
+// identical and only the numbers differ.
+const COLLIDER_OVERLAY_COLOR  = 0x4a9eda; // authored box - cool blue, distinct from every ENTITY_COLORS hue
+const COLLIDER_SELECTED_COLOR = 0xffd23c; // the box currently being edited
+const COLLIDER_DISABLED_COLOR = 0x6b7480; // authored but starting disabled - present, not solid
+const COLLIDER_AUTO_COLOR     = 0x2c5f80; // dimmer: DERIVED fallback, not authored data
+
+// Collision view is a THREE-STATE mode, not a toggle:
+//   OFF   - nothing drawn.
+//   ALL   - every collidable object's boxes, solid. The "is my whole stage
+//           blocked out correctly" view; occludes the scene, which is the
+//           point of it being a mode you switch into rather than an overlay
+//           you leave on.
+//   FOCUS - only the object you're working on, translucent, so you can see
+//           the geometry THROUGH the box you're fitting to it.
+export const COLLISION_VIEW_OFF = 0;
+export const COLLISION_VIEW_ALL = 1;
+export const COLLISION_VIEW_FOCUS = 2;
+
+let collisionViewMode = COLLISION_VIEW_OFF;
+
+let colliderOverlayGroup = null;
+
+// Selected-box mesh lookup, rebuilt every refresh. The gizmo attaches to
+// these, so they have to be findable by collider id after a rebuild.
+const colliderMeshes = new Map();
+
+// Which ids currently belong to collider meshes rather than instances -
+// objectChange consults this to route a drag to the right callback, since
+// both kinds share one currentTransformTarget.
+const colliderTargetIds = new Set();
+
+// A box scaled to exactly zero on an axis renders as nothing and cannot be
+// grabbed to fix itself. Floor the VISUAL scale so a flattened box stays
+// selectable; the authored size is untouched.
+const MIN_VISIBLE_BOX = 0.001;
+
+// Authored boxes are parented to their INSTANCE (so they inherit its
+// transform) rather than to colliderOverlayGroup, which means clearing the
+// group does not remove them. Tracked here so a rebuild can detach them from
+// wherever they ended up - a leak here shows as boxes multiplying every time
+// the panel re-renders, which is every keystroke.
+let colliderOverlayChildren = [];
+
+// Model-local, untransformed AABB per model name. Computed once per model
+// (the template never changes) and reused by every instance of it - the same
+// "bake once, not per frame" reasoning the runtime's collider table uses.
+const modelLocalBounds = new Map();
+
+function getModelLocalBounds(modelName) {
+  if (modelLocalBounds.has(modelName)) return modelLocalBounds.get(modelName);
+
+  const template = modelTemplates.get(modelName);
+  if (!template) return null;
+
+  // ONE BOX PER MESH, not one for the whole template. GLTFLoader creates a
+  // Mesh per glTF primitive, which is exactly the granularity
+  // py_convert_assets.py bakes collMin/collMax at - so iterating meshes here
+  // reproduces the console's collider set rather than approximating it.
+  //
+  // This is not a refinement, it is a correctness fix. house.glb is a
+  // building mesh plus a flat grass plane; one box around both made the
+  // house's collider the size of its lawn, extruded to the building's
+  // height, and the player couldn't get near the front door.
+  template.updateMatrixWorld(true);
+  const inverse = new THREE.Matrix4().copy(template.matrixWorld).invert();
+
+  const list = [];
+  template.traverse((child) => {
+    if (!child.isMesh || !child.geometry) return;
+
+    // Bounds in TEMPLATE-local space: take the mesh's own geometry box and
+    // push it through (mesh world matrix) then back out of the template's,
+    // so a mesh parented under a transformed node lands correctly.
+    child.geometry.computeBoundingBox();
+    const box = child.geometry.boundingBox;
+    if (!box || box.isEmpty()) return;
+
+    const toTemplate = new THREE.Matrix4().multiplyMatrices(inverse, child.matrixWorld);
+    const local = box.clone().applyMatrix4(toTemplate);
+
+    const centre = new THREE.Vector3();
+    const size = new THREE.Vector3();
+    local.getCenter(centre);
+    local.getSize(size);
+    // The glTF mesh name rides along with its bounds rather than being
+    // recovered by a second parallel traverse - two walks that must stay in
+    // lockstep is a bug waiting for someone to add a filter to one of them.
+    list.push({ name: child.name || null, centre, half: size.multiplyScalar(0.5) });
+  });
+
+  // A model with no drawable geometry bakes no bounds on the console either
+  // (build_stage_colliders counts it in SKIP), so agree with that rather
+  // than inventing a zero-size box.
+  const bounds = list.length > 0 ? list : null;
+  modelLocalBounds.set(modelName, bounds);
+  return bounds;
+}
+
+/**
+ * World-space collider boxes for one tracked model instance - one per
+ * primitive, matching what build_stage_colliders() bakes. Returns an array of
+ * { centre, half } in viewport units, or null if there are no bakeable bounds.
+ */
+function computeColliderBoxes(inst) {
+  const boundsList = getModelLocalBounds(inst.modelName);
+  if (!boundsList) return null;
+
+  inst.object3D.updateWorldMatrix(true, false);
+  const m = inst.object3D.matrixWorld.elements; // column-major
+
+  // Basis INCLUDING scale (the world matrix is T*R*S, and the runtime
+  // likewise scales before rotating - same composition order, so the same
+  // combined basis applies).
+  const b = [
+    [m[0], m[4], m[8]],
+    [m[1], m[5], m[9]],
+    [m[2], m[6], m[10]],
+  ];
+
+  // The instance basis is shared by every primitive, so it is built once
+  // above and only the per-primitive centre/half differ below - the same
+  // structure as the runtime's RotMatrix-outside-the-loop.
+  return boundsList.map(({ centre: c, half: h }) => ({
+    centre: new THREE.Vector3(
+      b[0][0] * c.x + b[0][1] * c.y + b[0][2] * c.z + m[12],
+      b[1][0] * c.x + b[1][1] * c.y + b[1][2] * c.z + m[13],
+      b[2][0] * c.x + b[2][1] * c.y + b[2][2] * c.z + m[14]
+    ),
+    // Transformed-AABB refit: each output extent is the input extents
+    // weighted by the ABSOLUTE values of that basis row. Math.abs also
+    // absorbs a negative (mirrored) scale, exactly as the runtime's explicit
+    // sign flip does - a mirrored prop gets the mirrored box, not an
+    // inverted one that fails every test.
+    half: new THREE.Vector3(
+      Math.abs(b[0][0]) * h.x + Math.abs(b[0][1]) * h.y + Math.abs(b[0][2]) * h.z,
+      Math.abs(b[1][0]) * h.x + Math.abs(b[1][1]) * h.y + Math.abs(b[1][2]) * h.z,
+      Math.abs(b[2][0]) * h.x + Math.abs(b[2][1]) * h.y + Math.abs(b[2][2]) * h.z
+    ),
+  }));
+}
+
+/**
+ * Rebuild the overlay from scratch for `collidableIds` (the ids app.js
+ * determines have Collide ticked - viewer.js has no access to editor state).
+ *
+ * Full rebuild rather than incremental diffing: a stage is tens of
+ * instances, the boxes are 12-line wireframes, and a rebuild is trivially
+ * correct where a diff has to track adds, removals, transform edits and flag
+ * flips separately. Cheap enough to call on every updateUI().
+ */
+/**
+ * One collision box: a filled unit cube plus its wireframe edges.
+ *
+ * Filled rather than wireframe-only because a wireframe box reads terribly
+ * against wireframe-ish level geometry - you cannot tell which lines belong
+ * to the collider. The fill also makes "is this box inside the wall or
+ * outside it" answerable at a glance.
+ *
+ * Opacity follows the VIEW MODE, not the box: ALL is solid (blocking out a
+ * whole stage), FOCUS is translucent (fitting one box to geometry you need to
+ * still see). Edges stay opaque in both so the box outline survives.
+ */
+function buildColliderMesh(size, { selected = false, disabled = false, derived = false } = {}) {
+  const color = derived   ? COLLIDER_AUTO_COLOR
+              : selected  ? COLLIDER_SELECTED_COLOR
+              : disabled  ? COLLIDER_DISABLED_COLOR
+              : COLLIDER_OVERLAY_COLOR;
+
+  const translucent = collisionViewMode === COLLISION_VIEW_FOCUS;
+
+  const geom = new THREE.BoxGeometry(1, 1, 1);
+  const mesh = new THREE.Mesh(geom, new THREE.MeshBasicMaterial({
+    color,
+    transparent: true,
+    // Even "solid" keeps a little transparency: a fully opaque box hides the
+    // geometry it is meant to be aligned with, which makes the ALL view
+    // useless for spotting a box that has drifted off its model.
+    opacity: translucent ? 0.22 : 0.55,
+    depthWrite: false,   // never let a collider occlude real geometry in the depth buffer
+    side: THREE.DoubleSide,
+  }));
+
+  const edges = new THREE.LineSegments(
+    new THREE.EdgesGeometry(geom),
+    new THREE.LineBasicMaterial({ color, depthTest: false })
+  );
+  edges.renderOrder = 999;
+  edges.raycast = () => {};
+  mesh.add(edges);
+
+  mesh.renderOrder = 998;
+  // Not click-selectable: picking is done from the tree. A collider swallowing
+  // viewport clicks would make the object underneath unselectable in exactly
+  // the situation where you most want it.
+  mesh.raycast = () => {};
+  return mesh;
+}
+
+export function refreshColliderOverlay(collidableIds, authoredByInstance, selectedColliderId, focusInstanceId) {
+  if (!colliderOverlayGroup) {
+    colliderOverlayGroup = new THREE.Group();
+    colliderOverlayGroup.name = 'ColliderOverlay';
+    colliderOverlayGroup.raycast = () => {};
+    stage.add(colliderOverlayGroup); // `stage` is this module's THREE.Scene, not the edited PS1 stage
+  }
+
+  // Dispose before clearing - Three does not free GPU buffers on removal,
+  // and this runs on every updateUI().
+  for (const child of colliderOverlayGroup.children) {
+    if (child.geometry) child.geometry.dispose();
+    if (child.material) child.material.dispose();
+  }
+  colliderOverlayGroup.clear();
+
+  // Authored boxes live under their instance, not under the group, so
+  // clear() above does not reach them.
+  for (const child of colliderOverlayChildren) {
+    if (child.parent) child.parent.remove(child);
+    if (child.geometry) child.geometry.dispose();
+    if (child.material) child.material.dispose();
+  }
+  colliderOverlayChildren = [];
+  colliderMeshes.clear();
+
+  colliderOverlayGroup.visible = collisionViewMode !== COLLISION_VIEW_OFF;
+  if (collisionViewMode === COLLISION_VIEW_OFF) {
+    // Nothing is drawn, so nothing can be dragged - drop the gizmo rather
+    // than leaving it floating over an invisible box.
+    if (currentTransformTarget && colliderTargetIds.has(currentTransformTarget)) {
+      transformControls.detach();
+      currentTransformTarget = null;
+    }
+    colliderTargetIds.clear();
+    return;
+  }
+
+  colliderTargetIds.clear();
+  const wanted = collidableIds instanceof Set ? collidableIds : new Set(collidableIds || []);
+
+  for (const [id, inst] of instances) {
+    if (inst.isEntity) continue;      // markers have no geometry to collide with
+    if (!wanted.has(id)) continue;    // Collide unticked
+
+    // FOCUS MODE shows only the object you are working on. `focusInstanceId`
+    // is resolved by app.js - selecting either an instance or one of its
+    // boxes focuses that instance, so picking a box out of the tree does not
+    // hide the thing it belongs to.
+    if (collisionViewMode === COLLISION_VIEW_FOCUS && id !== focusInstanceId) continue;
+
+    const authored = authoredByInstance ? authoredByInstance.get(id) : null;
+
+    if (authored && authored.length > 0) {
+      inst.object3D.updateWorldMatrix(true, false);
+      for (const box of authored) {
+        const selected = selectedColliderId === box.id;
+        const mesh = buildColliderMesh(box.size, {
+          selected,
+          disabled: box.enabled === false,
+          authored: true,
+        });
+
+        // UNIT GEOMETRY SCALED TO SIZE, not geometry built at size. That is
+        // what makes the transform gizmo work directly on a box: the gizmo
+        // writes position and scale, which map one-to-one onto the authored
+        // center and size. Baking the size into the geometry would leave
+        // scale meaning nothing and require a conversion on every drag.
+        mesh.position.set(box.center.x, box.center.y, box.center.z);
+        mesh.scale.set(
+          Math.max(box.size.x, MIN_VISIBLE_BOX),
+          Math.max(box.size.y, MIN_VISIBLE_BOX),
+          Math.max(box.size.z, MIN_VISIBLE_BOX)
+        );
+
+        inst.object3D.add(mesh);   // inherit the instance's transform
+        colliderOverlayChildren.push(mesh);
+        colliderMeshes.set(box.id, mesh);
+        colliderTargetIds.add(box.id);
+      }
+      continue;
+    }
+
+    // DERIVED FALLBACK. No authored boxes, so show what the runtime would
+    // compose - drawn in a dimmer tone and never gizmo-editable, because
+    // there is no authored data behind it to write a drag back into.
+    const boxes = computeColliderBoxes(inst);
+    if (!boxes) continue;
+
+    for (const box of boxes) {
+      const mesh = buildColliderMesh(null, { derived: true });
+      mesh.position.copy(box.centre);
+      mesh.scale.set(
+        Math.max(box.half.x * 2, MIN_VISIBLE_BOX),
+        Math.max(box.half.y * 2, MIN_VISIBLE_BOX),
+        Math.max(box.half.z * 2, MIN_VISIBLE_BOX)
+      );
+      colliderOverlayGroup.add(mesh);
+    }
+  }
+
+  // Re-attach the gizmo if the selected box still exists. The overlay is
+  // rebuilt from scratch on every re-render, so the mesh the gizmo was
+  // holding is gone by now - without this, a box loses its handles the
+  // instant anything triggers a UI refresh, including its own drag.
+  if (selectedColliderId != null && colliderMeshes.has(selectedColliderId)) {
+    transformControls.attach(colliderMeshes.get(selectedColliderId));
+    currentTransformTarget = selectedColliderId;
+  }
+}
+
+export function getModelMeshBounds(modelName) {
+  const boundsList = getModelLocalBounds(modelName);
+  if (!boundsList) return null;
+
+  return boundsList.map((b, i) => ({
+    name: b.name || `Box ${i + 1}`,
+    center: { x: b.centre.x, y: b.centre.y, z: b.centre.z },
+    // getModelLocalBounds stores HALF extents; Auto Box wants full size.
+    size: { x: b.half.x * 2, y: b.half.y * 2, z: b.half.z * 2 },
+  }));
+}
+
+/**
+ * Set the collision view mode (COLLISION_VIEW_OFF / _ALL / _FOCUS). The
+ * caller follows up with refreshColliderOverlay() to rebuild at the new mode.
+ */
+export function setCollisionViewMode(mode) {
+  collisionViewMode = mode;
+  if (colliderOverlayGroup) colliderOverlayGroup.visible = mode !== COLLISION_VIEW_OFF;
+  return collisionViewMode;
+}
+
+export function getCollisionViewMode() {
+  return collisionViewMode;
+}
+
+/**
+ * Attach the transform gizmo to a collision box.
+ *
+ * The box mesh is parented to its owning INSTANCE, so TransformControls
+ * operates in that instance's local space for free - which is exactly the
+ * space `center` and `size` are authored in. Dragging a box on a rotated
+ * building therefore moves it along the building's axes, not the world's,
+ * which is what "child of the instance" has to mean to be useful.
+ */
+export function selectCollider(colliderId) {
+  const mesh = colliderMeshes.get(colliderId);
+  if (!mesh) {
+    transformControls.detach();
+    currentTransformTarget = null;
+    return false;
+  }
+  transformControls.attach(mesh);
+  currentTransformTarget = colliderId;
+  return true;
+}
+
+/**
+ * Current transform of a collider mesh, in its instance's local space:
+ * position IS the authored center, scale IS the authored size. The unit-cube
+ * geometry is what makes that mapping direct rather than a conversion.
+ */
+export function getColliderTransform(colliderId) {
+  const mesh = colliderMeshes.get(colliderId);
+  if (!mesh) return null;
+  return {
+    center: { x: mesh.position.x, y: mesh.position.y, z: mesh.position.z },
+    size: { x: mesh.scale.x, y: mesh.scale.y, z: mesh.scale.z },
+  };
+}
+
+/** True if `id` is currently a collider mesh rather than an instance. */
+export function isColliderTarget(id) {
+  return colliderTargetIds.has(id);
 }
 
 /**
@@ -1229,6 +1817,7 @@ export function addInstance(id, modelName, initialTransform = {}, materialsMap =
 // Colors mirror stage_state.js's ENTITY_KINDS (CSS side). Keep in sync.
 const ENTITY_COLORS = {
   trigger: 0xff8c42,
+  postprocess: 0x5de0c8,
   spawn: 0x5dd06a,
   summon: 0xb06ee0,
   particle: 0xffd23c,
@@ -1315,6 +1904,52 @@ function buildEntityMeshes(group, kind, color, props) {
         new THREE.LineBasicMaterial({ color })
       );
       group.add(edges);
+      break;
+    }
+    case 'postprocess': {
+      // Same unit-cube-scaled-by-entity-scale shape as a trigger: the
+      // entity's own scale gizmo resizes the region, with no separate extent
+      // field to keep in sync.
+      //
+      // Tinted by the AUTHORED tint colour when Colour Tint is on, so a
+      // stage full of these reads at a glance - a green sickly volume and a
+      // red alarm volume should not look identical in the viewport. Falls
+      // back to the kind colour when tint is off (the volume may only be
+      // doing blur, ghost, or a palette shift, none of which have a colour).
+      const tint = (props && props.tintEnabled && props.tintColor)
+        ? parseLightColor(props.tintColor) : color;
+
+      const fill = new THREE.Mesh(
+        new THREE.BoxGeometry(1, 1, 1),
+        new THREE.MeshBasicMaterial({
+          color: tint, transparent: true, opacity: 0.10, side: THREE.DoubleSide, depthWrite: false,
+        })
+      );
+      fill.userData.noPick = true; // huge translucent volume - select via the edges
+      group.add(fill);
+
+      const edges = new THREE.LineSegments(
+        new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
+        new THREE.LineBasicMaterial({ color: tint })
+      );
+      group.add(edges);
+
+      // FALLOFF SHELL. The effect ramps in across this distance OUTSIDE the
+      // solid box, so the authored volume is where the effect is at FULL
+      // strength and the shell is where it fades. Drawn as a second, larger
+      // wireframe because otherwise falloff is an invisible number and
+      // authors consistently under-estimate how far an eased volume reaches.
+      if (props && props.transition !== 'hard') {
+        const f = Math.max(0, props.falloff || 0);
+        if (f > 0) {
+          const shell = new THREE.LineSegments(
+            new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
+            new THREE.LineBasicMaterial({ color: tint, transparent: true, opacity: 0.35 })
+          );
+          shell.name = 'postFxFalloffShell';
+          group.add(shell);
+        }
+      }
       break;
     }
     case 'spawn':
@@ -1581,6 +2216,38 @@ function applyEntityPropsToMeshes(inst) {
     }
   }
 
+  if (inst.kind === 'postprocess') {
+    const tint = (inst.props.tintEnabled && inst.props.tintColor)
+      ? parseLightColor(inst.props.tintColor) : ENTITY_COLORS.postprocess;
+
+    // Live recolour, so editing the tint swatch is visible immediately
+    // rather than after a reload.
+    inst.object3D.traverse((child) => {
+      if (child.material && child.material.color) child.material.color.setHex(tint);
+    });
+
+    // FALLOFF SHELL SIZING. The shell is a child of the entity group, so it
+    // inherits the entity's scale - but falloff is authored in WORLD units.
+    // Dividing through by the entity scale is what keeps the shell a
+    // constant real-world distance outside the box regardless of how the
+    // volume itself has been stretched. Without this, widening a volume
+    // would appear to widen its falloff too, which it does not.
+    const shell = inst.object3D.getObjectByName('postFxFalloffShell');
+    if (shell) {
+      const eased = inst.props.transition !== 'hard';
+      const f = Math.max(0, inst.props.falloff || 0);
+      const s = inst.object3D.scale;
+      shell.visible = eased && f > 0;
+      if (shell.visible) {
+        shell.scale.set(
+          1 + (2 * f) / Math.max(Math.abs(s.x), 0.0001),
+          1 + (2 * f) / Math.max(Math.abs(s.y), 0.0001),
+          1 + (2 * f) / Math.max(Math.abs(s.z), 0.0001)
+        );
+      }
+    }
+  }
+
   if (inst.kind === 'light') {
     const type = inst.props.lightType || 'spherical';
     const range = Math.max(0, inst.props.range || 0);
@@ -1735,6 +2402,16 @@ export function onTransformModeChange(callback) {
   transformModeCallback = callback;
 }
 
+// Fired while a collision box is dragged, with (colliderId, { center, size }).
+// Separate from onTransformChange because a box has no pos/rot/scale to
+// report - center and size are its whole transform, and they live on a
+// different state object entirely.
+let colliderChangeCallback = null;
+
+export function onColliderChange(callback) {
+  colliderChangeCallback = callback;
+}
+
 export function setTransformMode(mode) {
   transformControls.setMode(mode);
   if (transformModeCallback) transformModeCallback(mode);
@@ -1775,6 +2452,13 @@ export function setInstanceTransform(id, transform) {
     if (transform.scale.x !== undefined) obj.scale.x = transform.scale.x;
     if (transform.scale.y !== undefined) obj.scale.y = transform.scale.y;
     if (transform.scale.z !== undefined) obj.scale.z = transform.scale.z;
+
+    // A post-process volume's falloff shell is sized RELATIVE to the
+    // entity's own scale (falloff is a world distance, the shell is a
+    // child), so resizing the volume has to re-derive it. Without this the
+    // shell stretches with the box and stops representing the real falloff
+    // the moment anyone drags a scale handle.
+    if (inst.isEntity && inst.kind === 'postprocess') applyEntityPropsToMeshes(inst);
   }
 }
 
@@ -1946,6 +2630,7 @@ const PS1_LIT_VERT = /* glsl */ `
   varying vec2 vUv;
   varying vec3 vWorldNormal;
   varying vec3 vWorldPos;
+  varying float vViewDepth;
 
   void main() {
     vUv = uv;
@@ -1954,7 +2639,18 @@ const PS1_LIT_VERT = /* glsl */ `
     // match the runtime, which ignores it too (semantics doc 5.7).
     vWorldNormal = mat3(modelMatrix) * normal;
     vWorldPos = (modelMatrix * vec4(position, 1.0)).xyz;
-    gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+
+    vec4 viewPos = modelViewMatrix * vec4(position, 1.0);
+    // The runtime's fog depth is SZ - the CAMERA-SPACE Z the GTE projected,
+    // i.e. distance along the view axis, NOT radial distance from the eye.
+    // Negated because view space looks down -Z. Interpolating this per
+    // fragment is a deliberate upgrade on the console's per-vertex IR0: it
+    // shows the ramp the author is authoring rather than that ramp's
+    // Gouraud approximation across whatever tessellation the model happens
+    // to have.
+    vViewDepth = -viewPos.z;
+
+    gl_Position = projectionMatrix * viewPos;
   }
 `;
 
@@ -1969,9 +2665,21 @@ const PS1_LIT_FRAG = /* glsl */ `
   uniform vec3 psSphPos[${PS1_MAX_PREVIEW_SPHERES}];    // spherical: world position
   uniform vec3 psSphColor[${PS1_MAX_PREVIEW_SPHERES}];  // spherical: colour * intensity
   uniform float psSphRange[${PS1_MAX_PREVIEW_SPHERES}]; // spherical: range, 0 == infinite
+  uniform float uFogEnabled;    // fog_enabled, 0/1
+  uniform float uFogCull;       // fog_cull_enabled, 0/1
+  uniform float uFogNear;       // fog_near, viewport units
+  uniform float uFogFar;        // fog_far AFTER drift widening
+  uniform float uFogCullFar;    // fog_far as authored (cull + quads read this)
+  uniform vec3 uFogColor;       // FOG_COL_R/G/B, 0..1
+  uniform vec3 uFogGradTop;     // fog colour + FOG_GRAD_TOP, clamped
+  uniform vec3 uFogGradBottom;  // fog colour + FOG_GRAD_BOTTOM, clamped
+  uniform float uFogLayerZ[${PS1_MAX_FOG_LAYERS}]; // quad depths, viewport units
+  uniform float uFogLayerCount;
+  uniform float uFogViewportH;
   varying vec2 vUv;
   varying vec3 vWorldNormal;
   varying vec3 vWorldPos;
+  varying float vViewDepth;
 
   void main() {
     vec4 texel = texture2D(map, vUv);
@@ -2003,7 +2711,59 @@ const PS1_LIT_FRAG = /* glsl */ `
 
     lit = min(lit, vec3(1.0));
 
-    gl_FragColor = vec4(baseColor * texel.rgb * lit * texFactor, 1.0);
+    if (uFogEnabled > 0.5) {
+      float z = max(vViewDepth, 1e-4);
+
+      // FOG CULL, previewed as a discard. main.c rejects these triangles
+      // outright (per triangle, in draw_object_into_ot) - whether that pops
+      // depends on how close the quads got this stage's textures to the fog
+      // colour, which is exactly the thing that has to be eyeballed.
+      // Reads the AUTHORED far, not the drifted one, like the runtime.
+      if (uFogCull > 0.5 && z > uFogCullFar) discard;
+
+      // THE GTE DEPTH CUE. IR0 ramps linearly in 1/z from 0 at Near to 4096
+      // at Far, so this is a reciprocal ramp, not a linear one - fog
+      // thickens fastest just past Near.
+      float invNear = 1.0 / max(uFogNear, 1e-4);
+      float invFar = 1.0 / max(uFogFar, 1e-4);
+      float denom = invNear - invFar;
+      float f = denom > 1e-9 ? clamp((invNear - 1.0 / z) / denom, 0.0, 1.0) : 0.0;
+
+      // gte_dpcs: interpolate the LIT VERTEX COLOUR toward the far colour.
+      // Applied to the lit term (before texture modulation) rather than to
+      // the final pixel ON PURPOSE - that ordering is what makes a fully
+      // depth-cued TEXTURED surface come out as its raw texel at the
+      // neutral #808080 fog colour (texel * 128/255 * 255/128), which is
+      // the hardware behaviour main.c documents at fog_cull_enabled.
+      lit = mix(lit, uFogColor, f);
+    }
+
+    vec3 rgb = baseColor * texel.rgb * lit * texFactor;
+
+    if (uFogEnabled > 0.5) {
+      // THE LAYERED OT QUADS - the half of the fog that makes TEXTURED
+      // geometry actually converge. The OT is walked back-to-front, so a
+      // fragment is painted over by every quad NEARER than it; k quads deep
+      // is a 50/50 blend applied k times == 1 - 0.5^k of the way to the fog
+      // colour. Quad depths use the authored far (drift moves the ramp, not
+      // the quads - matching draw_fog_layers, which reads fog_far raw).
+      float z = max(vViewDepth, 1e-4);
+      float k = 0.0;
+      for (int i = 0; i < ${PS1_MAX_FOG_LAYERS}; i++) {
+        if (float(i) >= uFogLayerCount) break;
+        if (uFogLayerZ[i] < z) k += 1.0;
+      }
+      if (k > 0.0) {
+        // Vertical Gouraud gradient across each quad: thinner toward the
+        // skyline, denser pooling low. gl_FragCoord.y is 0 at the BOTTOM of
+        // the drawing buffer, so t=0 picks the dense shade.
+        float t = clamp(gl_FragCoord.y / max(uFogViewportH, 1.0), 0.0, 1.0);
+        vec3 quadColor = mix(uFogGradBottom, uFogGradTop, t);
+        rgb = mix(rgb, quadColor, 1.0 - pow(0.5, k));
+      }
+    }
+
+    gl_FragColor = vec4(rgb, 1.0);
     #include <colorspace_fragment>
   }
 `;
@@ -2041,6 +2801,9 @@ function buildPS1LitMaterial(srcColor, map, alphaTest, side) {
       psSphPos: ps1LightUniforms.psSphPos,
       psSphColor: ps1LightUniforms.psSphColor,
       psSphRange: ps1LightUniforms.psSphRange,
+      // Fog: same shared-object trick as the lights - referenced, not
+      // cloned, so refreshFogUniforms() updates every material at once.
+      ...ps1FogUniforms,
     },
   });
   // Bookkeeping mirrors of the Basic material's properties, so palette-row
@@ -2189,12 +2952,145 @@ export function setPS1LightingEnabled(enabled) {
   }
 
   if (next) updatePS1LightsFromEntities();
+
+  // Fog rides the shading toggle: leaving PS1 mode has to put the editor's
+  // background back, or the viewport stays fog-grey with nothing fogging it.
+  applyFogBackground();
+
   return ps1LightingEnabled;
 }
 
 /** Whether the PS1 lighting parity preview is currently active. */
 export function isPS1LightingEnabled() {
   return ps1LightingEnabled;
+}
+
+/**
+ * Hand the stage's authored fog block to the preview. Called by app.js on
+ * every fog edit and on the project-load / undo resync path. Stores it
+ * verbatim; refreshFogUniforms() (per frame) does the derivation, so drift
+ * animates without app.js re-pushing anything.
+ */
+export function setStageFog(fog) {
+  stageFog = fog ? { ...fog } : null;
+  applyFogBackground();
+}
+
+/** Parse '#rrggbb' into a THREE.Color, tolerating a half-typed value the
+ *  same way the exporter's hexToRgb does (fall back rather than throw). */
+const _fogColor = new THREE.Color();
+function parseFogColor(hex) {
+  if (typeof hex === 'string' && /^#[0-9a-fA-F]{6}$/.test(hex)) return _fogColor.set(hex);
+  return _fogColor.setRGB(0.5, 0.5, 0.5);
+}
+
+/**
+ * THE CLEAR COLOUR IS THE FOG COLOUR, and this is not cosmetic. main.c
+ * derives its screen clear colour from FOG_COL_* precisely so that geometry
+ * fading toward the fog colour does not fade against a background of a
+ * DIFFERENT colour - the failure mode that reads instantly as a broken
+ * renderer, and the actual bug the first fog cut shipped with. A viewport
+ * that fogged geometry against the editor's near-black background would
+ * misrepresent the result badly enough to be worse than no preview.
+ *
+ * Applied only while the PS1 preview is showing fog; the editor's own
+ * background comes back otherwise.
+ */
+// Owned outright and mutated in place - assigning a fresh THREE.Color every
+// frame would be a per-frame allocation for a value that rarely changes.
+const _backgroundColor = new THREE.Color(EDITOR_BACKGROUND);
+
+function applyFogBackground() {
+  if (!stage) return;
+  const showFog = ps1LightingEnabled && stageFog && stageFog.enabled;
+  if (showFog) _backgroundColor.copy(parseFogColor(stageFog.color));
+  else _backgroundColor.setHex(EDITOR_BACKGROUND);
+  stage.background = _backgroundColor;
+}
+
+/**
+ * Re-derive every fog uniform from the authored block. Runs once per frame
+ * (like updatePS1LightsFromEntities) rather than event-driven, because drift
+ * is time-varying and because it makes a scrubbed Near/Far update the
+ * viewport live with no plumbing through app.js.
+ */
+function refreshFogUniforms(dtSeconds) {
+  const on = !!(ps1LightingEnabled && stageFog && stageFog.enabled);
+  ps1FogUniforms.uFogEnabled.value = on ? 1 : 0;
+
+  // Re-asserted per frame rather than only on change: it makes the clear
+  // colour correct regardless of what order app.js happens to call
+  // initViewer / setStageFog / setPS1LightingEnabled in, and it costs a hex
+  // compare on a colour object we already own.
+  applyFogBackground();
+
+  if (!on) return;
+
+  const near = Math.max(1e-4, stageFog.near || 0);
+  const authoredFar = Math.max(near + 1e-4, stageFog.far || 0);
+
+  // DENSITY DRIFT. main.c widens the span by up to
+  // (span/64) * ((wave * FOG_DRIFT_AMOUNT) >> 12) >> 7, which reduces to
+  // span * 384/(4096*64*128/8192)... i.e. ~9.4% of span at the peak. It is
+  // ONE-SIDED - only ever outward - and that is a safety property, not an
+  // aesthetic one: widening the span can only REDUCE |DQA|, so drift can
+  // never walk a rail-safe range into a railed one behind the author's back.
+  let far = authoredFar;
+  if (stageFog.drift) {
+    fogDriftPhase = (fogDriftPhase + dtSeconds / FOG_DRIFT_PERIOD_SECONDS) % 1;
+    const wave01 = (Math.sin(fogDriftPhase * Math.PI * 2) + 1) * 0.5; // 0..1
+    far = authoredFar + (authoredFar - near) * 0.09375 * wave01;
+    // FOG_FAR_MAX in viewport units. Drift must respect the same ceiling the
+    // panel's clamp enforces, or a stage authored right at the limit would
+    // breathe straight past it.
+    far = Math.min(far, 32000 / 1024);
+  } else {
+    fogDriftPhase = 0;
+  }
+
+  ps1FogUniforms.uFogNear.value = near;
+  ps1FogUniforms.uFogFar.value = far;
+  ps1FogUniforms.uFogCullFar.value = authoredFar;
+  ps1FogUniforms.uFogCull.value = stageFog.cull ? 1 : 0;
+
+  const col = parseFogColor(stageFog.color);
+  ps1FogUniforms.uFogColor.value.copy(col);
+
+  // Quad gradient endpoints: FOG_GRAD_TOP/BOTTOM are signed 0-255 offsets in
+  // main.c, clamped after adding. Same arithmetic here, in 0..1.
+  const gradTop = -10 / 255;
+  const gradBottom = 10 / 255;
+  ps1FogUniforms.uFogGradTop.value.setRGB(
+    Math.min(1, Math.max(0, col.r + gradTop)),
+    Math.min(1, Math.max(0, col.g + gradTop)),
+    Math.min(1, Math.max(0, col.b + gradTop))
+  );
+  ps1FogUniforms.uFogGradBottom.value.setRGB(
+    Math.min(1, Math.max(0, col.r + gradBottom)),
+    Math.min(1, Math.max(0, col.g + gradBottom)),
+    Math.min(1, Math.max(0, col.b + gradBottom))
+  );
+
+  // Quad depths: near + (far-near)*sqrt((i+1)/(L+1)), the far-biased spacing
+  // draw_fog_layers() uses. It spaces evenly in fog OPACITY rather than in
+  // depth, which lands every quad where geometry still differs most from the
+  // fog - evenly-spaced-in-depth quads put their sharpest transition where
+  // the scene is least fogged, and that one reads as a wall of fog hanging
+  // in mid-air. Uses the AUTHORED far, like the runtime.
+  const layers = Math.max(0, Math.min(PS1_MAX_FOG_LAYERS, Math.round(stageFog.layers ?? 3)));
+  ps1FogUniforms.uFogLayerCount.value = layers;
+  for (let i = 0; i < PS1_MAX_FOG_LAYERS; i++) {
+    if (i >= layers) {
+      ps1FogUniforms.uFogLayerZ.value[i] = 0;
+      continue;
+    }
+    const t = Math.sqrt((i + 1) / (layers + 1));
+    ps1FogUniforms.uFogLayerZ.value[i] = near + (authoredFar - near) * t;
+  }
+
+  if (renderer) {
+    ps1FogUniforms.uFogViewportH.value = renderer.getContext().drawingBufferHeight || 1;
+  }
 }
 
 /** Recolour every missing-texture material on one instance to match the

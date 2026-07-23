@@ -69,6 +69,11 @@
 #include "sfx.h"
 #include "music.h"
 
+// Skeletal animation runtime (animation.c). Consumes the per-model rig data
+// (MODEL_DEF.bones/.vertSkin/.clips) baked by py_convert_assets.py and skins a
+// posed vertex buffer that the normal draw path projects. See animation.h.
+#include "animation.h"
+
 
 // Every discovered assets/object/<name>/<name>.obj, baked in unconditionally.
 // Defines MODEL_TRI/MODEL_DEF (via model_common.h), each <name>_model*
@@ -278,9 +283,29 @@ void update_frame_time(void)
 // apart, geometry fades to one shade against a background of another and
 // the whole effect collapses. Declared this early only because init() needs
 // it; the fog system itself is documented further down, at fog_enabled.
+//
+// THESE ARE NOW THE DEFAULT, not the live value. Fog colour is stage-
+// authored (STAGE_FOG.r/g/b, set by load_stage_fog()), so the three
+// consumers above read the g_fog_col_* GLOBALS below rather than these
+// defines directly. The defines survive as the seed for those globals and
+// as the fallback when no stage loads (stageRegistryCount == 0) - so a build
+// with an empty assets/stage/ looks exactly as it did before fog was
+// authorable. 128 specifically is the neutral multiplier for PS1 texture
+// modulation (texel * tint / 128); see the fog_cull_enabled block for why
+// that matters and why moving off it changes how textured geometry fogs.
 #define FOG_COL_R 128
 #define FOG_COL_G 128
 #define FOG_COL_B 128
+
+// Live fog colour. Seeded from the defaults above (so init()'s clear colour
+// is correct before the first stage loads) and overwritten per stage by
+// load_stage_fog(), which also repaints the screen clear colour to match.
+// The single source setup_frame_fog(), draw_fog_layers() and the clear
+// colour all read - keeping them from ever drifting apart at runtime the way
+// the compile-time constant kept them from drifting before.
+unsigned char g_fog_col_r = FOG_COL_R;
+unsigned char g_fog_col_g = FOG_COL_G;
+unsigned char g_fog_col_b = FOG_COL_B;
 
 
 
@@ -382,6 +407,61 @@ int fov_speed = 10;
 // nearby triangles land in too few buckets.
 #define OT_Z_SHIFT 2
 
+
+// ==================== NEAR-PLANE / SCREEN CULL TUNING =====================
+// The knobs that decide how much geometry near the camera or near a screen
+// edge survives. All were hardcoded magic numbers scattered across two
+// functions; they are gathered here because they trade off against each
+// other and tuning one in isolation is what produced the aggressive feel.
+//
+// ---- THE CORE TRADE-OFF ----
+// The GTE's perspective divide computes H/SZ, where H is the projection
+// distance pushed by gte_SetGeomScreen (FOCAL_LENGTH + fov, so 512 by
+// default). As SZ shrinks toward the camera that quotient grows, and past a
+// point the divide SATURATES: the vertex comes back with a wildly wrong
+// screen position, which draws as a hugely stretched triangle with smeared
+// texture. NEAR_CLIP_SZ exists to reject those before they are drawn.
+//
+// So the two failure modes pull in opposite directions:
+//   TOO HIGH -> triangles vanish while still clearly in shot. Whole road
+//               quads pop out as you approach them.
+//   TOO LOW  -> triangles survive with an overflowed projection and draw
+//               as stretched, warped, smeared geometry.
+//
+// NEITHER IS "SOLVED" BY THIS CONSTANT. The real fix is near-plane
+// CLIPPING - splitting a triangle that straddles the plane so no vertex is
+// ever in the unsafe zone - which is a much larger change. This is the
+// tuning knob until that exists.
+//
+// 64 was the original value and is well below the safe divide depth (see
+// NEAR_WARP_SZ), which means the build has been drawing overflowed vertices
+// for its whole life. That is a strong candidate for the "aggressive texture
+// warping" long geometry shows. Lower this for less popping and more
+// warping; raise it for the reverse.
+#define NEAR_CLIP_SZ  48
+
+// Depth below which the perspective divide is at risk of saturating, derived
+// from H rather than guessed. NOT a cull - purely a DIAGNOSTIC: triangles
+// below it are still drawn, and counted into nearWarpTriCount for the debug
+// overlay's NEARWARP readout.
+//
+// Point the camera at a road and watch that number. If it climbs while the
+// warping is visible, the warping is projection overflow and NEAR_CLIP_SZ
+// wants raising (or the geometry wants near-plane clipping). If it stays at
+// zero, the warping is ordinary PS1 affine texture mapping instead, and the
+// fix is to SUBDIVIDE the road mesh - more, smaller quads - because affine
+// mapping interpolates UVs linearly in screen space and the error grows with
+// how much depth a single polygon spans. No renderer constant can fix that
+// one; it is what per-polygon texture mapping without perspective correction
+// does, and it is why PS1-era roads are always heavily tessellated.
+#define NEAR_WARP_SZ  ((FOCAL_LENGTH + fov) / 2)
+
+// Flat safety margin (pixels) added to an object's approximate on-screen
+// radius before the screen-bounds test rejects it. Under-culling wastes a
+// little transform work; over-culling is a visible pop, so this is
+// deliberately generous.
+#define CULL_SCREEN_MARGIN 32
+
 // Upper bound on triangles insertable into the OT in a single frame,
 // across every visible object. primBytesRemaining enforces this as a
 // hard runtime cap - an over-budget stage drops triangles (reported via
@@ -401,6 +481,12 @@ int db;
 // can still be walking last frame's OT (DrawOTag()) while the CPU fills
 // the OTHER buffer's OT for the next frame.
 static uint32_t ot[2][OT_LEN];
+
+// Mask-bit-set packet (GP0 E6, pbw=1), inserted at the HEAD of every frame's
+// command stream in main() - double-buffered like the OT it rides in. This
+// is what makes the post-fx framebuffer feedback actually BLEND: see the
+// comment at its insertion point in main().
+static DR_STP maskSetPrim[2];
 
 // Primitive packet storage backing the OT above. ClearOTagR()/addPrim()
 // only manage the ot[] linked-list structure - the actual POLY_F3/POLY_G3/
@@ -527,14 +613,192 @@ static int player_move_frac_z = 0;
 static int player_cam_yaw = 0;            // 12-bit follow-cam yaw, orbited via L1/R1 in PLAY
 static int player_cam_pitch = 128;        // follow-cam view pitch, nudged by L2/R2 in PLAY
 
-#define PLAYER_GROUND_Y     0             // the flat plane the player is confined to (no gravity)
-#define PLAYER_MOVE_SPEED   14            // world units/frame at full D-pad deflection
+// "No particular spawn requested" - resolve to the stage's lowest spawnId.
+// What boot and any non-door caller passes; a trigger arriving from another
+// stage passes a real id instead.
+#define SPAWN_ID_DEFAULT    (-1)
+
+#define PLAYER_GROUND_Y     0             // DEFAULT flat plane height (see player_ground_y)
+
+// The flat plane the player is actually confined to this stage. Seeded to
+// PLAYER_GROUND_Y and then set from the authored spawn point's height by
+// load_stage_spawn_at(), so a Spawn placed on top of a platform puts the player
+// on that platform rather than at world zero underneath it.
+//
+// This exists because the player has NO GRAVITY and NO COLLISION yet: vy is
+// re-pinned every frame in update_play(). Without making the pin height
+// stage-authored, spawning at a raised Spawn would visibly "work" for
+// exactly one frame and then drop the player to y=0. When real ground
+// collision lands, this becomes the fallback plane rather than the rule.
+static int player_ground_y = PLAYER_GROUND_Y;
+#define PLAYER_MOVE_SPEED   28            // world units/frame at full D-pad deflection
+
+// ---- Player collision volume ----
+// DELIBERATELY NOT DERIVED FROM THE PLAYER MODEL. The mesh is currently a
+// scaled-down debug arrow (assets/object/player/player.glb is a copy of
+// arrow.glb); its bbox is long, thin, pointed and asymmetric about its
+// origin, which is not how a character should feel against a wall. Swapping
+// in real art must not silently change how the player collides, so the
+// volume is authored here rather than measured from geometry.
+//
+// draw_player() still uses the MODEL's bsphereRadius for render culling -
+// that is a question about the mesh, and gets the mesh's answer. Collision
+// asks a different question and gets its own.
+//
+// A vertical cylinder: a circle in XZ extruded over the player's height.
+// A round footprint slides along walls and around corners where a box would
+// snag its corners, and circle-vs-box needs no sqrt in the common case.
+//
+// HARDCODED, not authored per stage. The player's size is a property of the
+// GAME, not of any one stage - shipping it in stage.json would mean the
+// player can change size walking through a door. See COLLISION_ACTION_PLAN.md.
+#define PLAYER_RADIUS       350           // world units (20.12); ~0.34 authoring units
+#define PLAYER_HEIGHT      1600           // feet -> head. RENDERER Y DECREASES UPWARD,
+                                          // so the head is at player_pos.vy - PLAYER_HEIGHT.
+
+// Colliders whose top surface is no higher than the player's feet + this are
+// IGNORED for wall purposes. This is what makes walls-only collision
+// shippable before gravity exists, and it is not optional: the ground plane
+// is a stage object like any other, `plane` bakes a ZERO-thickness bbox
+// (bboxMin.vy == bboxMax.vy == 0, verified in generated/plane.c), and
+// build_stage_colliders() clamps that to a 1-unit half-extent sitting exactly
+// where the player stands. Without this test the floor is a wall and the
+// player gets shoved sideways off the world on the first frame.
+//
+// Conceptually it is "things you stand ON, not things you walk INTO" - floors,
+// kerbs, low steps. With vy pinned to player_ground_y there is no other
+// mechanism that could tell those apart. When gravity lands, this constant
+// becomes the real step-up height and this test becomes the ground query.
+#define PLAYER_STEP_HEIGHT  400
 #define PLAYER_CAM_DIST     2200          // how far BEHIND the player the follow-cam sits
 #define PLAYER_CAM_HEIGHT   900           // how far ABOVE the player the follow-cam sits
 #define PLAYER_CAM_YAW_SPEED 22           // follow-cam yaw units/frame while L1/R1 held (orbit)
 #define PLAYER_CAM_PITCH_SPEED 12         // follow-cam pitch units/frame while L2/R2 held
 #define PLAYER_CAM_PITCH_MIN (-300)       // clamp so the view can't flip past straight up
 #define PLAYER_CAM_PITCH_MAX 700          // clamp so the view can't flip past straight down
+
+
+// ------------------------------------------------------------
+// STAGE TRANSITION (fade out -> load -> fade in)
+// ------------------------------------------------------------
+// A scene switch is three phases: darken the screen, do the (blocking) load
+// while nothing is visible, then bring it back. The load is deliberately
+// hidden rather than made asynchronous - a CD-backed stage load is hundreds
+// of milliseconds and no amount of engineering makes that invisible, so the
+// honest answer is to cover it.
+//
+// THE HITCH IS ALREADY SAFE. update_frame_time() clamps elapsed to 16
+// vblanks, so the frame that finishes a long load advances the simulation by
+// at most 16 ticks instead of the hundreds that actually passed. That clamp
+// was written for CD seeks; it is exactly what makes a blocking stage load
+// survivable here, with no extra work.
+//
+// HOW THE FADE ITSELF WORKS - this is a genuine full-screen post-process,
+// not a trick. The PS1 GPU has four semi-transparency rates; abr=2 is
+// SUBTRACTIVE (dest = dest - src). A full-screen quad in that mode with
+// colour L subtracts L from every channel of the finished framebuffer -
+// geometry, textures, and the background clear alike, because the clear
+// happens first. Ramping L 0..255 therefore reduces the whole image's
+// brightness to zero. One POLY_F4 + one DR_TPAGE per frame, no passes, no
+// render targets. See draw_transition_fade(), far below.
+//
+// WHY SUBTRACTIVE AND NOT A BLEND-TO-BLACK. The PS1 cannot do a
+// multiplicative dim (dest * k) in one pass. abr=0 against black gives
+// exactly half brightness, and stacking N of those gives 1/2^N - genuinely
+// multiplicative, but quantised to 100/50/25/12.5%, far too coarse to ramp
+// smoothly. Subtractive gives 256 monotonic steps for one primitive. The
+// trade is that it is a linear offset, so shadows crush to black before
+// highlights do; that slightly contrasty falloff is what most PS1 fades
+// looked like, and it reaches true zero at L=255.
+//
+// The quad goes into OT BUCKET 0 - the nearest bucket, walked LAST - so it
+// covers everything the frame drew. It does NOT cover the debug overlay,
+// which FntFlush() paints after DrawOTag() in main(); that is deliberate,
+// since the overlay is exactly what you want readable while diagnosing a
+// transition that went wrong.
+//
+// DECLARED THIS EARLY because load_stage_at() and the transition driver both
+// live well above the fog block these globals originally sat beside. C has
+// no forward declaration for a variable you intend to define later in the
+// same translation unit, so state used by functions this high up has to be
+// declared this high up.
+enum
+{
+    TRANSITION_NONE = 0, // no switch in flight
+    TRANSITION_OUT,      // darkening; input frozen
+    TRANSITION_LOAD,     // fully dark - the blocking load happens on this frame
+    TRANSITION_IN        // brightening back up; input still frozen
+};
+
+static int transition_state = TRANSITION_NONE;
+
+// 0 = untouched image, 255 = fully black. Also the quad's subtract amount.
+static int transition_level = 0;
+
+// Where the in-flight switch is going. spawn -1 means "use the stage's
+// lowest spawnId", the same default a fresh boot gets.
+static unsigned int transition_target_stage = 0;
+static int transition_target_spawn = -1;
+
+// Level units per 60Hz tick. 16 gives ~16 ticks (~0.27s at 60Hz) each way -
+// long enough to read as deliberate, short enough not to feel like a load
+// screen on a switch that is actually fast. Delta-timed, so the fade takes
+// the same wall-clock time at 50Hz and 60Hz.
+#define TRANSITION_FADE_SPEED 16
+
+
+// ------------------------------------------------------------
+// Trigger volume state (the test itself lives with update_triggers(), far
+// below - only the latch table and the point test are up here, because
+// load_stage_at() needs both to arm triggers the player spawns inside).
+// ------------------------------------------------------------
+
+// Per-trigger "already fired" latch for the ACTIVE stage. Indexed 1:1 with
+// stageRegistry[activeStageIndex].triggers, cleared by load_stage_at().
+//
+// This is what makes `once` mean once, and it also solves the subtler
+// problem a re-firing trigger has: without an inside/outside memory, a
+// volume the player is merely STANDING in fires again every single frame.
+// So the latch really means "I am currently inside this volume", and `once`
+// decides whether leaving it clears the latch.
+#define MAX_STAGE_TRIGGERS 32
+static unsigned char triggerFired[MAX_STAGE_TRIGGERS];
+
+// Triggers whose targetStage name didn't resolve against stageRegistry[] -
+// surfaced on the debug overlay, same self-diagnosing treatment unresolved
+// model names and sound samples get.
+static unsigned int triggerUnresolvedCount = 0;
+
+// Edge detector, defined down with the input handlers it was written for.
+// Forward-declared here because update_triggers() (well above them) needs it
+// for the CROSS interact check.
+static int edge_pressed(unsigned short raw, unsigned short mask);
+
+// Set by update_triggers() every PLAY frame: 1 while the player is standing
+// inside an armed trigger that is waiting on a CROSS press.
+//
+// THIS IS THE HOOK FOR A "PRESS X" PROMPT, and something does need to read
+// it eventually. An interact volume is invisible - unlike a walk-in trigger,
+// which announces itself by firing, one waiting on a button press looks
+// exactly like empty floor. Nothing renders this yet; it is published here
+// so the prompt, whatever form it takes, has a single flag to key on rather
+// than re-deriving the test.
+static int player_can_interact = 0;
+
+/** Axis-aligned point-in-box test, centre +/- halfExtent per axis. */
+static int point_in_trigger(const VECTOR *p, const STAGE_TRIGGER *tr)
+{
+    int dx = p->vx - tr->pos.vx; if (dx < 0) dx = -dx;
+    if (dx > tr->halfExtent.vx) return 0;
+
+    int dy = p->vy - tr->pos.vy; if (dy < 0) dy = -dy;
+    if (dy > tr->halfExtent.vy) return 0;
+
+    int dz = p->vz - tr->pos.vz; if (dz < 0) dz = -dz;
+    if (dz > tr->halfExtent.vz) return 0;
+
+    return 1;
+}
 
 
 // 12-bit fixed-point atan2 (returns 0..4095, the engine's angle format;
@@ -563,6 +827,99 @@ static int fp_atan2(int y, int x)
 }
 
 
+// Places the PLAY-mode player at this stage's authored spawn point, the
+// counterpart of load_stage_lights()/load_stage_fog() for the player. Called
+// from load_stage_at() on every load - the player's transform is LIVE state,
+// so a stage switch that skipped this would leave them standing wherever the
+// previous stage left them.
+//
+// WHICH SPAWN: `wantSpawnId` names one explicitly - what a door arriving
+// from another stage passes, so the player lands at that doorway rather
+// than the stage's front entrance. SPAWN_ID_DEFAULT (-1) means "the lowest
+// spawnId", the front-entrance behaviour boot uses.
+//
+// The lowest-id scan does NOT trust index 0 even though stage-gen sorts the
+// array on export: a hand-edited stage.json is exactly the case where that
+// ordering assumption would quietly break, and the scan is a handful of
+// comparisons over a tiny array once per stage load.
+//
+// AN UNMATCHED wantSpawnId FALLS BACK to the lowest id rather than dropping
+// the player at the origin. A door pointing at a spawn that was renumbered
+// or deleted should deposit the player somewhere sensible in the right
+// stage, not underneath the level geometry at world zero - the arrival is
+// wrong either way, but only one of those is recoverable by walking.
+void load_stage_spawn_at(const STAGE_DEF *stage, int wantSpawnId)
+{
+    const STAGE_SPAWN *chosen = 0;
+
+    if (stage && stage->spawns)
+    {
+        // Pass 1: exact match on the requested id.
+        if (wantSpawnId >= 0)
+        {
+            for (unsigned int i = 0; i < stage->spawnCount; i++)
+            {
+                if (stage->spawns[i].spawnId == (unsigned int)wantSpawnId)
+                {
+                    chosen = &stage->spawns[i];
+                    break;
+                }
+            }
+        }
+
+        // Pass 2: no request, or the requested id doesn't exist here.
+        if (!chosen)
+        {
+            for (unsigned int i = 0; i < stage->spawnCount; i++)
+            {
+                if (!chosen || stage->spawns[i].spawnId < chosen->spawnId)
+                    chosen = &stage->spawns[i];
+            }
+        }
+    }
+
+    if (chosen)
+    {
+        player_pos = chosen->pos;
+
+        // The spawn's facing is its own -Z (the viewport's forward pointer),
+        // so .vy is the yaw. The player faces it, and the follow-cam is put
+        // BEHIND them looking the same way - otherwise the player would spawn
+        // correctly oriented and then be viewed from an unrelated angle,
+        // which reads as the spawn rotation being ignored. Pitch is left at
+        // its current value: it's a view preference, not stage data.
+        player_rot.vx = 0;
+        player_rot.vy = chosen->rot.vy;
+        player_rot.vz = 0;
+        player_cam_yaw = chosen->rot.vy & 4095;
+
+        // The plane the player is pinned to (no gravity yet - see
+        // player_ground_y). Taking it from the spawn is what makes a Spawn
+        // placed on a raised surface actually hold the player up there.
+        player_ground_y = chosen->pos.vy;
+    }
+    else
+    {
+        player_pos.vx = 0;
+        player_pos.vy = PLAYER_GROUND_Y;
+        player_pos.vz = 0;
+        player_rot.vx = player_rot.vy = player_rot.vz = 0;
+        player_cam_yaw = 0;
+        player_ground_y = PLAYER_GROUND_Y;
+    }
+
+    // Clear the sub-unit movement remainders: they describe a fraction of a
+    // step already travelled, and carrying them across a teleport would nudge
+    // the player off the spawn point on their first moving frame.
+    player_move_frac_x = 0;
+    player_move_frac_z = 0;
+
+    // Re-arm the summon so the follow-camera re-derives from the new position
+    // on the next PLAY frame rather than easing over from the old one.
+    playerSpawned = 0;
+}
+
+
 
 // ------------------------------------------------------------
 // Debug transform - a global offset/multiplier layered on top of EVERY
@@ -571,6 +928,10 @@ static int fp_atan2(int y, int x)
 // eyeball lighting, or nudge every object at once without reconverting.
 // ------------------------------------------------------------
 int debug_scale = 4096;                 // fixed-point multiplier, 4096 == 1.0x (no pad control wired today)
+// No longer bound to any pad control - the DEBUG model-rotation bindings it
+// drove were removed to free the D-pad and L1/R1 for the feedback editor.
+// Kept because CAMERA_ROT_SPEED above documents itself as matching it, and
+// because model_rot itself still exists for anything that wants to set it.
 const uint8_t ROT_SPEED = 22;
 
 // XYZ rotation angles, fed straight into RotMatrix() as an SVECTOR.
@@ -586,6 +947,14 @@ VECTOR model_pos = { 0, 0, 0 };
 // transform - the camera is composed in separately (already built in
 // update_camera_matrix()).
 MATRIX world_matrix;
+
+// Object rotation WITHOUT the per-axis scale (a copy of world_matrix taken
+// before the scale columns are applied). Lighting composes light DIRECTIONS
+// with this, never with world_matrix: a direction has no length to scale, so
+// folding a non-unit object scale into the light matrix would multiply every
+// dot(dir, normal) by that scale and mis-brighten the object - a 0.1x-scaled
+// mesh would light ~10x too dark. Set alongside world_matrix each object.
+MATRIX world_light_rot;
 
 // Per-FACE lit colour cache (one RGB per triangle), reused as shared
 // scratch across every drawn object - draw_stage() always fully finishes
@@ -641,6 +1010,107 @@ static int stageObjectModelIndex[MAX_STAGE_OBJECTS];
 // Set by load_stage(): count of objects whose model name didn't
 // resolve, surfaced via debug_text()'s UNRESOLVED readout.
 static unsigned int stageUnresolvedCount = 0;
+
+// Per stage-object animation playback state, indexed like stageObjectModelIndex
+// []. Initialised at load_stage(): objects whose model carries a rig
+// (MODEL_DEF.bones) get bound to clip 0 and play; everything else stays inert
+// (model == NULL) and is skipped by draw_stage(). Advanced by g_dt per frame.
+static ANIM_STATE stageObjectAnim[MAX_STAGE_OBJECTS];
+
+// Scratch reused by every animated object, one object at a time (draw_stage
+// evaluates + skins + draws each object before moving on, so a single shared
+// buffer is enough and keeps ANIM_STATE small). g_boneMtx holds the current
+// pose's model-space skin matrices; g_posedVerts holds the skinned vertices
+// that transform_object_vertices() then projects instead of model->verts.
+static MATRIX  g_boneMtx[ANIM_MAX_BONES];
+static SVECTOR g_posedVerts[MAX_MODEL_VERTS];
+// Posed normals (one pass per animated object) so GTE lighting follows the
+// pose instead of the fixed bind orientation. compute_object_lighting() reads
+// these when the object is animated, model->faceNormals/vertNormals otherwise.
+static SVECTOR g_posedVertNormals[MAX_MODEL_VERTS];
+static SVECTOR g_posedFaceNormals[MAX_MODEL_TRIS];
+
+// Master switch for posed-normal lighting: rotate each normal with its bone so
+// shading tracks the deforming mesh. DEFAULT OFF, deliberately. It is
+// geometrically MORE correct, but on a stage with no ambient light the GTE's
+// one-sided lighting then renders every away-facing posed face pure BLACK - a
+// large, moving chunk of a dancing character. The bind-pose normals used when
+// this is off keep a consistent outward-facing set catching the light (the
+// "lit everywhere" look), and cost nothing per frame. Turn this ON only
+// alongside an ambient/fill light, so the honest shadow side is not pure black.
+int g_posed_normals = 0;
+
+
+// ======================== STAGE COLLIDERS ================================
+// World-space collision volumes for the stage objects authored with
+// stage-gen's Collide tickbox (STAGE_OBJECT.collide). See
+// COLLISION_ACTION_PLAN.md for the whole design; the parts that matter here:
+//
+// BAKED ONCE AT STAGE LOAD, never per frame. A stage object's transform is
+// fixed for the lifetime of the stage, so its collider is too - recomputing
+// it every frame would be pure waste. This is the same reasoning (and the
+// same lifetime) as stageObjectModelIndex[] above.
+//
+// AXIS-ALIGNED, deliberately. The model's own baked bboxMin/bboxMax is
+// rotated and then RE-FITTED to a world-axis-aligned box rather than kept as
+// an oriented one. Three reasons, in order of weight:
+//   1. It costs nothing per frame. An OBB would need a world->local
+//      transform per object per test, forever; this pays once at load.
+//   2. It is EXACT for the 0/90/180/270 rotations architectural level
+//      geometry actually uses. The conservative case only arises at odd
+//      angles - a 45-degree-rotated wall gets a collider ~41% wider than the
+//      wall, which is the honest cost of this choice.
+//   3. STAGE_TRIGGER already made the same call for the same reason (see
+//      stage_common.h). Two collision-ish systems answering one question two
+//      different ways is worse than both being slightly conservative.
+// Authors keep level geometry axis-aligned, exactly as triggers already ask.
+//
+// Centre + half-extent, matching STAGE_TRIGGER's shape on purpose so the
+// overlap helpers can be shared rather than written twice with subtly
+// different boundary conditions.
+typedef struct
+{
+    VECTOR centre;      // world, 20.12 - same space as STAGE_OBJECT.pos
+    VECTOR halfExtent;  // per-axis, forced >= 1 so the box always has an interior
+
+    // Stage-unique handle from stage-gen, or -1 for an automatic fallback
+    // box. This is what makes collision TOGGLEABLE: a future trigger action
+    // looks a box up by this id and flips `enabled` below.
+    int colliderId;
+
+    // LIVE state, not authored state. Seeded from STAGE_COLLIDER.enabled at
+    // load and then owned by the runtime - a barrier that drops, a door that
+    // seals. Kept as a byte per box rather than a bitfield because the
+    // collider table is 64 entries and clarity is worth 64 bytes.
+    unsigned char enabled;
+} COLLIDER_BOX;
+
+// ONE BOX PER GLTF PRIMITIVE, not per object - so the ceiling is not
+// MAX_STAGE_OBJECTS. A .glb routinely holds several pieces (house.glb is a
+// building mesh plus a grass plane, so a placed house contributes 2), and a
+// merged per-model box was actively wrong: the house's collider became its
+// LAWN's footprint extruded to the building's height, which is what made the
+// building unapproachable. See MODEL_DEF.collMin/collMax in model_common.h.
+//
+// 64 is deliberate headroom over 32 objects: most models are one primitive,
+// a few are two or three. If a stage ever exhausts this, the overflow is
+// counted and shown rather than silently dropped.
+#define MAX_STAGE_COLLIDERS 64
+
+static COLLIDER_BOX stageColliders[MAX_STAGE_COLLIDERS];
+
+// How many of stageColliders[] are live. NOT the same as
+// activeStageObjectCount: objects with collide==0, an unresolved model, or a
+// model with no baked bounds are skipped, so the array is dense and this is
+// the only valid loop bound.
+static unsigned int activeColliderCount = 0;
+
+// Objects that asked to collide but couldn't - unresolved model name, or a
+// model with no bboxMin/bboxMax (a vertex-less model bakes neither). Surfaced
+// on the debug overlay's WORLD page, same "say it out loud" policy as
+// stageUnresolvedCount, because a wall the player walks through is otherwise
+// indistinguishable from one nobody ticked.
+static unsigned int stageColliderSkippedCount = 0;
 
 
 
@@ -781,18 +1251,319 @@ static int find_model_index_by_name(const char *name)
 // load_stage() below calls it.
 void load_stage_lights(const STAGE_DEF *stage);
 
+// Loads a stage's authored fog into the fog_* globals (or main.c's compiled-
+// in defaults when the stage is NULL), clamps the range to the current
+// projection, and repaints the screen clear colour to the fog colour.
+// Defined near fog_clamp_range() (which it calls); forward-declared here
+// because load_stage() below calls it.
+void load_stage_fog(const STAGE_DEF *stage);
+
+// (load_stage_spawn_at() needs no forward declaration - unlike the two above
+// it is already DEFINED further up, immediately after the player globals and
+// fp_atan2() that it writes/uses. load_stage_at() below calls it.)
+
+// Brings the music bank in line with a stage, continuing the current track
+// when it hasn't changed. Defined just below (it needs stage_find_music());
+// load_stage_at() calls it in the one window where music is the top of the
+// SPU LIFO and can legally be released.
+static void load_stage_music(const STAGE_DEF *stage);
+
+// The stage's chosen music entity, or NULL if it authors none. "Chosen" is
+// the FIRST music-mode sound with autoplay ticked - autoplay is music's
+// ENABLE toggle, so a stage may carry several candidate tracks and switch
+// between them by ticking one. Later enabled entries are ignored (stage-gen
+// warns at export when more than one is enabled).
+//
+// Deliberately reads the STAGE_DEF directly rather than going through
+// sfx_stage_music(), which only knows the answer AFTER sfx_stage_load() has
+// run - and the music swap has to happen BEFORE that, while music is still
+// the top of the SPU stack. init() uses this too, so boot and stage-switch
+// pick music by identical rules instead of two hand-copied loops.
+static const STAGE_SOUND *stage_find_music(const STAGE_DEF *stage)
+{
+    if (!stage || !stage->sounds)
+        return 0;
+
+    for (unsigned int i = 0; i < stage->soundCount; i++)
+    {
+        const STAGE_SOUND *snd = &stage->sounds[i];
+        if (snd->mode == SFX_MODE_MUSIC && snd->autoplay)
+            return snd;
+    }
+    return 0;
+}
+
+// CD path of the music bank currently loaded, or NULL when none is. Compared
+// by STRING, not pointer: two stages naming the same track produce separate
+// string literals in their own generated stage_*.c, so pointer equality
+// would report "different" for identical tracks and needlessly restart them.
+static const char *g_current_music_path = 0;
+
+/**
+ * Brings the music bank in line with `stage`, called from load_stage_at()
+ * in the narrow window where sfx is unloaded and music is the top of the
+ * SPU LIFO (see the ordering note there).
+ *
+ * CONTINUES THE TRACK WHEN IT HASN'T CHANGED. This is the whole point: a
+ * hub with several rooms sharing one piece of music should not restart it
+ * every time the player walks through a door - the restart is far more
+ * noticeable than the switch it accompanies. Only a genuinely different
+ * bank pays the unload/reload cost.
+ *
+ * NOTE this is where a future cross-fade belongs: STAGE_SOUND already
+ * carries the authored fadeOnStageEnter flag, and the branch that swaps
+ * banks is exactly the moment it describes. Today the swap is a hard cut.
+ */
+static void load_stage_music(const STAGE_DEF *stage)
+{
+    const STAGE_SOUND *want = stage_find_music(stage);
+
+    // Same bank already playing - leave it entirely alone.
+    if (want && g_current_music_path && music_loaded() &&
+        strcmp(want->cdPath, g_current_music_path) == 0)
+    {
+        // Volume is still per-entity authored data, so honour it even when
+        // the bank is untouched: two stages may share a track at different
+        // levels.
+        music_set_volume(want->volume, want->volume);
+        return;
+    }
+
+    if (music_loaded())
+    {
+        music_unload();
+        g_current_music_path = 0;
+    }
+
+    if (!want)
+        return; // stage authors no enabled music - silence is the answer
+
+    if (music_load(want->cdPath, want->cdPath2))
+    {
+        music_set_volume(want->volume, want->volume);
+        music_play();
+        g_current_music_path = want->cdPath;
+    }
+    // A failed load leaves music_playing() false and shows on the overlay -
+    // same degrade-to-silence policy as a missing .VAG.
+}
+
+
+// Builds stageColliders[] from the active stage's objects. Called once per
+// stage load, AFTER the model-name resolve loop has filled
+// stageObjectModelIndex[] (it reads those indices to reach each model's baked
+// bounds).
+//
+// Per collidable object: take the model's local-space AABB, scale it, rotate
+// it, refit a world AABB, and offset by the object's position.
+//
+// THE AUTHORED TRANSFORM ONLY - deliberately NOT get_object_transform().
+// That function folds in model_pos/model_rot/debug_scale, the DEBUG-mode pad
+// inspector's global offsets. Those exist to shove the whole scene around
+// while looking at it; baking them into collision would mean nudging the
+// debug transform silently moves every wall in the level out from under the
+// player. Colliders describe what the stage AUTHORED, not what the inspector
+// is currently doing to the view.
+//
+// Model bounds are already in renderer space: py_convert_assets.py remaps
+// vertices (x, -y, -z) BEFORE computing min/max, which is the same per-axis
+// flip stage-gen's remapPos() applies to placement. So bounds and positions
+// compose directly, with no conversion between them.
+static void build_stage_colliders(const STAGE_DEF *stage, unsigned int objectCount)
+{
+    activeColliderCount = 0;
+    stageColliderSkippedCount = 0;
+
+    // AUTHORED BOXES FIRST, and if there are any, they are the whole answer
+    // for this stage. stage-gen baked them to world space already - centre,
+    // half-extent, engine units - so this is a copy, not a composition.
+    //
+    // WHY AUTHORED WINS WHOLESALE rather than per object: the exporter
+    // already made that decision per instance (an instance with boxes exports
+    // its boxes; one without exports nothing and is meant to fall back). If
+    // the stage authors ANY boxes, every object that wanted automatic
+    // collision would have had boxes generated for it by Auto Box. Deciding
+    // again here, per object, would need a back-reference from box to object
+    // that the wire format deliberately does not carry.
+    if (stage->colliders && stage->colliderCount > 0)
+    {
+        unsigned int n = stage->colliderCount < MAX_STAGE_COLLIDERS
+                       ? stage->colliderCount : MAX_STAGE_COLLIDERS;
+
+        for (unsigned int i = 0; i < n; i++)
+        {
+            const STAGE_COLLIDER *src = &stage->colliders[i];
+            COLLIDER_BOX *c = &stageColliders[activeColliderCount++];
+
+            c->centre     = src->pos;
+            c->halfExtent = src->halfExtent;
+            c->colliderId = src->colliderId;
+            c->enabled    = src->enabled ? 1 : 0;
+
+            // The converter already forces >= 1, but a hand-written
+            // stage.json can reach here too, and a zero-extent box is
+            // silently inert rather than loudly wrong.
+            if (c->halfExtent.vx < 1) c->halfExtent.vx = 1;
+            if (c->halfExtent.vy < 1) c->halfExtent.vy = 1;
+            if (c->halfExtent.vz < 1) c->halfExtent.vz = 1;
+        }
+
+        // Anything past the table ceiling is counted, never silently dropped.
+        stageColliderSkippedCount += stage->colliderCount - n;
+        return;
+    }
+
+    // No authored boxes - derive one per model primitive, as before.
+    for (unsigned int i = 0; i < objectCount; i++)
+    {
+        const STAGE_OBJECT *obj = &stage->objects[i];
+
+        if (!obj->collide)
+            continue;   // authored passable - not a failure, nothing to report
+
+        int mi = stageObjectModelIndex[i];
+        if (mi < 0)
+        {
+            stageColliderSkippedCount++;   // model name never resolved
+            continue;
+        }
+
+        const MODEL_DEF *model = &modelRegistry[mi];
+        if (!model->collMin || !model->collMax || model->collCount == 0)
+        {
+            stageColliderSkippedCount++;   // model baked no bounds (no verts)
+            continue;
+        }
+
+        // The object's rotation is shared by all of its primitives, so build
+        // the matrix ONCE outside the primitive loop rather than per box.
+        SVECTOR rot = obj->rot;
+        MATRIX  m;
+        RotMatrix(&rot, &m);
+
+        // ONE COLLIDER PER PRIMITIVE. house.glb yields two - the building and
+        // its grass plane - instead of one box around both. The grass bakes a
+        // zero-thickness box, which the collision step tolerance
+        // then treats as floor rather than wall; merged, it inherited the
+        // building's height and became an unapproachable wall.
+        for (unsigned int p = 0; p < model->collCount; p++)
+        {
+        if (activeColliderCount >= MAX_STAGE_COLLIDERS)
+        {
+            stageColliderSkippedCount++;   // table full - counted, never silently dropped
+            continue;
+        }
+
+        const SVECTOR *bmin = &model->collMin[p];
+        const SVECTOR *bmax = &model->collMax[p];
+
+        // Local-space centre and half-extent, from this primitive's AABB. The
+        // /2 is exact here: both are already 20.12, so this is a plain halving
+        // of a fixed-point value, not a precision loss worth widening for.
+        int cx = ((int)bmax->vx + (int)bmin->vx) / 2;
+        int cy = ((int)bmax->vy + (int)bmin->vy) / 2;
+        int cz = ((int)bmax->vz + (int)bmin->vz) / 2;
+        int hx = ((int)bmax->vx - (int)bmin->vx) / 2;
+        int hy = ((int)bmax->vy - (int)bmin->vy) / 2;
+        int hz = ((int)bmax->vz - (int)bmin->vz) / 2;
+
+        // Scale (4096 == 1.0). Applied before rotation, which is the correct
+        // order for the usual scale-then-rotate-then-translate composition
+        // and matches how the render path builds its matrix.
+        cx = (cx * obj->scale.vx) >> 12;
+        cy = (cy * obj->scale.vy) >> 12;
+        cz = (cz * obj->scale.vz) >> 12;
+        hx = (hx * obj->scale.vx) >> 12;
+        hy = (hy * obj->scale.vy) >> 12;
+        hz = (hz * obj->scale.vz) >> 12;
+
+        // A negative authored scale mirrors the model, which flips a
+        // half-extent negative and would make every test fail silently
+        // (|d| > negative is always true). Absolute value here rather than
+        // rejecting the object: a mirrored prop is a legitimate authoring
+        // trick and its collider is simply the mirrored box.
+        if (hx < 0) hx = -hx;
+        if (hy < 0) hy = -hy;
+        if (hz < 0) hz = -hz;
+
+        // Rotate the centre, and refit the half-extent. The refit is the
+        // standard transformed-AABB formula - each output extent is the sum
+        // of the input extents weighted by the ABSOLUTE values of that
+        // matrix row - which is why this needs no corner enumeration.
+        //
+        // Done in plain C rather than via ApplyMatrixLV: this runs once at
+        // load, well outside the render path, and going through the GTE here
+        // would mean caring about what else has left registers loaded.
+        //
+        // Overflow: extents run to a few tens of thousands and |m| <= 4096,
+        // so each term is under ~1e8 and the three-term sum stays well
+        // inside int32.
+        int ax0 = m.m[0][0] < 0 ? -m.m[0][0] : m.m[0][0];
+        int ax1 = m.m[0][1] < 0 ? -m.m[0][1] : m.m[0][1];
+        int ax2 = m.m[0][2] < 0 ? -m.m[0][2] : m.m[0][2];
+        int ay0 = m.m[1][0] < 0 ? -m.m[1][0] : m.m[1][0];
+        int ay1 = m.m[1][1] < 0 ? -m.m[1][1] : m.m[1][1];
+        int ay2 = m.m[1][2] < 0 ? -m.m[1][2] : m.m[1][2];
+        int az0 = m.m[2][0] < 0 ? -m.m[2][0] : m.m[2][0];
+        int az1 = m.m[2][1] < 0 ? -m.m[2][1] : m.m[2][1];
+        int az2 = m.m[2][2] < 0 ? -m.m[2][2] : m.m[2][2];
+
+        COLLIDER_BOX *c = &stageColliders[activeColliderCount];
+
+        c->centre.vx = obj->pos.vx + ((m.m[0][0] * cx + m.m[0][1] * cy + m.m[0][2] * cz) >> 12);
+        c->centre.vy = obj->pos.vy + ((m.m[1][0] * cx + m.m[1][1] * cy + m.m[1][2] * cz) >> 12);
+        c->centre.vz = obj->pos.vz + ((m.m[2][0] * cx + m.m[2][1] * cy + m.m[2][2] * cz) >> 12);
+
+        c->halfExtent.vx = (ax0 * hx + ax1 * hy + ax2 * hz) >> 12;
+        c->halfExtent.vy = (ay0 * hx + ay1 * hy + ay2 * hz) >> 12;
+        c->halfExtent.vz = (az0 * hx + az1 * hy + az2 * hz) >> 12;
+
+        // A flat model (a ground plane has zero thickness in Y) would bake a
+        // zero half-extent, and a zero-thickness box can never contain
+        // anything. Force an interior so such a collider is testable rather
+        // than silently inert - matching STAGE_TRIGGER's ">= 1" guarantee.
+        if (c->halfExtent.vx < 1) c->halfExtent.vx = 1;
+        if (c->halfExtent.vy < 1) c->halfExtent.vy = 1;
+        if (c->halfExtent.vz < 1) c->halfExtent.vz = 1;
+
+        // Derived boxes are NOT addressable - there is no authored thing for
+        // a trigger to have meant. Solid from the start, like the geometry
+        // they stand in for.
+        c->colliderId = -1;
+        c->enabled = 1;
+
+        activeColliderCount++;
+        }   // per-primitive
+    }       // per-object
+}
+
+
 // Makes `index` (into stageRegistry[]) the active stage: pulls its
 // camera block into the live CAMERA struct, and resolves every object's
 // model-name string against modelRegistry[] ONCE. Safe to call again
 // with a different index for a runtime stage switch.
-void load_stage(unsigned int index)
+//
+// `arrivalSpawnId` selects WHICH spawn point the player lands on: a door in
+// one stage wants to arrive at a specific spawn in the next, not just
+// wherever the lowest id happens to be. Pass SPAWN_ID_DEFAULT (-1) for the
+// lowest-id behaviour a fresh boot gets. load_stage() below is the plain
+// wrapper for callers that don't care.
+void load_stage_at(unsigned int index, int arrivalSpawnId)
 {
     activeStageObjectCount = 0;
     stageUnresolvedCount = 0;
+    activeColliderCount = 0;
+    stageColliderSkippedCount = 0;
 
     // Tear down the PREVIOUS stage's sounds before anything else: keys
     // their voices off and gives back their SPU RAM in reverse load order
     // (the bump allocator's LIFO contract). No-op on the first call.
+    //
+    // THIS MUST STAY FIRST, and not only for tidiness: the SPU allocator is
+    // a LIFO bump, stage sfx sit ABOVE the music bank, and the music swap
+    // below may need to release music. Music cannot be freed while sfx is
+    // still stacked on top of it, so the only workable order is
+    // sfx_unload -> music swap -> sfx_load. Moving this call breaks that.
     sfx_stage_unload();
 
     if (stageRegistryCount == 0)
@@ -803,6 +1574,8 @@ void load_stage(unsigned int index)
         // sounds to play - unloaded above).
         activeStageIndex = 0;
         load_stage_lights(0); // no stage -> no authored lights (scene unlit)
+        load_stage_fog(0);    // no stage -> compiled-in fog defaults (off, grey)
+        load_stage_spawn_at(0, SPAWN_ID_DEFAULT); // player at the world origin
         return;
     }
 
@@ -812,6 +1585,11 @@ void load_stage(unsigned int index)
     activeStageIndex = index;
 
     const STAGE_DEF *stage = &stageRegistry[activeStageIndex];
+
+    // Music swap, in the one window where it is legal: sfx has been released
+    // above, so music is now the top of the SPU stack and can be rewound;
+    // sfx_stage_load() below will re-stack on top of whatever ends up here.
+    load_stage_music(stage);
 
     camera.pos = stage->cameraPos;
     camera.rot = stage->cameraRot;
@@ -831,9 +1609,36 @@ void load_stage(unsigned int index)
         stageObjectModelIndex[i] = idx;
         if (idx < 0)
             stageUnresolvedCount++;
+
+        // Bind an animation state to any object whose model carries a rig;
+        // everything else gets an inert state (model NULL) that draw_stage()
+        // skips. The clip and playback knobs are AUTHORED per object in
+        // stage.json (STAGE_OBJECT.anim / animSpeed / animStart / animLoop) - a
+        // named clip resolves to an index, falling back to clip 0 when the name
+        // is absent or unmatched.
+        if (idx >= 0 && modelRegistry[idx].bones && modelRegistry[idx].clipCount > 0)
+        {
+            const STAGE_OBJECT *obj = &stage->objects[i];
+            int clip = obj->anim ? anim_find_clip(&modelRegistry[idx], obj->anim) : 0;
+            if (clip < 0) clip = 0;
+            anim_init(&stageObjectAnim[i], &modelRegistry[idx], clip);
+            stageObjectAnim[i].speed     = obj->animSpeed;   // 4096 == 1.0x (converter default)
+            stageObjectAnim[i].timeTicks = obj->animStart;   // desync offset, ticks
+            stageObjectAnim[i].loop      = obj->animLoop;     // per-object loop/once override
+            stageObjectAnim[i].playing   = obj->animPlaying;  // autoplay on spawn vs paused on frame 0
+        }
+        else
+            anim_init(&stageObjectAnim[i], NULL, -1);
     }
 
     activeStageObjectCount = objectCount;
+
+    // Collision volumes for the objects authored solid. Must run AFTER the
+    // resolve loop above - it reads stageObjectModelIndex[] to reach each
+    // model's baked bounds. Nothing consumes stageColliders[] yet; this
+    // stage of the work just makes the table exist and be inspectable on the
+    // debug overlay's WORLD page.
+    build_stage_colliders(stage, objectCount);
 
     // Load and (autoplay) start this stage's authored sounds - the CD
     // paths were baked from stage.json's "sounds" array by
@@ -848,6 +1653,309 @@ void load_stage(unsigned int index)
     // Build the GTE lighting state from this stage's authored lights (or
     // clear all lighting when it authors none - no recovery sun).
     load_stage_lights(stage);
+
+    // Load this stage's authored fog into the fog_* globals, clamp it to the
+    // current projection, and repaint the clear colour. Runs every stage
+    // load (not just when fog is on): fog is a single stage-level block with
+    // no fallback, so an unloaded fog would let the previous stage's fog
+    // linger across a runtime stage switch - the same reason authored lights
+    // are authoritative.
+    load_stage_fog(stage);
+
+    // Place the PLAY-mode player at this stage's authored spawn point. Must
+    // run on every stage load for the same reason as fog: the player's
+    // position is live state, so a stage switch that didn't re-place them
+    // would drop them wherever the PREVIOUS stage left them.
+    load_stage_spawn_at(stage, arrivalSpawnId);
+
+    // Clear the trigger latches: they describe the player's inside/outside
+    // state relative to the PREVIOUS stage's volumes, which no longer exist.
+    // Leaving them set would make a `once` trigger in the new stage appear
+    // already-spent purely because the old stage's trigger at that index had
+    // fired - the arrival door being the obvious casualty.
+    for (unsigned int i = 0; i < MAX_STAGE_TRIGGERS; i++)
+        triggerFired[i] = 0;
+    triggerUnresolvedCount = 0;
+
+    // ARM ANY TRIGGER THE PLAYER SPAWNS INSIDE. A door pair is naturally
+    // symmetric - the spawn on the far side usually sits within the return
+    // door's own volume - so without this the player would arrive, be found
+    // inside that volume on frame one, and be sent straight back. Latching
+    // on arrival means the return door only fires once they have LEFT it and
+    // come back, which is what walking through a door actually means.
+    if (stage->triggers)
+    {
+        unsigned int tcount = stage->triggerCount < MAX_STAGE_TRIGGERS
+                            ? stage->triggerCount : MAX_STAGE_TRIGGERS;
+        for (unsigned int i = 0; i < tcount; i++)
+        {
+            if (point_in_trigger(&player_pos, &stage->triggers[i]))
+                triggerFired[i] = 1;
+        }
+    }
+}
+
+
+// Plain wrapper: load a stage at its DEFAULT arrival (lowest spawnId). What
+// boot and any caller that isn't coming through a specific door wants.
+void load_stage(unsigned int index)
+{
+    load_stage_at(index, SPAWN_ID_DEFAULT);
+}
+
+
+// Resolve a stage NAME to its stageRegistry[] index, or -1 if no such stage
+// was baked in. Triggers name their destination as free text (resolved late,
+// exactly like model names and sound samples) so authoring a door doesn't
+// depend on stage ordering, which changes whenever a folder is added.
+int find_stage_index_by_name(const char *name)
+{
+    if (!name)
+        return -1;
+
+    for (unsigned int i = 0; i < stageRegistryCount; i++)
+    {
+        if (strcmp(stageRegistry[i].name, name) == 0)
+            return (int)i;
+    }
+    return -1;
+}
+
+
+// ------------------------------------------------------------
+// Stage transition driver
+// ------------------------------------------------------------
+
+/**
+ * Request a switch to `stageIndex`, arriving at `spawnId` (-1 = that stage's
+ * lowest spawnId). Starts the fade; the actual load happens later, at full
+ * black, in stage_transition_tick().
+ *
+ * IGNORED IF A SWITCH IS ALREADY IN FLIGHT. Without this guard a trigger
+ * volume the player is still standing inside would re-request the switch
+ * every frame of the fade, restarting it forever - the player would walk
+ * into a door and the screen would sit half-dark permanently. The `once`
+ * flag does not cover this case, because a non-once trigger is *supposed*
+ * to re-fire on a later entry.
+ */
+void stage_transition_begin(unsigned int stageIndex, int spawnId)
+{
+    if (transition_state != TRANSITION_NONE)
+        return;
+
+    if (stageRegistryCount == 0)
+        return;
+    if (stageIndex >= stageRegistryCount)
+        return;
+
+    transition_target_stage = stageIndex;
+    transition_target_spawn = spawnId;
+    transition_state = TRANSITION_OUT;
+}
+
+/**
+ * As stage_transition_begin(), plus fire an authored "Upon Enter SFX" in the
+ * CURRENT stage. What a Switch Scene trigger calls.
+ *
+ * THE SOUND PLAYS HERE, NOT LATER, and it has to: the sound belongs to the
+ * stage being left, and load_stage_at() calls sfx_stage_unload() partway
+ * through the transition - which frees its sample and keys its voice off.
+ * So the audible window is the fade-out only, roughly 16 frames at the
+ * current TRANSITION_FADE_SPEED. A sample longer than that gets cut off
+ * mid-play; lengthen the fade if a door needs more room to breathe.
+ *
+ * Fired only when the transition is actually ACCEPTED. Playing the sound
+ * before the re-entry guard would let a player standing in a doorway
+ * retrigger the creak every frame of a fade already in progress.
+ */
+static void stage_transition_begin_with_sfx(unsigned int stageIndex, int spawnId, int onEnterSoundId)
+{
+    if (transition_state != TRANSITION_NONE)
+        return;
+
+    stage_transition_begin(stageIndex, spawnId);
+
+    // Only if begin() actually took - it re-validates the stage index, and a
+    // door pointing at an out-of-range stage should be silent, not announce
+    // a switch that never happens.
+    if (transition_state == TRANSITION_NONE)
+        return;
+
+    if (onEnterSoundId >= 0)
+        sfx_play_by_id((unsigned int)onEnterSoundId);
+}
+
+/** True while a switch is in flight - update() gates PLAY input on this so
+ *  the player can't keep walking (or re-enter another trigger) mid-fade. */
+int stage_transition_active(void)
+{
+    return transition_state != TRANSITION_NONE;
+}
+
+// Defined further down with the player camera code; needed by the LOAD
+// phase below to re-aim the view before the fade-in reveals the new stage.
+void update_player_follow_camera(void);
+
+/**
+ * Advances the fade/load/fade state machine. Called once per frame from
+ * update(), BEFORE the mode handlers, so a transition that completes this
+ * frame hands control back on the same frame it finishes.
+ */
+void stage_transition_tick(void)
+{
+    switch (transition_state)
+    {
+    case TRANSITION_OUT:
+        transition_level += dt_scale(TRANSITION_FADE_SPEED);
+        if (transition_level >= 255)
+        {
+            transition_level = 255;
+            transition_state = TRANSITION_LOAD;
+        }
+        break;
+
+    case TRANSITION_LOAD:
+        // Fully dark: do the blocking work. Everything this touches (SPU
+        // uploads, CD reads, stage data) is invisible right now, and the
+        // delta clamp in update_frame_time() absorbs the hitch on the
+        // frame after.
+        load_stage_at(transition_target_stage, transition_target_spawn);
+
+        // Re-summon the player and re-aim the follow-cam NOW, not on the
+        // next PLAY frame. load_stage_spawn_at() cleared playerSpawned, and
+        // PLAY input stays frozen through TRANSITION_IN - so without this
+        // the entire fade-in would render the new stage from its authored
+        // dev camera with no player drawn, then snap to the follow-cam the
+        // frame control returns.
+        if (control_mode == MODE_PLAY)
+        {
+            playerSpawned = 1;
+            update_player_follow_camera();
+        }
+
+        transition_state = TRANSITION_IN;
+        break;
+
+    case TRANSITION_IN:
+        transition_level -= dt_scale(TRANSITION_FADE_SPEED);
+        if (transition_level <= 0)
+        {
+            transition_level = 0;
+            transition_state = TRANSITION_NONE;
+        }
+        break;
+
+    default:
+        break;
+    }
+}
+
+
+// ------------------------------------------------------------
+// Trigger volumes
+// ------------------------------------------------------------
+
+/**
+ * Tests the player against every trigger volume in the active stage and
+ * performs the action of any that activates. Called once per PLAY frame,
+ * with that frame's raw pad state for the CROSS interact check.
+ *
+ * DELIBERATELY NOT A COLLISION SYSTEM. The player is a point here, not a
+ * volume - which is the right approximation for a doorway (you want the
+ * trigger to fire when the player is *in* the door, not when their bounding
+ * box grazes the frame) and it keeps this to three subtracts and three
+ * compares per trigger. When real collision lands, this can grow a proper
+ * shape test without anything else changing.
+ *
+ * Skipped entirely while a transition is in flight - update() already
+ * freezes PLAY input during one, but this is called from update_play() and
+ * the guard costs nothing.
+ */
+static void update_triggers(unsigned short raw)
+{
+    // Recomputed every frame: true only while the player stands inside an
+    // ARMED trigger that is waiting on a CROSS press. This is the hook for a
+    // "Press X" prompt - without some indication, an interact volume is
+    // invisible and the player has no way to know a door is there. Nothing
+    // renders it yet; see the note in the summary.
+    player_can_interact = 0;
+
+    if (stageRegistryCount == 0)
+        return;
+    if (stage_transition_active())
+        return;
+
+    // Edge-detected ONCE for the whole pass, not per trigger: a held CROSS
+    // must not re-fire, and two overlapping volumes must not both consume
+    // the same press. edge_pressed() compares against the shared
+    // prevPadRaw, which update() advances at the END of the frame, so every
+    // edge check in the frame sees the same transition.
+    const int crossPressed = edge_pressed(raw, PAD_CROSS);
+
+    const STAGE_DEF *stage = &stageRegistry[activeStageIndex];
+    if (!stage->triggers)
+        return;
+
+    unsigned int count = stage->triggerCount < MAX_STAGE_TRIGGERS
+                       ? stage->triggerCount : MAX_STAGE_TRIGGERS;
+
+    for (unsigned int i = 0; i < count; i++)
+    {
+        const STAGE_TRIGGER *tr = &stage->triggers[i];
+
+        if (!point_in_trigger(&player_pos, tr))
+        {
+            // LEFT the volume. A re-firing trigger re-arms here; a `once`
+            // trigger keeps its latch so it can never fire again this stage.
+            if (!tr->once)
+                triggerFired[i] = 0;
+            continue;
+        }
+
+        // Inside. Already-latched means we either fired on a previous frame
+        // and haven't left yet, or this is a spent `once` trigger.
+        if (triggerFired[i])
+            continue;
+
+        // ARMED AND WAITING. An interact trigger does nothing on entry - it
+        // sits here until the player presses CROSS, so the volume acts as a
+        // prompt and walking in commits to nothing. Note this does NOT latch
+        // while waiting: the player can stand in a doorway indefinitely and
+        // it stays available.
+        if (tr->userInteract)
+        {
+            player_can_interact = 1;
+            if (!crossPressed)
+                continue;
+        }
+
+        triggerFired[i] = 1;
+
+        if (tr->action == TRIGGER_ACTION_SWITCH_SCENE)
+        {
+            int target = find_stage_index_by_name(tr->targetStage);
+            if (target < 0)
+            {
+                // Unresolved destination (typo'd or deleted stage, or an
+                // empty target the author never filled in). Counted for the
+                // overlay and otherwise ignored - the same degrade-quietly
+                // policy an unresolved model name gets. NOTE the latch stays
+                // SET, so a broken door doesn't re-attempt every frame and
+                // flood the counter.
+                triggerUnresolvedCount++;
+                continue;
+            }
+
+            stage_transition_begin_with_sfx((unsigned int)target,
+                                            (int)tr->targetSpawnId,
+                                            tr->onEnterSoundId);
+            return; // a switch is in flight; no other trigger can matter now
+        }
+
+        // TRIGGER_ACTION_NONE and any future action land here. stage-gen
+        // doesn't export inert triggers, so reaching this means a
+        // hand-authored stage.json - harmless, just nothing to do.
+    }
 }
 
 
@@ -884,10 +1992,14 @@ void init(void)
     // another - which reads instantly as a broken renderer. (That was the
     // first fog cut's actual bug: the far colour tracked g_ambient_*, and
     // house_demo authors no ambient light, so geometry faded to BLACK
-    // against this grey.) Derived from the same constants so they cannot
-    // drift apart again.
-    setRGB0(&draw[0], FOG_COL_R, FOG_COL_G, FOG_COL_B);
-    setRGB0(&draw[1], FOG_COL_R, FOG_COL_G, FOG_COL_B);
+    // against this grey.) Read from the g_fog_col_* globals (seeded to
+    // FOG_COL_* here, then repainted per stage by load_stage_fog()) so they
+    // cannot drift apart. This is the SEED value only - load_stage(0) runs
+    // later in init() and load_stage_fog() re-sets these draw envs from the
+    // boot stage's authored fog colour; the update is picked up on the next
+    // PutDrawEnv() in display(), so no re-put is needed here.
+    setRGB0(&draw[0], g_fog_col_r, g_fog_col_g, g_fog_col_b);
+    setRGB0(&draw[1], g_fog_col_r, g_fog_col_g, g_fog_col_b);
     draw[0].isbg = 1;
     draw[1].isbg = 1;
 
@@ -959,47 +2071,12 @@ void init(void)
     // sound_cd_ready() false and everything degrades to silence.
     sound_init();
 
-    // Music is FULLY stage-authored now: it plays if - and only if - the
-    // boot stage (stageRegistry[0]) places a mode=music sound entity,
-    // whose baked cdPath/cdPath2 name the VAB/SEQ pair (assets/sound/
-    // music/<SAMPLE>.VAB/.SEQ, shipped by py_convert_sounds.py). No
-    // entity = no music_load() at all (overlay shows MUSIC LOADED=N) -
-    // the old hardcoded \SONG fallback is gone, same arc the wind
-    // ambient followed from hardcoded to stage-driven. The entity's
-    // authored volume (baked 0..0x3fff) drives music_set_volume().
-    // Peeked directly from the registry here - NOT via sfx_stage_music()
-    // - because this must run BEFORE the first load_stage(): stage sfx
-    // must sit ABOVE the music bank in the SPU bump allocator so a
-    // runtime stage switch can LIFO-release them without clobbering
-    // music's slice. (Swapping music ON a live stage transition - with
-    // the entity's fadeOnStageEnter preference - is the future
-    // transition system's job; it'll need a music unload/reload path
-    // that respects that same LIFO order.) A missing/oversized/
-    // malformed pair just leaves music_playing() false on the overlay.
-    //
-    // For MUSIC entities, Autoplay is the ENABLE toggle: a stage may
-    // author several music entities and tick exactly the one it wants -
-    // unticked ones are skipped entirely (not loaded, not blocking).
-    // First ENABLED music entity wins, same rule as sfx_stage_music().
-    // (Previously the first music entity won regardless of autoplay, so
-    // a disabled first entity silently starved every later one.)
-    if (stageRegistryCount > 0)
-    {
-        const STAGE_DEF *bootStage = &stageRegistry[0];
-        for (unsigned int i = 0; i < bootStage->soundCount; i++)
-        {
-            const STAGE_SOUND *snd = &bootStage->sounds[i];
-            if (snd->mode != SFX_MODE_MUSIC || !snd->autoplay)
-                continue;
-
-            if (music_load(snd->cdPath, snd->cdPath2))
-            {
-                music_set_volume(snd->volume, snd->volume);
-                music_play();
-            }
-            break; // first ENABLED music entity wins
-        }
-    }
+    // Music is NOT loaded here: load_stage_at() owns it entirely (its
+    // sfx_stage_unload -> load_stage_music -> sfx_stage_load order keeps the
+    // music bank below the stage sfx in the LIFO SPU allocator, on boot
+    // exactly as on every later switch - one code path, no boot special
+    // case). Music plays iff the active stage authors an autoplay
+    // mode=music entity; see stage_find_music() / load_stage_music().
 
     // Make the first baked stage (stageRegistry[0]) active: pulls its
     // camera into `camera`, resolves every object's model name once, and
@@ -1123,7 +2200,7 @@ MATRIX g_light_color_matrix = {
 // Global AMBIENT (GTE back colour): added to every lit vertex, and the floor
 // a one-sided face falls to when it faces away from every light. Overwritten
 // per stage by load_stage_lights() (authored ambient, or 0 if none).
-int g_ambient_r = 128, g_ambient_g = 128, g_ambient_b = 128;
+int g_ambient_r = 0, g_ambient_g = 0, g_ambient_b = 0;
 
 // ---- Live intensity editor (DEBUG mode, hold L2 + Up/Down) --------------
 // Redefined from the old multiplicative "dimmer": L2 now edits the lights'
@@ -1178,20 +2255,12 @@ int g_light_intensity_offset = 0;   // signed, 256 == +/-1.0. L2+Up/Down.
 // positions (SZ is the camera-space Z the GTE projected), so fog_far
 // ~6000 is a little over one CAMERA_DISTANCE (4096) beyond the near edge.
 //
-// FOG COLOUR is a compile-time constant for now, deliberately identical to
-// the screen clear colour set in init() - if the two ever drift, geometry
-// fades to one colour against a void of another, which reads instantly as
-// broken (that was the first cut's bug: the far colour was slaved to
-// g_ambient_*, and a stage authoring no ambient light made it BLACK against
-// this grey background). init() now derives its clear colour from these, so
-// they cannot drift again.
-//
-// WHEN STAGE-GEN AUTHORS FOG: add enable/near/far/colour to STAGE_DEF, set
-// these globals in load_stage_lights(), and leave the L1+L2 editor writing
-// the same globals as a live override - exactly the pattern the light
-// intensities already use (authored value + live offset).
-// FOG_COL_R/G/B live up with DISPLAY_W/H rather than here, because init()
-// needs them for the screen clear colour and runs long before this block.
+// FOG COLOUR and near/far are STAGE-AUTHORED (STAGE_FOG, applied by
+// load_stage_fog(), which also repaints the screen clear colour so the two
+// can never drift - see the FOG_COL_* block up top). The values below are
+// only the pre-stage defaults; the L1+L2 editor stays a live override on
+// the same globals, the authored-value + live-offset pattern the light
+// intensities use.
 
 uint8_t fog_enabled = 0;            // master toggle (L1+L2 + CROSS)
 int fog_near = 800;                 // SZ at which fog starts (IR0 = 0)
@@ -1242,6 +2311,335 @@ uint8_t fog_cull_enabled = 0;
 int fogCulledCount = 0;             // whole objects, reset in draw_stage()
 int fogCulledTriCount = 0;          // triangles, reset in draw_stage()
 
+
+// ==================== POST-PROCESS VOLUMES ===============================
+// Ceiling on post-process tint quads per frame. Each is a full-screen fill,
+// which is the single most expensive thing this feature can ask for, and the
+// exporter already clamps the authored value to 8. This is the runtime's own
+// backstop against a hand-written stage.json.
+//
+// DEFINED HERE, at the top of this section, rather than next to
+// FOG_MAX_LAYERS where it would read more naturally: update_postfx() below
+// uses it, and this whole block sits ABOVE the fog constants in the file.
+#define POSTFX_MAX_TINT_LAYERS 8
+
+// Feedback (blur/ghost) limits. DEFINED HERE with the other post-fx
+// constants rather than beside draw_postfx_feedback() where they are used:
+// the DEBUG pad handler also clamps against MAX_PASSES, and it sits ~600
+// lines ABOVE the draw code. Same trap POSTFX_MAX_TINT_LAYERS fell into.
+#define POSTFX_FEEDBACK_MAX_PASSES 4
+#define POSTFX_FEEDBACK_MAX_OFFSET 3   // pixels; beyond this it reads as a double image, not a blur
+
+// Regions authored in stage-gen that change how the frame is rendered while
+// the player is inside them. See STAGE_POSTFX in stage_common.h.
+//
+// This is the whole "shaders on a machine with no shaders" answer: the PS1
+// GPU has four fixed blend modes, a CLUT, and a unified VRAM where the
+// framebuffer is addressable as a texture. Everything here is assembled from
+// those three facts.
+//
+// EVALUATED ONCE PER FRAME into these accumulators, then consumed by
+// draw_postfx() at the end of the frame. Splitting evaluation from drawing
+// means the volume maths runs in update() with everything else that thinks
+// about where the player is, and the draw path stays a dumb consumer.
+typedef struct
+{
+    int weight;        // 0..4096 - how strongly post-fx applies at all this frame
+
+    int tintR, tintG, tintB;   // 0..255, already weighted and blended
+    int tintMode;              // POSTFX_TINT_* (the GPU's ABR bits)
+    int tintLayers;            // full-screen quads to draw, 0 = no tint
+
+    int blurAmount;    // 0..4096
+    int ghostAmount;   // 0..4096
+
+    int paletteRow;    // -1 = no shift authored anywhere this frame
+} POSTFX_STATE;
+
+static POSTFX_STATE g_postfx;
+
+/**
+ * Palette row offset contributed by post-process volumes this frame, or 0.
+ *
+ * An OFFSET, not an absolute row, so it composes with each object's own
+ * authored palette and with the DEBUG pad nudge instead of overriding either.
+ * The per-texture clamp in draw_object_into_ot() is what keeps the sum safe
+ * when a texture has fewer CLUT rows than the shift asks for - it settles on
+ * that texture's last row rather than reading past it.
+ */
+static inline unsigned int postfx_palette_offset(void)
+{
+    return g_postfx.paletteRow > 0 ? (unsigned int)g_postfx.paletteRow : 0u;
+}
+
+// Diagnostics for the debug overlay: how many volumes contained the player
+// (fully or in falloff) this frame.
+static int postfxActiveVolumes = 0;
+
+// ---- Post-fx feedback DEBUG overrides (DEBUG mode, hold R1+L2) ----------
+// Live knobs over the feedback machinery, because its parameters interact
+// with the hardware's fixed blend ratios in ways only tunable by eye:
+//
+//   g_postfx_blur_add / g_postfx_ghost_add - signed offsets ADDED to the
+//     volume-derived amounts (authored value + live offset, the same pattern
+//     as the light-intensity editor). Applied even when NO volume is active,
+//     so the feedback can be exercised anywhere in any stage.
+//
+//   g_postfx_fb_abr - the feedback quads' semi-transparency rate (GPU ABR
+//     0..3). The "fixed" 50/50 blend is only fixed per rate - the hardware
+//     has four, and they change the algorithm's character entirely:
+//       0  B/2+F/2  the default - even mix, history decays by halving
+//       1  B+F      additive: trails BLOOM and never dim the scene (watch
+//                   for white-out - the loop gain is >1 by construction)
+//       2  B-F      subtractive: dark smears, burns history OUT of the image
+//       3  B+F/4    additive quarter: subtle bloom, gain 1.25 - slow burn
+//
+//   g_postfx_fb_bright - the quads' modulation colour (texel * b/128).
+//     THE fine-grained blend strength control. At abr 0 the prev-frame term
+//     becomes prev * b/256: below 128 the loop gain drops under 0.5, so
+//     trails decay faster and the image dims slightly - a genuinely
+//     CONTINUOUS knob over a blend the rate bits only move in steps of 2x.
+//
+// NOT reset per stage (unlike the light offset): these tune the ALGORITHM,
+// not a stage's authored look - walking through a door mid-comparison
+// shouldn't snap them back. TRIANGLE in the editor resets all four.
+int g_postfx_blur_add  = 0;     // -4096..4096
+int g_postfx_ghost_add = 0;     // -4096..4096
+
+// Feedback pass isolation, DEBUG L1/R1. 0 = draw every pass (normal).
+// 1..POSTFX_FEEDBACK_MAX_PASSES = draw ONLY that pass.
+//
+// Purely diagnostic. The feedback effect composites several full-screen
+// quads and any one of them being wrong - wrong texture page, wrong UV,
+// wrong offset - shows up as an artifact spread across the whole screen with
+// no indication of which quad caused it. Isolating one pass at a time is the
+// difference between "the blur looks wrong" and "pass 2 is sampling the
+// wrong page".
+int g_postfx_pass_isolate = 0;
+int g_postfx_fb_abr    = 0;     // 0..3, GPU ABR bits
+int g_postfx_fb_bright = 128;   // 0..255, 128 = neutral modulation
+
+/**
+ * Containment weight of one volume, 0..4096.
+ *
+ * Inside the box proper -> 4096. Outside by more than `falloff` -> 0. In
+ * between -> a linear ramp on the axis the player is furthest out on.
+ *
+ * WHY THE FURTHEST AXIS rather than a true distance: a real distance needs a
+ * square root per volume per frame, and the visible difference is confined to
+ * the box's corners. Using the dominant axis makes the falloff region a
+ * rounded-off shell rather than a sphere-swept box, which nobody can see and
+ * costs three compares.
+ */
+static int postfx_volume_weight(const STAGE_POSTFX *fx, const VECTOR *p)
+{
+    // Distance outside the box on each axis (0 when inside on that axis).
+    int dx = (p->vx < fx->pos.vx ? fx->pos.vx - p->vx : p->vx - fx->pos.vx) - fx->halfExtent.vx;
+    int dy = (p->vy < fx->pos.vy ? fx->pos.vy - p->vy : p->vy - fx->pos.vy) - fx->halfExtent.vy;
+    int dz = (p->vz < fx->pos.vz ? fx->pos.vz - p->vz : p->vz - fx->pos.vz) - fx->halfExtent.vz;
+
+    if (dx < 0) dx = 0;
+    if (dy < 0) dy = 0;
+    if (dz < 0) dz = 0;
+
+    int out = dx;
+    if (dy > out) out = dy;
+    if (dz > out) out = dz;
+
+    if (out == 0)          return 4096;   // fully inside
+    if (fx->falloff <= 0)  return 0;      // hard edge: inside or nothing
+    if (out >= fx->falloff) return 0;
+
+    // Linear ramp. Eased rather than smoothstepped deliberately - a curve
+    // here would need a multiply per volume to hide a transition nobody
+    // reported noticing, and `falloff` is already the knob for how gradual
+    // it feels.
+    return 4096 - ((out * 4096) / fx->falloff);
+}
+
+/**
+ * Evaluate every post-process volume against the player and blend the
+ * results into g_postfx. Called once per frame from update().
+ *
+ * BLENDING RULES, and why there are two of them:
+ *   - TINT COLOUR is weighted by each tinting volume's containment weight
+ *     and NORMALISED (a weighted average), then eased by the combined
+ *     weight. BLUR/GHOST are weight-SCALED and summed, clamped at 1.0 -
+ *     not normalised, because half-containment should mean half the
+ *     effect, and two overlapping half-strength volumes should stack.
+ *   - paletteRow CANNOT be averaged. Row 2 and row 5 do not make row 3.5;
+ *     they make a completely different, probably wrong, palette. So it takes
+ *     the value from the highest-weighted volume THAT AUTHORS a palette
+ *     shift. Averaging it would flicker between rows wherever two overlap.
+ *
+ * The tint MODE is discrete for the same reason and follows the same rule,
+ * judged among the volumes that actually tint - you cannot average
+ * "additive" and "subtractive" into anything meaningful.
+ */
+static void update_postfx(void)
+{
+    g_postfx.weight = 0;
+    g_postfx.tintR = g_postfx.tintG = g_postfx.tintB = 0;
+    g_postfx.tintMode = POSTFX_TINT_BLEND50;
+    g_postfx.tintLayers = 0;
+    g_postfx.blurAmount = 0;
+    g_postfx.ghostAmount = 0;
+    g_postfx.paletteRow = -1;
+    postfxActiveVolumes = 0;
+
+    // NOT early-returns any more: the volume loop is skipped when there is
+    // nothing to evaluate, but the tail still runs so the DEBUG feedback
+    // editor's blur/ghost offsets work anywhere - including a stage that
+    // authors no volumes at all, which is exactly where you want to audition
+    // the effect before authoring one.
+    const STAGE_DEF *stage = (activeStageIndex < stageRegistryCount)
+                           ? &stageRegistry[activeStageIndex] : 0;
+    unsigned int volumeCount = (stage && stage->postfx) ? stage->postfxCount : 0;
+
+    int totalW = 0;          // sum of weights, for normalising the blends
+    int tintW = 0;           // sum of weights of volumes that actually tint
+    int accR = 0, accG = 0, accB = 0;
+    int accLayers = 0;
+    int accBlur = 0, accGhost = 0;
+
+    // Discrete params are tracked PER EFFECT, not from one overall winner:
+    // "highest-weighted volume" has to mean the highest-weighted volume THAT
+    // AUTHORS that effect. One shared winner was order-dependent - a strong
+    // volume with no tint could shadow a weaker tinting volume's authored
+    // mode (its COLOUR still blended in, but drew in the default mode), and
+    // likewise eat a palette row, depending on nothing but export order.
+    int bestTintW = 0, bestTintVol = 0;
+    int bestMode = POSTFX_TINT_BLEND50;
+    int bestPalW = 0, bestPalVol = 0;
+    int bestPaletteRow = -1;
+
+    for (unsigned int i = 0; i < volumeCount; i++)
+    {
+        const STAGE_POSTFX *fx = &stage->postfx[i];
+
+        int w = postfx_volume_weight(fx, &player_pos);
+        if (w <= 0) continue;
+
+        // MASTER INTENSITY multiplies the falloff weight. The two answer
+        // different questions - falloff is "how far into this volume am I",
+        // intensity is "how strong is this volume at full depth" - so they
+        // compose rather than override. Intensity 0 mutes the volume without
+        // the author having to untick four effects.
+        //
+        // Deliberately NOT clamped to 4096 here: over-driving is allowed (the
+        // editor permits >100%), and the individual results are clamped at
+        // the end. Clamping the weight would silently cap the very thing the
+        // over-drive exists to do.
+        w = (w * fx->intensity) >> 12;
+        if (w <= 0) continue;
+
+        postfxActiveVolumes++;
+        totalW += w;
+
+        // DISCRETE PARAMS: highest weight wins, and on a TIE the SMALLER
+        // volume wins.
+        //
+        // The tie is not an edge case - it is the normal case. Stand inside a
+        // small intense volume nested in a big ambient one and both report a
+        // full 4096, so without a tie-break the winner would be whichever
+        // happened to come first in the exported array, i.e. authoring order.
+        // Preferring the smaller volume encodes the obvious intent: the
+        // tighter volume is the more specific statement about this spot.
+        //
+        // Sum of half-extents rather than the true volume - one multiply
+        // short of meaningless here, and it cannot overflow the way a
+        // product of three 20.12 extents could.
+        int vol = fx->halfExtent.vx + fx->halfExtent.vy + fx->halfExtent.vz;
+
+        if (fx->tint && (w > bestTintW || (w == bestTintW && vol < bestTintVol)))
+        {
+            bestTintW   = w;
+            bestTintVol = vol;
+            bestMode    = fx->tintMode;
+        }
+        if (fx->palette && (w > bestPalW || (w == bestPalW && vol < bestPalVol)))
+        {
+            bestPalW       = w;
+            bestPalVol     = vol;
+            bestPaletteRow = fx->paletteRow;
+        }
+
+        if (fx->tint)
+        {
+            tintW += w;
+            accR += fx->tintR * w;
+            accG += fx->tintG * w;
+            accB += fx->tintB * w;
+            accLayers += fx->tintStrength * w;
+        }
+        if (fx->blur)  accBlur  += (fx->blurAmount  * w) >> 12;
+        if (fx->ghost) accGhost += (fx->ghostAmount * w) >> 12;
+    }
+
+    if (totalW > 0)
+    {
+    // Cap the combined weight at 1.0. Overlapping volumes are meant to layer,
+    // not to multiply into something the author never previewed.
+    g_postfx.weight = totalW > 4096 ? 4096 : totalW;
+
+    if (tintW > 0)
+    {
+        g_postfx.tintR = accR / tintW;
+        g_postfx.tintG = accG / tintW;
+        g_postfx.tintB = accB / tintW;
+        g_postfx.tintMode = bestMode;
+
+        int layers = accLayers / tintW;   // weighted avg strength, 1..8
+
+        if (bestMode == POSTFX_TINT_BLEND50)
+        {
+            // BLEND50 has no neutral colour - ANY quad pulls the frame 50%
+            // toward its colour - so the only ramp available is layer count.
+            // ROUNDED, not floored: floored, the default strength-1 volume
+            // computed 0 layers at every weight below 4096, so the falloff
+            // ramp did nothing and the tint popped on at the box edge. The
+            // step is still a step (fixed-ratio hardware), but it now lands
+            // mid-falloff instead of never.
+            layers = (layers * g_postfx.weight + 2048) >> 12;
+        }
+        else
+        {
+            // ADDITIVE / SUBTRACTIVE / QUARTER all treat BLACK as neutral
+            // (B +/- 0 == B), so the falloff can ease the COLOUR itself - a
+            // genuinely smooth per-frame ramp the fixed blend ratios cannot
+            // provide - and the layer count stays the authored strength.
+            g_postfx.tintR = (g_postfx.tintR * g_postfx.weight) >> 12;
+            g_postfx.tintG = (g_postfx.tintG * g_postfx.weight) >> 12;
+            g_postfx.tintB = (g_postfx.tintB * g_postfx.weight) >> 12;
+        }
+
+        if (layers > POSTFX_MAX_TINT_LAYERS) layers = POSTFX_MAX_TINT_LAYERS;
+        g_postfx.tintLayers = layers;
+    }
+
+    g_postfx.blurAmount  = accBlur  > 4096 ? 4096 : accBlur;
+    g_postfx.ghostAmount = accGhost > 4096 ? 4096 : accGhost;
+    g_postfx.paletteRow  = bestPaletteRow;
+    }   // totalW > 0
+
+    // DEBUG feedback-editor offsets, applied LAST and outside the volume
+    // guard - authored value + live offset, clamped into the amounts' own
+    // 0..4096 range. Zero offsets leave an untouched build bit-identical.
+    g_postfx.blurAmount  += g_postfx_blur_add;
+    g_postfx.ghostAmount += g_postfx_ghost_add;
+    if (g_postfx.blurAmount  < 0)    g_postfx.blurAmount  = 0;
+    if (g_postfx.blurAmount  > 4096) g_postfx.blurAmount  = 4096;
+    if (g_postfx.ghostAmount < 0)    g_postfx.ghostAmount = 0;
+    if (g_postfx.ghostAmount > 4096) g_postfx.ghostAmount = 4096;
+}
+
+// Triangles DRAWN this frame from a depth shallower than NEAR_WARP_SZ, i.e.
+// close enough that the GTE's perspective divide may have saturated and the
+// projected corners may be wrong. Not a cull count - these are on screen.
+// Diagnostic for the near-camera stretching long geometry shows; see
+// NEAR_WARP_SZ for how to interpret it.
+int nearWarpTriCount = 0;           // triangles, reset in draw_stage()
+
 // ---- Fog density drift (L1+L2 + TRIANGLE) ------------------------------
 // Slow sine breathing on the fog's far edge. Deliberately ONE-SIDED: it
 // only ever pushes far OUTWARD from the authored value, never inward. That
@@ -1275,7 +2673,7 @@ int g_fog_drift_phase = 0;          // advances once per frame in update()
 
 #define FOG_NEAR_MIN     64         // below this the perspective divide
                                     // is already saturating (draw_object_
-                                    // into_ot rejects SZ < 64 anyway)
+                                    // into_ot rejects SZ < NEAR_CLIP_SZ anyway)
 #define FOG_FAR_MAX      32000      // far*65536 must stay inside int32 in
                                     // setup_frame_fog's DQB staging
 #define FOG_STEP         32         // world units per held frame
@@ -1527,6 +2925,134 @@ static int edge_pressed(unsigned short raw, unsigned short mask)
     return !(raw & mask) && (prevPadRaw & mask);
 }
 
+// ======================== PLAYER COLLISION ===============================
+// Which axes pushed back this frame - bit 0 = X, bit 1 = Z. Recomputed every
+// PLAY frame, read only by the debug overlay. Cheap, and "am I actually
+// being blocked or does it just feel like it" is the first question anyone
+// asks when this feels wrong.
+static int player_blocked_axes = 0;
+
+// Switch a collision box on or off by its authored colliderId. Returns the
+// number of boxes changed (0 means the id matched nothing).
+//
+// THE POINT OF colliderId. Everything else about a box is baked and static;
+// this is the one thing that moves at runtime. A Switch Scene trigger already
+// knows how to address a sound by soundId - a "toggle collider" action is the
+// same shape, and this is the function it will call. Exposed now, with the
+// data already carrying ids, so adding that action is a stage-gen change
+// rather than a runtime one.
+//
+// Ids are NOT unique by construction (a hand-written stage.json could repeat
+// one), so this toggles every match rather than stopping at the first - which
+// is also the useful behaviour if an author deliberately gives a row of
+// barrier boxes one shared id.
+int set_collider_enabled(int colliderId, int enabled)
+{
+    int changed = 0;
+    for (unsigned int i = 0; i < activeColliderCount; i++)
+    {
+        if (stageColliders[i].colliderId != colliderId) continue;
+        stageColliders[i].enabled = enabled ? 1 : 0;
+        changed++;
+    }
+    return changed;
+}
+
+
+// Pushes the player out of any collider they are overlapping, along ONE axis
+// (0 = X, 2 = Z, matching the VECTOR component order). Returns 1 if anything
+// pushed back.
+//
+// CALLED ONCE PER AXIS, IMMEDIATELY AFTER THAT AXIS MOVES - never once after
+// both. That sequencing is the entire wall-sliding implementation: blocked on
+// X, the Z component of the same input still applies, so the player slides
+// along the wall instead of stopping dead. No slide vector, no dot products,
+// no special case for "am I against a wall" - it falls out of the ordering.
+//
+// The player is a vertical cylinder (PLAYER_RADIUS / PLAYER_HEIGHT). The test
+// inflates the box by the radius and treats the player as a point - the
+// Minkowski sum - which is exact everywhere except the box's corner regions,
+// where a true cylinder should push out radially and this pushes out
+// axis-aligned.
+static int resolve_player_axis(int axis)
+{
+    int blocked = 0;
+
+    // RENDERER Y DECREASES UPWARD throughout. The head is at a SMALLER Y
+    // than the feet, and a box's "top" is its smaller-Y face. Getting this
+    // backwards inverts every vertical test while still compiling and still
+    // looking plausible, so it is spelled out rather than inlined.
+    int feet = player_pos.vy;
+    int head = player_pos.vy - PLAYER_HEIGHT;
+
+    for (unsigned int i = 0; i < activeColliderCount; i++)
+    {
+        const COLLIDER_BOX *c = &stageColliders[i];
+
+        // Runtime-toggleable: a box switched off is present in the table but
+        // not solid. Checked FIRST because it is one byte and rejects the
+        // whole test.
+        if (!c->enabled)
+            continue;
+
+        int boxTop    = c->centre.vy - c->halfExtent.vy;   // smaller Y == higher
+        int boxBottom = c->centre.vy + c->halfExtent.vy;
+
+        // Step tolerance FIRST - it is the cheapest reject and the one that
+        // stops the ground plane behaving as a wall (see PLAYER_STEP_HEIGHT).
+        // A box whose top is no more than a step above the feet is something
+        // you stand on. This also rejects everything strictly BELOW the
+        // player, whose top is at a LARGER Y than the feet.
+        if (boxTop >= feet - PLAYER_STEP_HEIGHT)
+            continue;
+
+        // Vertical overlap: a box entirely above head height is something to
+        // walk under, not into.
+        if (boxBottom <= head)
+            continue;
+
+        // XZ overlap against the radius-inflated box.
+        int dx = player_pos.vx - c->centre.vx; if (dx < 0) dx = -dx;
+        if (dx >= c->halfExtent.vx + PLAYER_RADIUS)
+            continue;
+
+        int dz = player_pos.vz - c->centre.vz; if (dz < 0) dz = -dz;
+        if (dz >= c->halfExtent.vz + PLAYER_RADIUS)
+            continue;
+
+        // Overlapping. Push out to whichever face of THIS axis the player's
+        // centre is nearer - which, because we only ever resolve the axis
+        // just moved, is the face they came in through.
+        if (axis == 0)
+        {
+            if (player_pos.vx >= c->centre.vx)
+                player_pos.vx = c->centre.vx + c->halfExtent.vx + PLAYER_RADIUS;
+            else
+                player_pos.vx = c->centre.vx - c->halfExtent.vx - PLAYER_RADIUS;
+        }
+        else
+        {
+            if (player_pos.vz >= c->centre.vz)
+                player_pos.vz = c->centre.vz + c->halfExtent.vz + PLAYER_RADIUS;
+            else
+                player_pos.vz = c->centre.vz - c->halfExtent.vz - PLAYER_RADIUS;
+        }
+
+        blocked = 1;
+        // No break: a corner is two overlapping colliders, and resolving only
+        // the first would leave the player inside the second.
+        //
+        // KNOWN LIMITATION - THE SQUEEZE. Single-pass resolution cannot solve
+        // a gap NARROWER THAN THE PLAYER'S DIAMETER: box A pushes right, box B
+        // pushes left, and whichever is tested last wins. Iterating would not
+        // fix it - there is no valid position to converge on. The authoring
+        // rule is to leave more than 2 * PLAYER_RADIUS between solid faces.
+    }
+
+    return blocked;
+}
+
+
 // ---- PLAY mode: the actual game (default on boot) ----
 // Fully digital, nothing held. The D-pad moves the player camera-relative;
 // L1/R1 orbit the follow-cam yaw around the player; L2/R2 pitch its view up/
@@ -1546,6 +3072,15 @@ static void update_play(unsigned short raw)
     if (!(raw & PAD_R2)) player_cam_pitch += dt_scale(PLAYER_CAM_PITCH_SPEED);
     if (player_cam_pitch < PLAYER_CAM_PITCH_MIN) player_cam_pitch = PLAYER_CAM_PITCH_MIN;
     if (player_cam_pitch > PLAYER_CAM_PITCH_MAX) player_cam_pitch = PLAYER_CAM_PITCH_MAX;
+
+    // Pin to the ground plane BEFORE moving, not after. No gravity yet, so
+    // this is the same value either way - but resolve_player_axis() reads
+    // player_pos.vy to decide which colliders are walls, and it should read
+    // THIS frame's height rather than last frame's. When gravity lands and
+    // vy genuinely changes per frame, that distinction stops being academic.
+    player_pos.vy = player_ground_y;
+
+    player_blocked_axes = 0;   // recomputed below; overlay-only
 
     // Movement: D-pad, treated as full deflection (+/-128) on each axis.
     int mx = 0, my = 0;
@@ -1569,6 +3104,15 @@ static void update_play(unsigned short raw)
         // units as before now that full deflection is a fixed +/-128.
         int f = -my, s = mx;
 
+        // Normalise diagonals: with both axes at full deflection |(f,s)| is
+        // 181, not 128, so the raw basis moved the player ~41% faster
+        // diagonally than straight. 2896/4096 == 1/sqrt(2).
+        if (mx != 0 && my != 0)
+        {
+            f = (f * 2896) >> 12;
+            s = (s * 2896) >> 12;
+        }
+
         // DELTA-TIMED, via accumulators rather than dt_scale(). The step is
         // built in 20.12 - (fwd*f + rgt*s)/128 lands at ~4096 magnitude, so
         // multiplying by PLAYER_MOVE_SPEED gives units-per-tick already in
@@ -1585,8 +3129,27 @@ static void update_play(unsigned short raw)
         int stepFP_X = ((fwdX * f + rgtX * s) / 128) * PLAYER_MOVE_SPEED;
         int stepFP_Z = ((fwdZ * f + rgtZ * s) / 128) * PLAYER_MOVE_SPEED;
 
+        // MOVE ONE AXIS, RESOLVE IT, THEN THE NEXT. Not both moves followed
+        // by one resolve - see resolve_player_axis()'s comment: this ordering
+        // IS the wall-sliding.
+        //
+        // Zeroing the accumulator on a blocked axis matters and is easy to
+        // miss. dt_advance() banks the sub-unit remainder; while the player
+        // pushes into a wall that remainder would keep accruing with nowhere
+        // to go, then discharge as a visible jolt the instant they turn away.
         player_pos.vx += dt_advance(&player_move_frac_x, stepFP_X);
+        if (resolve_player_axis(0))
+        {
+            player_move_frac_x = 0;
+            player_blocked_axes |= 1;
+        }
+
         player_pos.vz += dt_advance(&player_move_frac_z, stepFP_Z);
+        if (resolve_player_axis(2))
+        {
+            player_move_frac_z = 0;
+            player_blocked_axes |= 2;
+        }
 
         // Face the direction of travel (OBJ files carry no look target, so
         // travel direction IS the look direction).
@@ -1595,7 +3158,20 @@ static void update_play(unsigned short raw)
         player_rot.vz = 0;
     }
 
-    player_pos.vy = PLAYER_GROUND_Y;   // no gravity: locked to the ground plane
+    // (The ground-plane pin moved ABOVE the movement block - see the comment
+    // there. Collision resolution needs this frame's height before it can
+    // decide what counts as a wall.)
+
+    // Volume tests LAST, against the position the player actually ended the
+    // frame at. Testing before the move would fire a doorway a frame late
+    // and, worse, test a position the player was never rendered at. Takes
+    // this frame's pad state for the CROSS interact check.
+    update_triggers(raw);
+
+    // (Post-process volumes are evaluated in update(), NOT here - they must
+    // re-evaluate every frame in every mode, or the last PLAY frame's
+    // blur/ghost/tint would freeze in place through a stage transition and
+    // while tabbed into CAMERA/DEBUG. See update().)
 }
 
 // ---- CAMERA mode: free-fly dev camera ----
@@ -1700,8 +3276,106 @@ static void fog_clamp_range(void)
 }
 
 
+// Loads a stage's authored fog (STAGE_FOG, baked by py_convert_stages.py)
+// into the live fog_* globals, the parallel of load_stage_lights() for the
+// fog block. Called once per stage load from load_stage(), for EVERY stage -
+// fog is a single stage-level block with no runtime fallback, so skipping an
+// unauthored one would let the previous stage's fog persist across a runtime
+// stage switch (the same reason authored lights are authoritative and there
+// is no recovery sun).
+//
+// stage == NULL is the no-stage boot path (stageRegistryCount == 0): fog
+// falls back to main.c's compiled-in defaults, so an empty assets/stage/
+// looks exactly as it did before fog was authorable.
+//
+// The authored nearZ/farZ are baked RAW by the converter - this is where
+// they get clamped, by calling the very same fog_clamp_range() the DEBUG
+// pad editor uses. So the one authority on "what range this projection can
+// render" is fog_clamp_range(), whether the values came from the editor or
+// from stage data; setup_frame_fog() still rails independently as a final
+// backstop.
+void load_stage_fog(const STAGE_DEF *stage)
+{
+    if (stage)
+    {
+        fog_enabled       = stage->fog.enabled ? 1 : 0;
+        fog_cull_enabled  = stage->fog.cull    ? 1 : 0;
+        fog_drift_enabled = stage->fog.drift   ? 1 : 0;
+        fog_layers        = stage->fog.layers;
+        fog_near          = stage->fog.nearZ;
+        fog_far           = stage->fog.farZ;
+        g_fog_col_r       = stage->fog.r;
+        g_fog_col_g       = stage->fog.g;
+        g_fog_col_b       = stage->fog.b;
+    }
+    else
+    {
+        // No stage: main.c's compiled-in defaults (fog off, mid-grey).
+        fog_enabled       = 0;
+        fog_cull_enabled  = 0;
+        fog_drift_enabled = 0;
+        fog_layers        = 3;
+        fog_near          = 800;
+        fog_far           = 6000;
+        g_fog_col_r       = FOG_COL_R;
+        g_fog_col_g       = FOG_COL_G;
+        g_fog_col_b       = FOG_COL_B;
+    }
+
+    // Layer count indexes fixed-size arrays (g_fog_layer_bucket[FOG_MAX_
+    // LAYERS]) and drives the per-frame prim budget - clamp it even though
+    // the converter already did, since this global is also live-editable.
+    if (fog_layers < 0)              fog_layers = 0;
+    if (fog_layers > FOG_MAX_LAYERS) fog_layers = FOG_MAX_LAYERS;
+
+    // Clamp near/far into the range the current projection can actually
+    // render (see fog_clamp_range's derivation) - raw authored values could
+    // otherwise rail DQA or overflow DQB, which INVERTS fog on hardware.
+    fog_clamp_range();
+
+    // The fog colour is also the SCREEN CLEAR colour: repaint both draw envs
+    // so the void behind geometry matches the shade geometry depth-cues
+    // toward (see the FOG_COL_* block). isbg was already set in init() and
+    // the change is picked up by the next PutDrawEnv() in display(), so this
+    // is all that a runtime stage switch needs to recolour the background.
+    setRGB0(&draw[0], g_fog_col_r, g_fog_col_g, g_fog_col_b);
+    setRGB0(&draw[1], g_fog_col_r, g_fog_col_g, g_fog_col_b);
+}
+
+
 static void update_debug(unsigned short raw)
 {
+    // Hold L1+R1: STAGE SWITCHER (test harness). LEFT/RIGHT step through
+    // stageRegistry[] and start a real transition - the same fade, load and
+    // music swap a trigger volume would produce.
+    //
+    // WHY THIS EXISTS SEPARATELY FROM TRIGGERS: it exercises the switch path
+    // with no dependency on authored Spawns, authored Triggers, or the
+    // volume test firing correctly. When a door doesn't work, this is how
+    // you find out whether the problem is the trigger or the switch - and
+    // it's the only way to reach a stage that nothing links to yet.
+    //
+    // L1+R1 is free rather than merely unused: in unmodified DEBUG they are
+    // the two roll directions, so holding both is already a no-op (the
+    // rotations cancel). Checked FIRST, before the L1+L2 fog editor, and the
+    // two combos can't overlap since one needs R1 and the other L2.
+    //
+    // Arrives at SPAWN_ID_DEFAULT - the destination's lowest spawnId - since
+    // a debug jump isn't coming through any particular door.
+    if (!(raw & PAD_L1) && !(raw & PAD_R1))
+    {
+        if (stageRegistryCount > 1)
+        {
+            if (edge_pressed(raw, PAD_RIGHT))
+                stage_transition_begin((activeStageIndex + 1) % stageRegistryCount,
+                                       SPAWN_ID_DEFAULT);
+            if (edge_pressed(raw, PAD_LEFT))
+                stage_transition_begin((activeStageIndex + stageRegistryCount - 1) % stageRegistryCount,
+                                       SPAWN_ID_DEFAULT);
+        }
+        return;
+    }
+
     // Hold L1+L2: LIVE FOG EDITOR. Checked BEFORE the L2-only branch so the
     // combination is unambiguous, and deliberately a combination rather
     // than a lone shoulder button: L2 alone already owns the intensity
@@ -1751,6 +3425,51 @@ static void update_debug(unsigned short raw)
         return;
     }
 
+    // Hold R1+L2: POST-FX FEEDBACK EDITOR. Live knobs over the blur/ghost
+    // machinery - see the g_postfx_fb_* declarations for what each value
+    // does to the loop. Checked BEFORE the L2-only branch so the combo is
+    // unambiguous; R1 alone stays the +Z roll and L2 alone the intensity
+    // editor, both suspended while this is held (the same trade every other
+    // combo makes). Can't collide with the branches above: the switcher
+    // needs L1+R1 and the fog editor L1+L2, and L1 is not part of this one.
+    //   Up/Down    - ghost amount offset (authored + offset, like lights)
+    //   Left/Right - blur amount offset
+    //   CROSS      - cycle the feedback blend rate (ABR 0..3)
+    //   SQUARE     - feedback brightness down (128 = neutral)
+    //   CIRCLE     - feedback brightness up
+    //   TRIANGLE   - reset every feedback override to neutral
+    if (!(raw & PAD_R1) && !(raw & PAD_L2))
+    {
+        if (!(raw & PAD_UP))    g_postfx_ghost_add += dt_scale(32);
+        if (!(raw & PAD_DOWN))  g_postfx_ghost_add -= dt_scale(32);
+        if (!(raw & PAD_RIGHT)) g_postfx_blur_add  += dt_scale(32);
+        if (!(raw & PAD_LEFT))  g_postfx_blur_add  -= dt_scale(32);
+        if (g_postfx_ghost_add < -4096) g_postfx_ghost_add = -4096;
+        if (g_postfx_ghost_add >  4096) g_postfx_ghost_add =  4096;
+        if (g_postfx_blur_add  < -4096) g_postfx_blur_add  = -4096;
+        if (g_postfx_blur_add  >  4096) g_postfx_blur_add  =  4096;
+
+        if (edge_pressed(raw, PAD_CROSS))
+            g_postfx_fb_abr = (g_postfx_fb_abr + 1) & 3;
+
+        // Brightness is a held ramp, not a click - it is the fine control,
+        // and stepping it 1-2 units per frame is exactly how you find the
+        // value where trails decay the way you want.
+        if (!(raw & PAD_SQUARE)) g_postfx_fb_bright -= dt_scale(2);
+        if (!(raw & PAD_CIRCLE)) g_postfx_fb_bright += dt_scale(2);
+        if (g_postfx_fb_bright < 0)   g_postfx_fb_bright = 0;
+        if (g_postfx_fb_bright > 255) g_postfx_fb_bright = 255;
+
+        if (edge_pressed(raw, PAD_TRIANGLE))
+        {
+            g_postfx_blur_add  = 0;
+            g_postfx_ghost_add = 0;
+            g_postfx_fb_abr    = 0;
+            g_postfx_fb_bright = 128;
+        }
+        return;
+    }
+
     // Hold L2: LIVE INTENSITY EDITOR (only meaningful with GTE lighting on).
     // Up/Down moves the authored lights' intensity by eye - the model-
     // rotation and FOV controls below are suspended while L2 is held. Light
@@ -1776,26 +3495,54 @@ static void update_debug(unsigned short raw)
         return;
     }
 
-    // Pitch (X rotation): D-pad up/down.
-    if (!(raw & PAD_UP))   model_rot.vx -= dt_scale(ROT_SPEED);
-    if (!(raw & PAD_DOWN)) model_rot.vx += dt_scale(ROT_SPEED);
-    model_rot.vx &= 4095;
+    // MODEL ROTATION REMOVED. D-pad pitch/yaw and L1/R1 roll used to drive
+    // model_rot here - a global debug transform applied to every stage object
+    // at once. It dated from the single-model days, when spinning the one
+    // thing on screen was the only way to inspect it; with a stage full of
+    // authored objects and a free-fly CAMERA mode that orbits properly, it
+    // stopped being the way anyone actually looks at geometry and became
+    // three inputs held hostage on the most contested pad in the build.
+    //
+    // model_rot/model_pos/debug_scale still EXIST and are still folded in by
+    // get_object_transform(), so anything that sets them keeps working - only
+    // the pad bindings are gone. build_stage_colliders() deliberately ignores
+    // them (see its comment), which is another reason not to steer by them.
+    //
+    // The D-pad, L1 and R1 are now free in plain DEBUG for the feedback
+    // editor below.
 
-    // Yaw (Y rotation): D-pad left/right.
-    if (!(raw & PAD_LEFT))  model_rot.vy -= dt_scale(ROT_SPEED);
-    if (!(raw & PAD_RIGHT)) model_rot.vy += dt_scale(ROT_SPEED);
-    model_rot.vy &= 4095;
+    // ---- FEEDBACK (blur / ghost) LIVE EDITOR ----
+    // Authored value + live offset, the same pattern the light intensity
+    // editor uses: g_postfx_blur_add / g_postfx_ghost_add are added to
+    // whatever the volumes resolved to, so this tunes ON TOP of authored
+    // data rather than replacing it, and zeroing them restores the stage.
+    if (!(raw & PAD_UP))    g_postfx_ghost_add += dt_scale(32);
+    if (!(raw & PAD_DOWN))  g_postfx_ghost_add -= dt_scale(32);
+    if (!(raw & PAD_RIGHT)) g_postfx_blur_add  += dt_scale(32);
+    if (!(raw & PAD_LEFT))  g_postfx_blur_add  -= dt_scale(32);
+    if (g_postfx_ghost_add < -4096) g_postfx_ghost_add = -4096;
+    if (g_postfx_ghost_add >  4096) g_postfx_ghost_add =  4096;
+    if (g_postfx_blur_add  < -4096) g_postfx_blur_add  = -4096;
+    if (g_postfx_blur_add  >  4096) g_postfx_blur_add  =  4096;
 
-    // Roll (Z rotation): L1/R1.
-    if (!(raw & PAD_L1)) model_rot.vz -= dt_scale(ROT_SPEED);
-    if (!(raw & PAD_R1)) model_rot.vz += dt_scale(ROT_SPEED);
-    model_rot.vz &= 4095;
+    // L1/R1: ISOLATE ONE FEEDBACK PASS. This is a diagnostic, not a feature.
+    // Blur draws four offset passes (-X, +X, -Y, +Y) and ghost draws N at
+    // zero offset, all compositing on top of each other - so when the result
+    // looks wrong there is no way to tell WHICH pass is misbehaving. This
+    // steps through them one at a time: 0 = all (normal), 1..4 = that pass
+    // alone. See g_postfx_pass_isolate.
+    if (edge_pressed(raw, PAD_R1)) g_postfx_pass_isolate++;
+    if (edge_pressed(raw, PAD_L1)) g_postfx_pass_isolate--;
+    if (g_postfx_pass_isolate < 0) g_postfx_pass_isolate = POSTFX_FEEDBACK_MAX_PASSES;
+    if (g_postfx_pass_isolate > POSTFX_FEEDBACK_MAX_PASSES) g_postfx_pass_isolate = 0;
 
     // FOV: CROSS widens, CIRCLE narrows.
     if (!(raw & PAD_CROSS))  fov += dt_scale(fov_speed);
     if (!(raw & PAD_CIRCLE)) fov -= dt_scale(fov_speed);
     if (fov > 65535) fov = 0;
-    if (fov < -65535) fov = 65536;
+    if (fov < -65535) fov = 65535; // wrap to the top, INSIDE the bound the
+                                   // line above enforces - the old 65536
+                                   // escaped it for one frame
 
     // Edge-detected render toggles.
     if (edge_pressed(raw, PAD_TRIANGLE)) use_vertex_light ^= 1;
@@ -1845,8 +3592,26 @@ void update(void)
         prev_mode = control_mode;
     }
 
+    // Advance any in-flight stage switch BEFORE the mode handlers, so a
+    // transition that finishes this frame hands control back on the same
+    // frame rather than costing an extra one.
+    stage_transition_tick();
+
     // Dispatch to the active mode's handler - each owns the whole pad.
-    if      (control_mode == MODE_PLAY)   update_play(raw);
+    //
+    // PLAY IS FROZEN DURING A TRANSITION. Two reasons, and the second is the
+    // load-bearing one: the player shouldn't drift while the screen is dark
+    // and they can't see, and - more importantly - they are usually still
+    // standing INSIDE the trigger volume that started the switch. Letting
+    // update_play() run would keep re-testing that volume every frame of the
+    // fade. stage_transition_begin() already refuses re-entry, so this isn't
+    // the only guard, but freezing means the player also isn't carried
+    // several frames of movement past the doorway before the load happens.
+    //
+    // CAMERA and DEBUG stay live on purpose: they're dev tooling, and being
+    // able to fly the camera or read the overlay while a transition runs is
+    // exactly what you want when one misbehaves.
+    if      (control_mode == MODE_PLAY)   { if (!stage_transition_active()) update_play(raw); }
     else if (control_mode == MODE_CAMERA) update_camera_mode(raw);
     else                                  update_debug(raw);
 
@@ -1866,6 +3631,17 @@ void update(void)
     // the other modes on purpose so CAMERA's free-fly position survives.
     if (control_mode == MODE_PLAY && playerSpawned)
         update_player_follow_camera();
+
+    // Post-process volumes, EVERY frame in EVERY mode - after the mode
+    // handlers so it reads the position the player actually ended the frame
+    // at (the tint is drawn from this result later in the SAME frame).
+    // Deliberately not inside update_play(): PLAY is frozen during a
+    // transition and skipped in CAMERA/DEBUG, and the effect state must
+    // keep tracking the world through both - a stage switch teleports the
+    // player, and the old stage's blur has no business surviving the fade.
+    // The volumes are keyed to the PLAYER, so flying the CAMERA away in
+    // dev modes correctly leaves the effect where the player stands.
+    update_postfx();
 
     prevPadRaw = raw;
 }
@@ -1932,6 +3708,9 @@ void update_object_world_and_compose(const VECTOR *pos, SVECTOR *rot, const VECT
     // RotMatrix() takes a non-const SVECTOR* (psxgte.h), so `rot` can't be
     // const here even though this function never writes through it.
     RotMatrix(rot, &world_matrix);
+
+    // Keep the pure rotation (pre-scale) for lighting - see world_light_rot.
+    world_light_rot = world_matrix;
 
     // Apply per-axis scale by scaling each COLUMN of the rotation matrix
     // (R * diag(scale) - scaling before rotating equals scaling each
@@ -2164,9 +3943,10 @@ void setup_frame_fog(void)
     gte_SetDQB(dqb);
 
     // FAR COLOUR - what fully-fogged geometry converges to under the depth
-    // cue. The same constant the OT fog quads and the screen clear colour
-    // use; see the FOG_COL_* block for why all three must agree.
-    gte_SetFarColor(FOG_COL_R, FOG_COL_G, FOG_COL_B);
+    // cue. The same colour the OT fog quads and the screen clear colour use
+    // (the g_fog_col_* globals, stage-authored); see the FOG_COL_* block for
+    // why all three must agree.
+    gte_SetFarColor(g_fog_col_r, g_fog_col_g, g_fog_col_b);
 }
 
 
@@ -2273,10 +4053,13 @@ void draw_fog_layers(void)
     if (nearD < 1) nearD = 1;
     if (farD <= nearD) farD = nearD + 1;
 
-    // Gradient endpoint colours, clamped once rather than per corner.
-    int gradTopR = FOG_COL_R + FOG_GRAD_TOP,    gradBotR = FOG_COL_R + FOG_GRAD_BOTTOM;
-    int gradTopG = FOG_COL_G + FOG_GRAD_TOP,    gradBotG = FOG_COL_G + FOG_GRAD_BOTTOM;
-    int gradTopB = FOG_COL_B + FOG_GRAD_TOP,    gradBotB = FOG_COL_B + FOG_GRAD_BOTTOM;
+    // Gradient endpoint colours, clamped once rather than per corner. Built
+    // from the live stage fog colour (g_fog_col_*), not the compile-time
+    // default, so the quads track an authored colour with the far colour and
+    // clear colour.
+    int gradTopR = g_fog_col_r + FOG_GRAD_TOP,    gradBotR = g_fog_col_r + FOG_GRAD_BOTTOM;
+    int gradTopG = g_fog_col_g + FOG_GRAD_TOP,    gradBotG = g_fog_col_g + FOG_GRAD_BOTTOM;
+    int gradTopB = g_fog_col_b + FOG_GRAD_TOP,    gradBotB = g_fog_col_b + FOG_GRAD_BOTTOM;
     if (gradTopR < 0) gradTopR = 0; if (gradTopR > 255) gradTopR = 255;
     if (gradTopG < 0) gradTopG = 0; if (gradTopG > 255) gradTopG = 255;
     if (gradTopB < 0) gradTopB = 0; if (gradTopB > 255) gradTopB = 255;
@@ -2362,6 +4145,268 @@ void draw_fog_layers(void)
         nextpri += sizeof(DR_TPAGE);
         primBytesRemaining -= sizeof(DR_TPAGE);
     }
+}
+
+
+// Full-screen subtractive fade quad for stage transitions: abr=2 is
+// dest - src, so a quad of value L darkens every channel of the finished
+// frame. Bucket 0 (nearest, walked last) puts it over everything except
+// the debug overlay, which FntFlush() paints after DrawOTag() - deliberate.
+// One POLY_F4 + one DR_TPAGE, only while a fade is in flight. Full
+// reasoning lives in the STAGE TRANSITION block up top.
+// ---- Blur / Ghost: framebuffer feedback ----
+//
+// NO SCRATCH VRAM. An earlier plan for this copied the framebuffer into the
+// free block at x:336-639 - which cannot work cleanly anyway, since that
+// block is 304 units wide and the framebuffer is 320, and MoveImage() cannot
+// scale. The better answer was sitting in the double-buffer layout:
+//
+//   disp[db] is at y = db * DISPLAY_H and holds the PREVIOUS COMPLETE FRAME.
+//   draw[db] is the other half, which is what this frame is drawing into.
+//
+// The displayed buffer is being scanned out, not written, so it is stable for
+// the whole frame - and VRAM is unified, so it is addressable as a texture.
+// Feedback is therefore just "texture a quad from the other half of VRAM",
+// with no copy, no scratch region, and no width limit.
+//
+// THE COST is that the source is one frame stale. For a ghost that is exactly
+// right (it IS the previous frame). For a blur it means the smear lags by a
+// frame, which at this framerate is not perceptible on atmospheric effects -
+// and it is the difference between this being ~4 quads and being a render-
+// target switch plus a downscale pass.
+//
+// TWO QUADS PER PASS, not one. A 16bpp texture page covers 256 VRAM units,
+// and the framebuffer is 320 wide - so the screen splits at x=256 into a
+// 256-wide quad reading page x=0 and a 64-wide quad reading page x=256.
+// Missing this draws the right-hand 64 pixels as a smear of the left edge.
+
+// Emits one full-screen textured quad pair sampling the displayed buffer,
+// shifted by (ox, oy) screen pixels. `srcY` is the displayed buffer's VRAM
+// row. Returns 0 if the primitive budget ran out.
+static int postfx_feedback_pass(int srcY, int ox, int oy, int bucket)
+{
+    // Left 256 columns, then the remaining 64 - see the tpage note above.
+    static const int SPLIT = 256;
+    const int segX[2]  = { 0, SPLIT };
+    const int segW[2]  = { SPLIT, DISPLAY_W - SPLIT };
+    const int pageX[2] = { 0, SPLIT };
+
+    for (int s = 0; s < 2; s++)
+    {
+        if (segW[s] <= 0) continue;
+
+        if (primBytesRemaining < (long)sizeof(POLY_FT4))
+        {
+            primOverflowCount++;
+            return 0;
+        }
+
+        POLY_FT4 *q = (POLY_FT4 *)nextpri;
+        setPolyFT4(q);
+        // 128 is NEUTRAL for texture modulation on this hardware, not 255 -
+        // 255 would brighten the sampled frame by 2x every pass and the
+        // "blur" would rapidly bloom to white. g_postfx_fb_bright defaults
+        // to exactly that neutral 128; the DEBUG feedback editor moves it
+        // to scale the feedback term continuously (see its declaration).
+        setRGB0(q, g_postfx_fb_bright, g_postfx_fb_bright, g_postfx_fb_bright);
+        setSemiTrans(q, 1);
+
+        setXY4(q,
+            segX[s] + ox,           oy,
+            segX[s] + segW[s] + ox, oy,
+            segX[s] + ox,           DISPLAY_H + oy,
+            segX[s] + segW[s] + ox, DISPLAY_H + oy);
+
+        // UVs are page-relative, so both segments start at u=0.
+        setUV4(q,
+            0,          0,
+            segW[s] - 1, 0,
+            0,          DISPLAY_H - 1,
+            segW[s] - 1, DISPLAY_H - 1);
+
+        // TPAGE ON THE PRIMITIVE, not a separate DR_TPAGE - the same way
+        // every textured prim in draw_object_into_ot() does it. A textured
+        // poly carries its own page, so the trailing-DR_TPAGE trick the fog
+        // and fade quads need (they are UNtextured, and the blend rate lives
+        // in the page register regardless) simply does not apply here.
+        //
+        //   2 = 16bpp direct colour, which is what a framebuffer is.
+        //   abr defaults to 0 = B/2 + F/2, the even blend, so N passes
+        //       converge on the average rather than saturating toward
+        //       white; the DEBUG feedback editor can cycle it through the
+        //       other three rates (see g_postfx_fb_abr for what each does).
+        // No setClut: a 16bpp texture is direct colour and has no palette.
+        setTPage(q, 2, g_postfx_fb_abr, pageX[s], srcY);
+
+        addPrim(&ot[db][bucket], q);
+        nextpri += sizeof(POLY_FT4);
+        primBytesRemaining -= sizeof(POLY_FT4);
+    }
+    return 1;
+}
+
+// Blur and ghost, both built from the same feedback pass.
+//
+//   GHOST is TEMPORAL: the previous frame drawn back at zero offset, so
+//         moving things leave a trail behind them.
+//   BLUR  is SPATIAL: the previous frame drawn back at a small offset whose
+//         DIRECTION ROTATES frame by frame (-x, +x, -y, +y). One pass.
+//
+// WHY ONE ROTATING PASS AND NOT FOUR OPPOSED ONES. The first cut drew all
+// four directions every frame, and because each pass is a sequential 50%
+// blend, the composition was
+//     scene/16 + P(-x)/16 + P(+x)/8 + P(-y)/4 + P(+y)/2
+// - two disasters in one line. The live scene was 6% of the image, so the
+// feedback loop ran at gain ~0.94 and the screen filled with self-referential
+// history (the "permanent blindness"). And the weights were wildly asymmetric
+// - HALF the final image was the +y-shifted copy - so the feedback also had a
+// net translation every frame, compounding across frames until everything
+// visibly streamed off the edge of the screen.
+//
+// One 50% pass per frame keeps the scene at 50% every frame (history halves
+// per frame - no blindness), and the four-frame direction cycle sums to zero
+// displacement (no drift). The blur is built TEMPORALLY: in steady state the
+// image carries taps at 1/2, 1/4, 1/8... along a zero-mean walk of offsets,
+// which converges in ~4 frames at 50-60Hz and reads as an actual soften.
+//
+// They share one function because they share the mechanism entirely - the
+// only difference is the offset. Which is also why they were always going to
+// belong to one volume rather than two.
+//
+// BUCKET 2, ahead of the tint (bucket 1) and the fade (bucket 0), so the
+// order down the OT is: scene -> feedback -> tint -> fade. A tint applied
+// over the blur is a tinted blurry image; the other way round would blur the
+// tint into the scene and wash it out.
+void draw_postfx_feedback(void)
+{
+    if (g_postfx.blurAmount <= 0 && g_postfx.ghostAmount <= 0)
+        return;
+
+    // The half of VRAM currently being DISPLAYED holds the last complete
+    // frame; the half being drawn into is this frame, still in progress.
+    const int srcY = db * DISPLAY_H;
+
+    if (g_postfx.ghostAmount > 0)
+    {
+        int passes = 1 + ((g_postfx.ghostAmount * (POSTFX_FEEDBACK_MAX_PASSES - 1)) >> 12);
+        for (int i = 0; i < passes; i++)
+            if (!postfx_feedback_pass(srcY, 0, 0, 2)) return;
+    }
+
+    if (g_postfx.blurAmount > 0)
+    {
+        // Amount drives the offset RADIUS; the direction comes from the
+        // rotating phase. A static counter rather than g_time_ticks: the
+        // cycle must advance exactly once per drawn frame, not per 60Hz
+        // tick, or a PAL machine would skip directions and reintroduce a
+        // net drift.
+        static const int dirs[4][2] = { {-1, 0}, {1, 0}, {0, -1}, {0, 1} };
+        static int blurPhase = 0;
+
+        int off = 1 + ((g_postfx.blurAmount * (POSTFX_FEEDBACK_MAX_OFFSET - 1)) >> 12);
+        const int *d = dirs[blurPhase & 3];
+        blurPhase++;
+
+        postfx_feedback_pass(srcY, d[0] * off, d[1] * off, 2);
+    }
+}
+
+
+// Draws the post-process tint for this frame: N full-screen quads in the
+// authored blend mode, straight into the OT.
+//
+// Structurally identical to draw_transition_fade() below and to
+// draw_fog_layers() - one POLY_F4 plus one DR_TPAGE per quad, the tpage
+// added AFTER the quad because addPrim prepends and the mode change has to
+// be walked FIRST. That repetition is deliberate: these are three different
+// features that happen to share one hardware idiom, and folding them into a
+// common helper would couple their very different tuning.
+//
+// BUCKET 1, not 0. The transition fade owns bucket 0 and must cover
+// everything including this - a scene switch should black out the
+// post-process too, not fade to a tinted screen.
+void draw_postfx(void)
+{
+    if (g_postfx.tintLayers <= 0)
+        return;
+
+    for (int i = 0; i < g_postfx.tintLayers; i++)
+    {
+        // Budget for BOTH prims before allocating either - a quad without
+        // its tpage blends in whatever mode the previous primitive left set.
+        if (primBytesRemaining < (long)(sizeof(POLY_F4) + sizeof(DR_TPAGE)))
+        {
+            primOverflowCount++;
+            return;
+        }
+
+        POLY_F4 *quad = (POLY_F4 *)nextpri;
+        setPolyF4(quad);
+        setRGB0(quad, g_postfx.tintR, g_postfx.tintG, g_postfx.tintB);
+        setSemiTrans(quad, 1);
+        setXY4(quad,
+            0,         0,
+            DISPLAY_W, 0,
+            0,         DISPLAY_H,
+            DISPLAY_W, DISPLAY_H);
+
+        addPrim(&ot[db][1], quad);
+        nextpri += sizeof(POLY_F4);
+        primBytesRemaining -= sizeof(POLY_F4);
+
+        // tintMode IS the hardware abr value - stage-gen's blend-mode
+        // dropdown maps straight onto the GPU's two semi-transparency bits,
+        // so nothing is translated here.
+        DR_TPAGE *tpage = (DR_TPAGE *)nextpri;
+        setDrawTPage(tpage, 0, 1, getTPage(0, g_postfx.tintMode, 0, 0));
+        addPrim(&ot[db][1], tpage);
+        nextpri += sizeof(DR_TPAGE);
+        primBytesRemaining -= sizeof(DR_TPAGE);
+    }
+}
+
+
+void draw_transition_fade(void)
+{
+    if (transition_level <= 0)
+        return;
+
+    int level = transition_level;
+    if (level > 255) level = 255;
+
+    // Budget for BOTH prims before allocating either - a quad without its
+    // tpage would blend in whatever mode the last primitive happened to
+    // leave set, which on a fog stage is the 50% rate and would flash.
+    if (primBytesRemaining < (long)(sizeof(POLY_F4) + sizeof(DR_TPAGE)))
+    {
+        primOverflowCount++;
+        return;
+    }
+
+    // POLY_F4, not G4: the fade is uniform, so there is no second colour to
+    // carry and the flat quad is the smaller packet.
+    POLY_F4 *quad = (POLY_F4 *)nextpri;
+    setPolyF4(quad);
+    setRGB0(quad, level, level, level);
+    setSemiTrans(quad, 1);
+    setXY4(quad,
+        0,         0,
+        DISPLAY_W, 0,
+        0,         DISPLAY_H,
+        DISPLAY_W, DISPLAY_H);
+
+    addPrim(&ot[db][0], quad);
+    nextpri += sizeof(POLY_F4);
+    primBytesRemaining -= sizeof(POLY_F4);
+
+    // abr=2 == B - F, the subtractive rate. Added to the SAME bucket AFTER
+    // the quad because addPrim prepends, which puts the mode change ahead of
+    // the quad that needs it - the identical trick draw_fog_layers() uses.
+    DR_TPAGE *tpage = (DR_TPAGE *)nextpri;
+    setDrawTPage(tpage, 0, 1, getTPage(0, 2, 0, 0));
+    addPrim(&ot[db][0], tpage);
+    nextpri += sizeof(DR_TPAGE);
+    primBytesRemaining -= sizeof(DR_TPAGE);
 }
 
 
@@ -2512,7 +4557,12 @@ static void fill_sphere_light_slots(MATRIX *dmtx, MATRIX *cmtx)
 // than trading one fragile order for another. The headlamp path's gte_rtv0
 // reads the rotation matrix but doesn't write it, so it is unaffected
 // either way.
-void compute_object_lighting(const MODEL_DEF *model)
+// faceN / vertN are the normal arrays to light with: model->faceNormals /
+// model->vertNormals for a static object, or posed normals (g_posedFaceNormals
+// / g_posedVertNormals) for an animated one. Same split as the vertex source in
+// transform_object_vertices(), so lighting follows the pose without any other
+// change to this function.
+void compute_object_lighting(const MODEL_DEF *model, const SVECTOR *faceN, const SVECTOR *vertN)
 {
     unsigned int triCount  = model->triCount  < MAX_MODEL_TRIS  ? model->triCount  : MAX_MODEL_TRIS;
     unsigned int vertCount = model->vertCount < MAX_MODEL_VERTS ? model->vertCount : MAX_MODEL_VERTS;
@@ -2543,11 +4593,11 @@ void compute_object_lighting(const MODEL_DEF *model)
             MATRIX cmtx = g_frame_color_matrix;
             fill_sphere_light_slots(&dmtx, &cmtx);
             gte_SetColorMatrix(&cmtx);
-            MulMatrix0(&dmtx, &world_matrix, &lmtx);
+            MulMatrix0(&dmtx, &world_light_rot, &lmtx);
         }
         else
         {
-            MulMatrix0(&g_light_dir_frame, &world_matrix, &lmtx);
+            MulMatrix0(&g_light_dir_frame, &world_light_rot, &lmtx);
         }
         gte_SetLightMatrix(&lmtx);
 
@@ -2561,7 +4611,7 @@ void compute_object_lighting(const MODEL_DEF *model)
         // this reason.)
         for (unsigned int i = 0; i < triCount; i++)
         {
-            gte_ldv0(&model->faceNormals[i]);
+            gte_ldv0(&faceN[i]);
             gte_ncs();
             gte_strgb(&transformedFaceColors[i]);
         }
@@ -2571,7 +4621,7 @@ void compute_object_lighting(const MODEL_DEF *model)
         {
             for (unsigned int i = 0; i < vertCount; i++)
             {
-                gte_ldv0(&model->vertNormals[i]);
+                gte_ldv0(&vertN[i]);
                 gte_ncs();
                 gte_strgb(&transformedVertColors[i]);
             }
@@ -2587,7 +4637,7 @@ void compute_object_lighting(const MODEL_DEF *model)
         for (unsigned int i = 0; i < triCount; i++)
         {
             SVECTOR n;
-            gte_ldv0(&model->faceNormals[i]);
+            gte_ldv0(&faceN[i]);
             gte_rtv0();
             gte_stsv(&n);
             int b = n.vz >> 2;
@@ -2605,7 +4655,7 @@ void compute_object_lighting(const MODEL_DEF *model)
             for (unsigned int i = 0; i < vertCount; i++)
             {
                 SVECTOR n;
-                gte_ldv0(&model->vertNormals[i]);
+                gte_ldv0(&vertN[i]);
                 gte_rtv0();
                 gte_stsv(&n);
                 int b = n.vz >> 2;
@@ -2633,7 +4683,12 @@ void compute_object_lighting(const MODEL_DEF *model)
 // update_object_world_and_compose() for this same object (needs
 // composed_matrix current). Runs BEFORE compute_object_lighting() so the
 // GTE lighting path can safely reuse GTE matrix registers afterwards.
-void transform_object_vertices(const MODEL_DEF *model)
+// srcVerts is the vertex array to project: model->verts for a static object,
+// or a skinned/posed buffer (g_posedVerts) for an animated one. Everything
+// else - the composed matrix, the screen-XY/Z cache, fog - is identical either
+// way, which is exactly why CPU skinning drops in here without touching the
+// projection, lighting or draw paths.
+void transform_object_vertices(const MODEL_DEF *model, const SVECTOR *srcVerts)
 {
     unsigned int vertCount = model->vertCount < MAX_MODEL_VERTS ? model->vertCount : MAX_MODEL_VERTS;
 
@@ -2660,7 +4715,7 @@ void transform_object_vertices(const MODEL_DEF *model)
         // the colour work means the dpcs cannot strand them.
         for (unsigned int i = 0; i < vertCount; i++)
         {
-            gte_ldv0(&model->verts[i]);
+            gte_ldv0(&srcVerts[i]);
             gte_rtps();
             gte_stsxy(&transformedScreenXY[i]);
             gte_stsz(&transformedScreenSZ[i]);
@@ -2674,7 +4729,7 @@ void transform_object_vertices(const MODEL_DEF *model)
     {
         for (unsigned int i = 0; i < vertCount; i++)
         {
-            gte_ldv0(&model->verts[i]);
+            gte_ldv0(&srcVerts[i]);
             gte_rtps();
             gte_stsxy(&transformedScreenXY[i]);
             gte_stsz(&transformedScreenSZ[i]);
@@ -2718,6 +4773,20 @@ int object_is_culled(const MODEL_DEF *model, int worldRadius)
         (short)(model->bsphereCenter->vy + model->bsphereRadius),
         model->bsphereCenter->vz
     };
+    // Z EDGE POINT - added because the X/Y pair alone systematically
+    // UNDER-STATES the screen extent of geometry that is long in Z, which is
+    // exactly what a road is. The screen-radius estimate below takes the
+    // larger of the projected offsets, and for a long road the X and Y
+    // offsets are small while the Z offset is enormous; the object then
+    // reads as far narrower on screen than it draws, and gets culled while
+    // still plainly in shot. Under perspective the Z offset also projects
+    // differently from a lateral one, which is the other half of why
+    // ignoring it was not safe.
+    SVECTOR edgeZ = {
+        model->bsphereCenter->vx,
+        model->bsphereCenter->vy,
+        (short)(model->bsphereCenter->vz + model->bsphereRadius)
+    };
 
     gte_ldv3(model->bsphereCenter, &edgeX, &edgeY);
     gte_rtpt();
@@ -2730,7 +4799,7 @@ int object_is_culled(const MODEL_DEF *model, int worldRadius)
     uint32_t sz0, sz1, sz2;
     gte_stsz3(&sz0, &sz1, &sz2);
 
-    if (sz0 < 64 && sz1 < 64 && sz2 < 64)
+    if (sz0 < NEAR_CLIP_SZ && sz1 < NEAR_CLIP_SZ && sz2 < NEAR_CLIP_SZ)
         return 1;
 
     // FOG CULL. Once an object sits entirely beyond fog_far, the depth cue
@@ -2771,7 +4840,7 @@ int object_is_culled(const MODEL_DEF *model, int worldRadius)
     DVECTOR sxy[3];
     gte_stsxy3(&sxy[0], &sxy[1], &sxy[2]);
 
-    // Approximate on-screen radius as the larger of the two edge points'
+    // Approximate on-screen radius as the largest of the edge points'
     // screen-space offset from centre (not exact under perspective, so a
     // flat safety margin is added). Deliberately conservative: under-
     // culling wastes a little work, over-culling is a visible bug.
@@ -2782,7 +4851,29 @@ int object_is_culled(const MODEL_DEF *model, int worldRadius)
     if (screenRadiusY < 0) screenRadiusY = -screenRadiusY;
 
     int screenRadius = (screenRadiusX > screenRadiusY) ? screenRadiusX : screenRadiusY;
-    screenRadius += 8; // flat safety margin, pixels
+
+    // Second pass for the Z edge point. It needs its own gte_rtpt because
+    // the first one consumed all three vertex slots on centre/X/Y - the
+    // alternative was dropping one of those, and the centre's own projected
+    // position is what the bounds test is built on. One extra rtpt per
+    // object per frame, against wrongly culling every long object in the
+    // stage.
+    {
+        gte_ldv3(model->bsphereCenter, &edgeZ, &edgeZ);
+        gte_rtpt();
+        DVECTOR zxy[3];
+        gte_stsxy3(&zxy[0], &zxy[1], &zxy[2]);
+
+        int screenRadiusZX = zxy[1].vx - zxy[0].vx;
+        if (screenRadiusZX < 0) screenRadiusZX = -screenRadiusZX;
+        int screenRadiusZY = zxy[1].vy - zxy[0].vy;
+        if (screenRadiusZY < 0) screenRadiusZY = -screenRadiusZY;
+
+        if (screenRadiusZX > screenRadius) screenRadius = screenRadiusZX;
+        if (screenRadiusZY > screenRadius) screenRadius = screenRadiusZY;
+    }
+
+    screenRadius += CULL_SCREEN_MARGIN;
 
     if (sxy[0].vx + screenRadius < 0 || sxy[0].vx - screenRadius > DISPLAY_W ||
         sxy[0].vy + screenRadius < 0 || sxy[0].vy - screenRadius > DISPLAY_H)
@@ -2830,16 +4921,32 @@ void draw_object_into_ot(const MODEL_DEF *model, MODEL_TEXTURE **triTextureCache
         if (cross >= 0)
             continue;
 
-        DVECTOR sxy[3] = { *p0, *p1, *p2 };
-
         // Near-plane reject, same threshold as before - read from the
         // per-vertex SZ cache instead of a fresh gte_stsz3().
         uint32_t sz0 = transformedScreenSZ[tri->v0];
         uint32_t sz1 = transformedScreenSZ[tri->v1];
         uint32_t sz2 = transformedScreenSZ[tri->v2];
 
-        if (sz0 < 64 || sz1 < 64 || sz2 < 64)
+        // NEAR-PLANE REJECT. Note this is ANY vertex, not all three - one
+        // corner dipping past the plane drops the whole triangle, which is
+        // what makes a road quad vanish as a whole while most of it is still
+        // clearly in shot. That is not a bug to flip to &&: a vertex below
+        // the plane comes back from the GTE with a saturated, meaningless
+        // screen position, and drawing a triangle through it produces a
+        // stretched mess across the screen rather than the missing sliver
+        // you wanted. Keeping the whole triangle honest requires SPLITTING
+        // it at the plane (near-plane clipping), which does not exist here
+        // yet. Until it does, NEAR_CLIP_SZ is the dial. See its comment.
+        if (sz0 < NEAR_CLIP_SZ || sz1 < NEAR_CLIP_SZ || sz2 < NEAR_CLIP_SZ)
             continue;
+
+        // DIAGNOSTIC ONLY - this triangle is drawn either way. Counts
+        // triangles projected from a depth where the GTE divide may already
+        // have saturated, i.e. geometry that is on screen but potentially
+        // warped. Surfaced as NEARWARP on the RENDER debug page; see
+        // NEAR_WARP_SZ for how to read it.
+        if (sz0 < (uint32_t)NEAR_WARP_SZ || sz1 < (uint32_t)NEAR_WARP_SZ || sz2 < (uint32_t)NEAR_WARP_SZ)
+            nearWarpTriCount++;
 
         // FOG CULL, PER TRIANGLE. Rejects individual triangles that sit
         // entirely past the fog plane rather than dropping whole objects,
@@ -2937,9 +5044,9 @@ void draw_object_into_ot(const MODEL_DEF *model, MODEL_TEXTURE **triTextureCache
 
                 setXY3(
                     pol,
-                    sxy[0].vx, sxy[0].vy,
-                    sxy[1].vx, sxy[1].vy,
-                    sxy[2].vx, sxy[2].vy
+                    p0->vx, p0->vy,
+                    p1->vx, p1->vy,
+                    p2->vx, p2->vy
                 );
 
                 // tri->uv0/uv1/uv2 index into model->uvs[][2] (converter-
@@ -2977,9 +5084,9 @@ void draw_object_into_ot(const MODEL_DEF *model, MODEL_TEXTURE **triTextureCache
 
                 setXY3(
                     pol,
-                    sxy[0].vx, sxy[0].vy,
-                    sxy[1].vx, sxy[1].vy,
-                    sxy[2].vx, sxy[2].vy
+                    p0->vx, p0->vy,
+                    p1->vx, p1->vy,
+                    p2->vx, p2->vy
                 );
 
                 setUV3(
@@ -3032,9 +5139,9 @@ void draw_object_into_ot(const MODEL_DEF *model, MODEL_TEXTURE **triTextureCache
 
             setXY3(
                 pol,
-                sxy[0].vx, sxy[0].vy,
-                sxy[1].vx, sxy[1].vy,
-                sxy[2].vx, sxy[2].vy
+                p0->vx, p0->vy,
+                p1->vx, p1->vy,
+                p2->vx, p2->vy
             );
 
             addPrim(&ot[db][bucket], pol);
@@ -3053,9 +5160,9 @@ void draw_object_into_ot(const MODEL_DEF *model, MODEL_TEXTURE **triTextureCache
 
             setXY3(
                 pol,
-                sxy[0].vx, sxy[0].vy,
-                sxy[1].vx, sxy[1].vy,
-                sxy[2].vx, sxy[2].vy
+                p0->vx, p0->vy,
+                p1->vx, p1->vy,
+                p2->vx, p2->vy
             );
 
             addPrim(&ot[db][bucket], pol);
@@ -3106,6 +5213,7 @@ void draw_stage(void)
     culledObjectCount = 0;
     fogCulledCount = 0;
     fogCulledTriCount = 0;
+    nearWarpTriCount = 0;
 
     if (activeStageIndex >= stageRegistryCount)
         return;
@@ -3134,6 +5242,14 @@ void draw_stage(void)
 
         update_object_world_and_compose(&objPos, &objRot, &objScale);
 
+        // Advance this object's animation clock every frame - even if it's
+        // about to be culled - so an object that scrolls back on-screen is in
+        // the pose its timeline demands, not frozen where it left view.
+        ANIM_STATE *anim = &stageObjectAnim[i];
+        int animated = (anim->model != NULL && anim->clip >= 0);
+        if (animated)
+            anim_advance(anim, g_dt);
+
         // Bounding radius in world units: the model-space radius stretched
         // by the object's LARGEST scale axis. Largest rather than average
         // because the sphere has to contain the object on every axis, and
@@ -3159,12 +5275,41 @@ void draw_stage(void)
         // that vertex is projected, since IR0 only survives its own rtps.
         // transform_object_vertices() re-pushes composed_matrix itself, so
         // it no longer cares that MulMatrix0 ran before it.
-        compute_object_lighting(model);
-        transform_object_vertices(model);   // per-vertex fog folded in here
+        // Skinned object: evaluate the current pose and skin the bind mesh into
+        // g_posedVerts (model space), then project THAT instead of the static
+        // verts. Lighting still uses bind-pose normals (fine for v1 - see
+        // ANIMATION_ACTION_PLAN.md section 5.4). A static object just projects
+        // model->verts as before.
+        const SVECTOR *vsrc = model->verts;
+        const SVECTOR *facN = model->faceNormals;
+        const SVECTOR *verN = model->vertNormals;
+        if (animated)
+        {
+            anim_evaluate(anim, g_boneMtx);
+            anim_skin_vertices(model, g_boneMtx, g_posedVerts);
+            vsrc = g_posedVerts;
+            if (g_posed_normals)
+            {
+                anim_skin_normals(model, g_boneMtx, g_posedVertNormals, g_posedFaceNormals);
+                facN = g_posedFaceNormals;
+                verN = g_posedVertNormals;
+            }
+        }
+
+        compute_object_lighting(model, facN, verN);
+        transform_object_vertices(model, vsrc);   // per-vertex fog folded in here
         apply_fog_to_faces(model);          // flat-shading path only
 
         MODEL_TEXTURE **triTextureCache = modelTriTextureCache[modelIndex];
-        unsigned int objectPalette = obj->palette + active_palette;
+        // active_palette is the DEBUG-mode pad nudge; postfx_palette_offset()
+        // is a post-process volume's authored row shift. Both are offsets on
+        // top of the object's own authored row, and they compose rather than
+        // override - so walking into a "sickly green" volume shifts the whole
+        // scene while the debug nudge still works for inspecting rows.
+        // draw_object_into_ot() clamps the total per texture against that
+        // texture's real CLUT height, so an out-of-range sum cannot read into
+        // another texture's VRAM.
+        unsigned int objectPalette = obj->palette + active_palette + postfx_palette_offset();
 
         draw_object_into_ot(model, triTextureCache, objectPalette);
     }
@@ -3201,13 +5346,16 @@ void draw_player(void)
 
     visibleObjectCount++;
 
-    // Lighting first, then positions (see draw_stage() for why).
-    compute_object_lighting(model);
-    transform_object_vertices(model);
+    // Lighting first, then positions (see draw_stage() for why). The player
+    // model is static for now, so it projects its own verts/normals; when the
+    // player gets a rig this is where its anim_evaluate / anim_skin_vertices /
+    // anim_skin_normals would go.
+    compute_object_lighting(model, model->faceNormals, model->vertNormals);
+    transform_object_vertices(model, model->verts);
     apply_fog_to_faces(model);
 
     MODEL_TEXTURE **triTextureCache = modelTriTextureCache[playerModelIndex];
-    draw_object_into_ot(model, triTextureCache, active_palette);
+    draw_object_into_ot(model, triTextureCache, active_palette + postfx_palette_offset());
 }
 
 
@@ -3276,6 +5424,41 @@ static void debug_page_render(int counter)
 
     FntPrint(-1, "MODELS=%d TEX=%d PAL=%d\n",
         modelRegistryCount, textureTableCount, active_palette);
+
+    // NEARWARP: triangles DRAWN this frame from shallower than NEAR_WARP_SZ,
+    // where the perspective divide may have saturated - the candidate cause
+    // of near-camera stretching. NCLIP is the current near-cull depth next
+    // to the depth this warns at, so the gap between them is visible while
+    // tuning. See NEAR_CLIP_SZ / NEAR_WARP_SZ.
+    FntPrint(-1, "NEARWARP=%d NCLIP=%d/%d\n",
+        nearWarpTriCount, NEAR_CLIP_SZ, NEAR_WARP_SZ);
+
+    // Post-process volumes containing the player, and what they resolved to.
+    // VOL is how many are contributing (including via falloff), W is the
+    // combined weight (4096 == full), Q is the full-screen quads being drawn
+    // - the line item that actually costs fill rate. PAL is the palette row
+    // offset in force, or - for none.
+    // Shown while any volume contributes OR the DEBUG feedback editor has
+    // overrides in force - the editor works in empty stages, and a readout
+    // that hides while its knobs are live would be worse than none.
+    if (postfxActiveVolumes > 0 ||
+        g_postfx.blurAmount > 0 || g_postfx.ghostAmount > 0 ||
+        g_postfx_fb_abr != 0 || g_postfx_fb_bright != 128)
+    {
+        FntPrint(-1, "PFX VOL=%d W=%d Q=%d PAL=%d\n",
+            postfxActiveVolumes, g_postfx.weight, g_postfx.tintLayers, g_postfx.paletteRow);
+        // BLUR/GHOST are the final feedback amounts (0..4096, volume-derived
+        // + editor offset). Each pass costs TWO textured full-screen quads -
+        // ghost is 1-4 passes, blur one rotating pass - far more fill rate
+        // than the tint. If the frame rate drops on entering a volume, this
+        // line is why. FB is the feedback blend rate (ABR 0-3) and quad
+        // brightness (128 = neutral) the editor controls.
+        FntPrint(-1, "  BLUR=%d GHOST=%d FB=%d/%d\n",
+            g_postfx.blurAmount, g_postfx.ghostAmount,
+            g_postfx_fb_abr, g_postfx_fb_bright);
+        FntPrint(-1, "  R1+L2: U/D=gho L/R=blu X=abr\n");
+        FntPrint(-1, "         []/O=bright ^=reset\n");
+    }
 }
 
 
@@ -3303,6 +5486,20 @@ static void debug_page_world(void)
         player_pos.vx, player_pos.vy, player_pos.vz);
     FntPrint(-1, "CAMYAW=%d PITCH=%d\n",
         player_cam_yaw, player_cam_pitch);
+
+    // Collider table, baked at stage load. OF is the object count it was
+    // built from, so COL<OF simply means some objects are authored passable;
+    // SKIP is the count that ASKED to collide and couldn't (unresolved model
+    // name, or a model with no baked bounds) and should normally read 0.
+    FntPrint(-1, "COL=%d OF=%d SKIP=%d\n",
+        activeColliderCount, activeStageObjectCount, stageColliderSkippedCount);
+
+    // Which axes pushed back on the last PLAY frame. "--" is free movement;
+    // one letter is sliding along a wall; "XZ" is a corner.
+    FntPrint(-1, "BLOCK=%s%s R=%d STEP=%d\n",
+        (player_blocked_axes & 1) ? "X" : "-",
+        (player_blocked_axes & 2) ? "Z" : "-",
+        PLAYER_RADIUS, PLAYER_STEP_HEIGHT);
 }
 
 
@@ -3578,6 +5775,40 @@ int main(int argc, const char *argv[])
         // object. This is the half of the fog that textured geometry
         // actually responds to. No-op when fog is off.
         draw_fog_layers();
+
+        // Stage-transition brightness fade, LAST of everything that goes
+        // into the OT - it targets bucket 0 (nearest, walked last) so it
+        // darkens every primitive above, fog quads included. No-op unless a
+        // switch is in flight. The debug overlay is drawn after DrawOTag()
+        // below and so stays readable through the fade, deliberately.
+        // Post-process, innermost first: feedback (bucket 2) is sampled and
+        // composited before the tint (bucket 1) lands over it, and the
+        // transition fade (bucket 0) covers both - so a scene switch blacks
+        // out the atmosphere rather than fading to a tinted, smeared screen.
+        draw_postfx_feedback();
+        draw_postfx();
+
+        draw_transition_fade();
+
+        // MASK-BIT SET (GP0 E6, pbw=1) - the FIRST command of the frame's
+        // stream: added to the farthest bucket LAST, so the OT walk meets it
+        // before anything else. Every pixel drawn this frame gets its STP
+        // bit forced on, which is what lets NEXT frame's feedback quads
+        // (draw_postfx_feedback) genuinely blend - a semi-transparent
+        // TEXTURED prim only blends texels whose STP bit is SET; an STP=0
+        // texel draws fully OPAQUE and a black STP=0 texel not at all. With
+        // the scene drawn mask-off (all STP=0), the "50% ghost" was the
+        // previous frame wholesale replacing this one, and the blur a
+        // sliding copy instead of a soften. One word of GPU traffic.
+        //
+        // The isbg clear (FillVRAM) ignores mask-set, so pixels only the
+        // clear touched take their first feedback write opaquely - but that
+        // write itself lands with STP=1, so it self-heals after one frame.
+        // CAVEAT: mask-set also applies to VRAM copy/upload commands; if a
+        // future system uploads to VRAM mid-game, it should push
+        // setDrawStp(p, 0, 0) first and restore afterwards.
+        setDrawStp(&maskSetPrim[db], 1, 0);
+        addPrim(&ot[db][OT_LEN - 1], &maskSetPrim[db]);
 
         // Kick off the GPU's own back-to-front walk of everything
         // draw_stage() just queued into ot[db], starting from the

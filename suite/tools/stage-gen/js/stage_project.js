@@ -30,7 +30,36 @@
 // missing newer fields (folders -> [], entities -> [], name -> null,
 // parentId -> null), which happens to make older files load flat/empty
 // where the newer concepts would be - same content, nothing errors.
-const PROJECT_FILE_VERSION = 3;
+// Version 4: adds the stage-level `fog` block (enabled/near/far/color/
+// layers/cull/drift - see FOG_DEFAULTS in stage_state.js). Same no-shim
+// policy as v2/v3: app.js merges whatever is present over FOG_DEFAULTS, so a
+// v1-v3 file simply loads with main.c's compiled-in fog defaults, which is
+// exactly the fog those older stages actually shipped with.
+// Version 5: adds per-Sound unique IDs (soundId) and the nextSoundId
+// counter backing them, plus the Trigger action schema that references
+// them. Older files have no soundId, so every Sound would load with the
+// schema default of 0 - app.js calls state.repairUniqueIds() after the
+// merge to mint real ones, which is what keeps a v1-v4 file's sounds
+// individually addressable rather than all sharing id 0.
+// Version 6: adds per-instance `collide` (solid to the player at runtime -
+// see COLLISION_ACTION_PLAN.md). Same no-shim policy as the versions above,
+// but note the default is TRUE, so a v1-v5 file loads with every instance
+// SOLID rather than every instance passable. That is deliberate and matches
+// what a freshly placed instance does - but it is the one bump here that
+// changes the behaviour of an old file rather than just adding a concept the
+// file didn't have. An older project reopened after this wants an audit pass
+// to untick foliage, decals and ceiling detail.
+// Version 7: adds authored collision boxes (`colliders` array + the
+// nextColliderId counter backing their addressable ids). A v1-v6 file simply
+// loads with no boxes, which means every instance falls back to the automatic
+// per-primitive AABB - exactly the behaviour those files already shipped with,
+// so this bump changes nothing until Auto Box is pressed.
+// Version 8: adds the per-instance `anim` block (default clip name, loop,
+// speed, autoplay - see ANIM_DEFAULTS in stage_state.js). Same no-shim policy:
+// app.js runs each loaded instance's anim through normalizeAnim(), so a v1-v7
+// file (which has no `anim` key) loads every instance with clip=None - i.e. no
+// default animation, exactly the behaviour those stages already had.
+const PROJECT_FILE_VERSION = 8;
 
 /**
  * Build the serializable project JSON from current editor state.
@@ -44,6 +73,8 @@ export function buildProjectJson(state) {
       pos: { ...state.camera.pos },
       rot: { ...state.camera.rot },
     },
+    // Stage fog: flat primitives, so a spread is a full deep clone.
+    fog: { ...state.fog },
     modelNames,
     folders: state.folders.map((folder) => ({
       id: folder.id,
@@ -55,11 +86,25 @@ export function buildProjectJson(state) {
       id: inst.id,
       model: inst.model,
       palette: inst.palette,
+      collide: inst.collide !== false,
       name: inst.name,
       parentId: inst.parentId,
       pos: { ...inst.pos },
       rot: { ...inst.rot },
       scale: { ...inst.scale },
+      // Flat primitives, so a spread is a full deep clone. Always present on
+      // live instances (addInstance seeds it); older loaded files got one
+      // backfilled by normalizeAnim on the way in.
+      anim: { ...inst.anim },
+    })),
+    colliders: state.colliders.map((c) => ({
+      id: c.id,
+      parentInstanceId: c.parentInstanceId,
+      name: c.name,
+      colliderId: c.colliderId,
+      enabled: c.enabled !== false,
+      center: { ...c.center },
+      size: { ...c.size },
     })),
     entities: state.entities.map((ent) => ({
       id: ent.id,
@@ -73,6 +118,8 @@ export function buildProjectJson(state) {
     })),
     nextId: state.nextId,
     nextSpawnId: state.nextSpawnId,
+    nextSoundId: state.nextSoundId,
+    nextColliderId: state.nextColliderId,
   };
 }
 

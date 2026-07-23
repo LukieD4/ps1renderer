@@ -1,0 +1,136 @@
+{
+  "camera": {
+    "pos": [
+      3721,
+      -451,
+      -1455
+    ],
+    "rot": [
+      0,
+      -90,
+      0
+    ]
+  },
+  "objects": [
+    {
+      "model": "plane",
+      "palette": 0,
+      "collide": true,
+      "pos": [
+        3072,
+        0,
+        -3072
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "model": "testnpc",
+      "palette": 0,
+      "collide": true,
+      "pos": [
+        2836,
+        -214,
+        1289
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        0.025,
+        0.025,
+        0.025
+      ]
+    }
+  ],
+  "lights": [
+    {
+      "type": "directional",
+      "disabled": false,
+      "mobility": "static",
+      "pos": [
+        0,
+        0,
+        0
+      ],
+      "rot": [
+        -85,
+        45,
+        83
+      ],
+      "dir": [
+        -2886,
+        -2896,
+        -241
+      ],
+      "color": [
+        255,
+        255,
+        255
+      ],
+      "intensity": 1,
+      "range": 5120,
+      "coneAngle": 30,
+      "penumbra": 0.2
+    }
+  ],
+  "spawns": [
+    {
+      "spawnId": 0,
+      "pos": [
+        -1636,
+        0,
+        -29
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ]
+    }
+  ],
+  "triggers": [
+    {
+      "action": "switchScene",
+      "event": "house_demo",
+      "pos": [
+        1780,
+        -512,
+        1165
+      ],
+      "halfExtent": [
+        512,
+        512,
+        512
+      ],
+      "targetStage": "house_demo",
+      "targetSpawnId": 0,
+      "onEnterSoundId": -1,
+      "userInteract": true,
+      "once": true
+    }
+  ],
+  "fog": {
+    "enabled": false,
+    "near": 1434,
+    "far": 3789,
+    "color": [
+      128,
+      128,
+      128
+    ],
+    "layers": 3,
+    "cull": false,
+    "drift": false
+  }
+}

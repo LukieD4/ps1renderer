@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 5,
   "camera": {
     "pos": {
       "x": 0,
@@ -12,7 +12,19 @@
       "z": 0
     }
   },
+  "fog": {
+    "enabled": false,
+    "near": 0.78125,
+    "far": 5.859375,
+    "color": "#808080",
+    "layers": 3,
+    "cull": false,
+    "drift": false
+  },
   "modelNames": [
+    "house",
+    "3shapes",
+    "honda",
     "plane",
     "arrow"
   ],
@@ -85,6 +97,7 @@
         "z": 1
       },
       "props": {
+        "soundId": 0,
         "sample": "LAVENDAR",
         "volume": 0.5,
         "mode": "music",
@@ -97,8 +110,129 @@
         "muteAfterPlay": false,
         "autoplay": true
       }
+    },
+    {
+      "id": 4,
+      "kind": "trigger",
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": -7.5,
+        "y": 0.5,
+        "z": -3.5
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "action": "switchScene",
+        "event": "",
+        "targetStage": "house_demo",
+        "targetSpawnId": 0,
+        "onEnterSoundId": -1,
+        "userInteract": true,
+        "once": false
+      }
+    },
+    {
+      "id": 5,
+      "kind": "spawn",
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": -1.5,
+        "y": 0,
+        "z": -2.5
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "spawnId": 0
+      }
+    },
+    {
+      "id": 6,
+      "kind": "light",
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": -7.247,
+        "y": 0.279,
+        "z": -3.71
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "lightType": "spherical",
+        "disabled": false,
+        "mobility": "static",
+        "color": "#f70006",
+        "intensity": 1,
+        "range": 5,
+        "coneAngle": 30,
+        "penumbra": 0.2
+      }
+    },
+    {
+      "id": 7,
+      "kind": "sound",
+      "name": "On enter",
+      "parentId": null,
+      "pos": {
+        "x": 0,
+        "y": -0.09,
+        "z": 0
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "soundId": 1,
+        "sample": "DOOR0LOC",
+        "volume": 0.5,
+        "mode": "once",
+        "fadeOnStageEnter": true,
+        "delay": 0,
+        "intervalMin": 2,
+        "intervalMax": 8,
+        "directional": false,
+        "radius": 0,
+        "muteAfterPlay": false,
+        "autoplay": true
+      }
     }
   ],
-  "nextId": 4,
-  "nextSpawnId": 0
+  "nextId": 8,
+  "nextSpawnId": 1,
+  "nextSoundId": 2
 }

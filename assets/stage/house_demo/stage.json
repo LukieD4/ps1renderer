@@ -15,6 +15,7 @@
     {
       "model": "house",
       "palette": 1,
+      "collide": true,
       "pos": [
         1,
         0,
@@ -34,6 +35,7 @@
     {
       "model": "3shapes",
       "palette": 0,
+      "collide": true,
       "pos": [
         1798,
         -3393,
@@ -53,6 +55,7 @@
     {
       "model": "honda",
       "palette": 0,
+      "collide": false,
       "pos": [
         1113,
         -2,
@@ -72,6 +75,7 @@
     {
       "model": "house",
       "palette": 0,
+      "collide": true,
       "pos": [
         -6340,
         0,
@@ -91,6 +95,7 @@
     {
       "model": "house",
       "palette": 2,
+      "collide": true,
       "pos": [
         6342,
         0,
@@ -106,10 +111,137 @@
         1,
         1
       ]
+    },
+    {
+      "model": "roads",
+      "palette": 0,
+      "collide": true,
+      "pos": [
+        1014,
+        169,
+        -7312
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "model": "roads",
+      "palette": 0,
+      "collide": true,
+      "pos": [
+        -3826,
+        169,
+        -7312
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "model": "roads",
+      "palette": 0,
+      "collide": true,
+      "pos": [
+        -8665,
+        169,
+        -7312
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "model": "testnpc",
+      "palette": 0,
+      "anim": {
+        "clip": "Dance",
+        "loop": true,
+        "speed": 1,
+        "autoplay": true
+      },
+      "collide": true,
+      "pos": [
+        -3204,
+        -315,
+        -578
+      ],
+      "rot": [
+        0,
+        -90,
+        0
+      ],
+      "scale": [
+        0.025,
+        0.025,
+        0.025
+      ]
+    },
+    {
+      "model": "roads",
+      "palette": 0,
+      "collide": true,
+      "pos": [
+        5853,
+        169,
+        -7312
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
+    },
+    {
+      "model": "roads",
+      "palette": 0,
+      "collide": true,
+      "pos": [
+        10694,
+        169,
+        -7312
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        1,
+        1,
+        1
+      ]
     }
   ],
   "sounds": [
     {
+      "soundId": 0,
       "sample": "WIND",
       "pos": [
         1617,
@@ -128,6 +260,7 @@
       "autoplay": true
     },
     {
+      "soundId": 1,
       "sample": "CAW1",
       "pos": [
         -4952,
@@ -143,9 +276,10 @@
       "intervalMax": 8,
       "directional": true,
       "muteAfterPlay": false,
-      "autoplay": true
+      "autoplay": false
     },
     {
+      "soundId": 2,
       "sample": "SIAMISS",
       "pos": [
         892,
@@ -164,6 +298,7 @@
       "autoplay": false
     },
     {
+      "soundId": 3,
       "sample": "TESTING2",
       "pos": [
         -1654,
@@ -182,13 +317,14 @@
       "autoplay": false
     },
     {
+      "soundId": 4,
       "sample": "TEST303",
       "pos": [
         87,
         -344,
         -1163
       ],
-      "volume": 1,
+      "volume": 0.5,
       "radius": 0,
       "mode": "music",
       "delay": 0,
@@ -196,6 +332,44 @@
       "intervalMin": 2,
       "intervalMax": 8,
       "directional": false,
+      "muteAfterPlay": false,
+      "autoplay": false
+    },
+    {
+      "soundId": 5,
+      "sample": "DOOR0CLO",
+      "pos": [
+        313,
+        -148,
+        -1118
+      ],
+      "volume": 0.5,
+      "radius": 0,
+      "mode": "loop",
+      "delay": 0,
+      "fadeOnStageEnter": true,
+      "intervalMin": 2,
+      "intervalMax": 8,
+      "directional": false,
+      "muteAfterPlay": false,
+      "autoplay": false
+    },
+    {
+      "soundId": 6,
+      "sample": "JIMBOB",
+      "pos": [
+        -3227,
+        -10,
+        -481
+      ],
+      "volume": 0.5,
+      "radius": 5120,
+      "mode": "loop",
+      "delay": 0,
+      "fadeOnStageEnter": true,
+      "intervalMin": 2,
+      "intervalMax": 8,
+      "directional": true,
       "muteAfterPlay": false,
       "autoplay": true
     }
@@ -259,5 +433,103 @@
       "coneAngle": 30,
       "penumbra": 0.2
     }
-  ]
+  ],
+  "spawns": [
+    {
+      "spawnId": 0,
+      "pos": [
+        -6125,
+        0,
+        -2183
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ]
+    }
+  ],
+  "triggers": [
+    {
+      "action": "switchScene",
+      "event": "zflatplane",
+      "pos": [
+        -6994,
+        -512,
+        -2355
+      ],
+      "halfExtent": [
+        512,
+        512,
+        512
+      ],
+      "targetStage": "zflatplane",
+      "targetSpawnId": 0,
+      "onEnterSoundId": 5,
+      "userInteract": true,
+      "once": true
+    },
+    {
+      "action": "switchScene",
+      "event": "jimbob_stage_demo",
+      "pos": [
+        -4588,
+        -512,
+        -2407
+      ],
+      "halfExtent": [
+        512,
+        512,
+        512
+      ],
+      "targetStage": "jimbob_stage_demo",
+      "targetSpawnId": 0,
+      "onEnterSoundId": 5,
+      "userInteract": true,
+      "once": true
+    }
+  ],
+  "postfx": [
+    {
+      "pos": [
+        -1024,
+        -477,
+        -2048
+      ],
+      "halfExtent": [
+        512,
+        512,
+        512
+      ],
+      "falloff": 2048,
+      "intensity": 100,
+      "tint": false,
+      "tintColor": [
+        128,
+        64,
+        96
+      ],
+      "tintMode": "blend50",
+      "tintStrength": 1,
+      "blur": true,
+      "blurAmount": 0.5,
+      "ghost": false,
+      "ghostAmount": 0.5,
+      "palette": false,
+      "paletteRow": 1
+    }
+  ],
+  "fog": {
+    "enabled": false,
+    "near": 1434,
+    "far": 3789,
+    "color": [
+      128,
+      128,
+      128
+    ],
+    "layers": 3,
+    "cull": true,
+    "drift": true
+  }
 }

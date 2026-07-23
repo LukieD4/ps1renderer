@@ -13,11 +13,13 @@
 (function () {
   const NAV_LINKS = [
     { key: "home", label: "Home", href: "/index.html" },
-    { key: "bpp", label: "BppProject", href: "/tools/image-bpp/index.html" },
-    { key: "palette", label: "PaletteGen", href: "/tools/palette-maker/index.html" },
+    { key: "tim", label: "TimGen", href: "/tools/tim-gen/index.html" },
     { key: "vag", label: "VAG", href: "/tools/audio-vag/index.html" },
     { key: "ost", label: "OST Studio", href: "/tools/audio-ost/index.html" },
     { key: "stage", label: "StageGen", href: "/tools/stage-gen/index.html" },
+    // The old image-bpp ("bpp") and palette-maker ("palette") tools were
+    // merged into TimGen. Their folders remain on disk as a fallback but are
+    // no longer linked here.
     // Future tools go here, e.g.:
     // { key: "sprite-packer", label: "Sprite Packer", href: "/tools/sprite-packer/index.html" },
   ];

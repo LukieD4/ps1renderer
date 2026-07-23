@@ -1,0 +1,185 @@
+{
+  "version": 8,
+  "camera": {
+    "pos": {
+      "x": 3.634,
+      "y": 0.44,
+      "z": 1.421
+    },
+    "rot": {
+      "x": 0,
+      "y": 90,
+      "z": 0
+    }
+  },
+  "fog": {
+    "enabled": false,
+    "near": 1.4,
+    "far": 3.7,
+    "color": "#808080",
+    "layers": 3,
+    "cull": false,
+    "drift": false
+  },
+  "modelNames": [
+    "house",
+    "3shapes",
+    "honda",
+    "roads",
+    "testnpc",
+    "plane"
+  ],
+  "folders": [],
+  "instances": [
+    {
+      "id": 5,
+      "model": "plane",
+      "palette": 0,
+      "collide": true,
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": 3,
+        "y": 0,
+        "z": 3
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "anim": {
+        "clip": null,
+        "loop": true,
+        "speed": 1,
+        "autoplay": true
+      }
+    },
+    {
+      "id": 8,
+      "model": "testnpc",
+      "palette": 0,
+      "collide": true,
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": 2.77,
+        "y": 0.209,
+        "z": -1.259
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 0.025,
+        "y": 0.025,
+        "z": 0.025
+      },
+      "anim": {
+        "clip": null,
+        "loop": true,
+        "speed": 1,
+        "autoplay": true
+      }
+    }
+  ],
+  "colliders": [],
+  "entities": [
+    {
+      "id": 1,
+      "kind": "light",
+      "name": "Sun",
+      "parentId": null,
+      "pos": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "rot": {
+        "x": -85.245,
+        "y": -44.802,
+        "z": -83.268
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "lightType": "directional",
+        "disabled": false,
+        "mobility": "static",
+        "color": "#ffffff",
+        "intensity": 1,
+        "range": 5,
+        "coneAngle": 30,
+        "penumbra": 0.2
+      }
+    },
+    {
+      "id": 6,
+      "kind": "spawn",
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": -1.598,
+        "y": 0,
+        "z": 0.028
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "spawnId": 0
+      }
+    },
+    {
+      "id": 9,
+      "kind": "trigger",
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": 1.738,
+        "y": 0.5,
+        "z": -1.138
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "action": "switchScene",
+        "event": "house_demo",
+        "targetStage": "house_demo",
+        "targetSpawnId": 0,
+        "onEnterSoundId": -1,
+        "userInteract": true,
+        "once": true
+      }
+    }
+  ],
+  "nextId": 10,
+  "nextSpawnId": 1,
+  "nextSoundId": 0,
+  "nextColliderId": 0
+}

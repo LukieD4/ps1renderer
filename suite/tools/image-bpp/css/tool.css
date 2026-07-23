@@ -5,7 +5,7 @@
 .workbench {
   display: grid;
   grid-template-columns: 300px 1fr;
-  min-height: calc(100vh - var(--nav-height) - 52px); /* minus navbar + transport bar */
+  min-height: calc(100vh - var(--nav-height) - var(--transport-height)); /* minus navbar + transport bar */
 }
 
 /* ---- Left rail: controls -------------------------------------------- */
@@ -42,13 +42,13 @@
   padding: 22px 14px;
   text-align: center;
   cursor: pointer;
-  transition: border-color 0.15s ease, background 0.15s ease;
+  transition: border-color var(--dur) ease, background var(--dur) ease;
 }
 
 .dropzone:hover,
 .dropzone.is-dragover {
   border-color: var(--accent);
-  background: rgba(94, 234, 212, 0.05);
+  background: rgba(var(--accent-rgb), 0.05);
 }
 
 .dropzone__icon {
@@ -115,7 +115,7 @@
   font-family: var(--font-display);
   font-size: 12.5px;
   color: var(--text-dim);
-  transition: all 0.12s ease;
+  transition: all var(--dur) ease;
 }
 
 .segmented__option:hover {
@@ -126,7 +126,7 @@
 .segmented__option.is-active {
   border-color: var(--accent);
   color: var(--accent);
-  background: rgba(94, 234, 212, 0.08);
+  background: rgba(var(--accent-rgb), 0.08);
 }
 
 .segmented__option-sub {
@@ -221,7 +221,7 @@ input[type="range"]::-moz-range-thumb {
   cursor: pointer;
   font-size: 12.5px;
   color: var(--text-dim);
-  transition: all 0.12s ease;
+  transition: all var(--dur) ease;
 }
 
 .dither-option:hover {
@@ -231,7 +231,7 @@ input[type="range"]::-moz-range-thumb {
 .dither-option.is-active {
   border-color: var(--accent);
   color: var(--text);
-  background: rgba(94, 234, 212, 0.06);
+  background: rgba(var(--accent-rgb), 0.06);
 }
 
 .dither-option__dot {
@@ -323,7 +323,7 @@ input[type="range"]::-moz-range-thumb {
   border: 1px solid var(--border-soft);
   border-radius: var(--radius-sm);
   cursor: pointer;
-  transition: all 0.12s ease;
+  transition: all var(--dur) ease;
 }
 
 .btn-secondary:hover {
@@ -341,7 +341,7 @@ input[type="range"]::-moz-range-thumb {
   padding: 32px;
   position: sticky;
   top: var(--nav-height);
-  height: calc(100vh - var(--nav-height) - 52px); /* minus navbar + transport bar */
+  height: calc(100vh - var(--nav-height) - var(--transport-height)); /* minus navbar + transport bar */
   align-self: start; /* needed so sticky works inside the grid */
   overflow: hidden;
   background-image:
@@ -368,7 +368,7 @@ input[type="range"]::-moz-range-thumb {
 
 .stage canvas {
   max-width: 100%;
-  max-height: calc(100vh - var(--nav-height) - 52px - 64px);
+  max-height: calc(100vh - var(--nav-height) - var(--transport-height) - 64px);
   image-rendering: pixelated;
   box-shadow: 0 4px 24px rgba(0, 0, 0, 0.4);
   border-radius: 2px;
@@ -429,7 +429,7 @@ input[type="range"]::-moz-range-thumb {
   background: var(--panel-raised);
   color: var(--text);
   cursor: pointer;
-  transition: all 0.12s ease;
+  transition: all var(--dur) ease;
 }
 
 .btn:hover:not(:disabled) {
@@ -443,23 +443,23 @@ input[type="range"]::-moz-range-thumb {
 
 .btn--primary {
   border-color: var(--accent-dim);
-  background: rgba(94, 234, 212, 0.1);
+  background: rgba(var(--accent-rgb), 0.1);
   color: var(--accent);
 }
 
 .btn--primary:hover:not(:disabled) {
-  background: rgba(94, 234, 212, 0.16);
+  background: rgba(var(--accent-rgb), 0.16);
   border-color: var(--accent);
 }
 
 .btn--export {
   border-color: var(--accent-warn-dim);
-  background: rgba(245, 158, 11, 0.08);
+  background: rgba(var(--warn-rgb), 0.08);
   color: var(--accent-warn);
 }
 
 .btn--export:hover:not(:disabled) {
-  background: rgba(245, 158, 11, 0.14);
+  background: rgba(var(--warn-rgb), 0.14);
   border-color: var(--accent-warn);
 }
 
@@ -482,7 +482,7 @@ input[type="file"].hidden-input {
   font-size: 12.5px;
   opacity: 0;
   pointer-events: none;
-  transition: opacity 0.18s ease, transform 0.18s ease;
+  transition: opacity var(--dur-slow) ease, transform var(--dur-slow) ease;
   z-index: 200;
 }
 

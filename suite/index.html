@@ -28,7 +28,7 @@
       border: 1px solid var(--border);
       border-radius: var(--radius-md);
       text-decoration: none;
-      transition: border-color 0.15s ease;
+      transition: border-color var(--dur) ease;
     }
     .home-card:hover {
       border-color: var(--accent-dim);
@@ -111,27 +111,22 @@
 
     <section class="home-section">
       <h2 class="home-section__title">Stage Maker</h2>
-      <p class="home-section__desc">A standalone tool, not part of the texture flow above.</p>
+      <p class="home-section__desc">A standalone tool, should cover the essentials for curating levels.</p>
 
       <a class="home-card" href="tools/stage-gen/index.html">
-        <div class="home-card__title">Stage Generator</div>
-        <div class="home-card__desc">Generate random pixel art stages with a variety of settings and export them as PNGs.</div>
+        <div class="home-card__title">StageGen</div>
+        <div class="home-card__desc">Generate stages with a variety of systems such as trigger volumes, post-processing, SFX and VFX.</div>
         <div class="home-card__warn">Requires the local server (node serve.js) to be running; not from file:// -- Run start.bat to fix this</div>
       </a>
     </section>
 
     <section class="home-section">
       <h2 class="home-section__title">Texture Curation</h2>
-      <p class="home-section__desc">Work through these two in order: reduce a source image, then build the palette it will use.</p>
+      <p class="home-section__desc">Perfect for adding textures to your universe with this tool that's built for the whole TIM pipeline.</p>
 
-      <a class="home-card" href="tools/image-bpp/index.html">
-        <div class="home-card__title"><span class="home-flow-step">1</span>BPP Image Tool</div>
-        <div class="home-card__desc">Reduce an image by restricting color depth (4/8bpp), adjust hue/saturation/contrast, dither, edit the palette by hand, and export or save your project.</div>
-      </a>
-
-      <a class="home-card" href="tools/palette-maker/index.html">
-        <div class="home-card__title"><span class="home-flow-step">2</span>Palette Maker</div>
-        <div class="home-card__desc">Create Colour Lookup Tables that will correspond to ONE texture.</div>
+      <a class="home-card" href="tools/tim-gen/index.html">
+        <div class="home-card__title">TimGen</div>
+        <div class="home-card__desc">Supports rescale, CLUTs, reduced bpp, rescale, adjust hue/sat/contrast, dither.</div>
       </a>
     </section>
 
@@ -140,8 +135,8 @@
       <p class="home-section__desc">Tools for working with PS1-style audio, including conversion and playback.</p>
 
       <a class="home-card" href="tools/audio-vag/index.html">
-        <div class="home-card__title"><span class="home-flow-step">1</span>Audio Bank Tool</div>
-        <div class="home-card__desc">Convert a .wav into a PS1 SPU-ADPCM .VAG, with sample-rate, anti-alias, effort and loop controls, and A/B preview.</div>
+        <div class="home-card__title"><span class="home-flow-step">1</span>Audio Converter to VAG</div>
+        <div class="home-card__desc">Convert a .wav into a PS1 SPU-ADPCM .VAG, with sample-rate, effort and loop controls, and A/B preview.</div>
       </a>
 
       <a class="home-card" href="tools/audio-ost/index.html">

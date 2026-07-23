@@ -151,6 +151,7 @@ psn00bsdk_add_executable(template GPREL
     sound.c
     sfx.c
     music.c
+    animation.c
     "${TEX_BLOB_S}"
     "${TEX_BLOB_TABLE}"
     "${SND_EMBED_S}"

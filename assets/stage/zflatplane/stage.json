@@ -49,10 +49,30 @@
         1,
         1
       ]
+    },
+    {
+      "model": "testnpc",
+      "palette": 0,
+      "pos": [
+        0,
+        -892,
+        0
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ],
+      "scale": [
+        0.1,
+        0.1,
+        0.1
+      ]
     }
   ],
   "sounds": [
     {
+      "soundId": 0,
       "sample": "LAVENDAR",
       "pos": [
         -1664,
@@ -69,6 +89,105 @@
       "directional": false,
       "muteAfterPlay": false,
       "autoplay": true
+    },
+    {
+      "soundId": 1,
+      "sample": "DOOR0LOC",
+      "pos": [
+        0,
+        92,
+        0
+      ],
+      "volume": 0.5,
+      "radius": 0,
+      "mode": "once",
+      "delay": 0,
+      "fadeOnStageEnter": true,
+      "intervalMin": 2,
+      "intervalMax": 8,
+      "directional": false,
+      "muteAfterPlay": false,
+      "autoplay": true
     }
-  ]
+  ],
+  "lights": [
+    {
+      "type": "spherical",
+      "disabled": false,
+      "mobility": "static",
+      "pos": [
+        -7421,
+        -286,
+        3799
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ],
+      "dir": [
+        0,
+        0,
+        -4096
+      ],
+      "color": [
+        247,
+        0,
+        6
+      ],
+      "intensity": 1,
+      "range": 5120,
+      "coneAngle": 30,
+      "penumbra": 0.2
+    }
+  ],
+  "spawns": [
+    {
+      "spawnId": 0,
+      "pos": [
+        -1536,
+        0,
+        2560
+      ],
+      "rot": [
+        0,
+        0,
+        0
+      ]
+    }
+  ],
+  "triggers": [
+    {
+      "action": "switchScene",
+      "event": "",
+      "pos": [
+        -7680,
+        -512,
+        3584
+      ],
+      "halfExtent": [
+        512,
+        512,
+        512
+      ],
+      "targetStage": "house_demo",
+      "targetSpawnId": 0,
+      "onEnterSoundId": -1,
+      "userInteract": true,
+      "once": false
+    }
+  ],
+  "fog": {
+    "enabled": false,
+    "near": 800,
+    "far": 6000,
+    "color": [
+      128,
+      128,
+      128
+    ],
+    "layers": 3,
+    "cull": false,
+    "drift": false
+  }
 }

@@ -211,6 +211,16 @@
         <button id="shading-editor" class="shading-btn is-active" title="Editor lighting: unlit, full-bright textures">Editor</button>
         <button id="shading-ps1" class="shading-btn" title="PS1 lighting: preview the runtime's GTE lighting from this stage's authored Lights (directional + ambient; spherical/spot await the vertex bake)">PS1</button>
       </div>
+
+      <!-- Collision view, sitting alongside the shading toggle as a sibling
+           viewport-overlay control (Blender puts its shading and overlay
+           modes together in the same corner for the same reason: they are
+           both "how am I looking at this", not "what am I editing"). -->
+      <div id="viewport-collision-toggle" class="shading-toggle" aria-label="Collision view">
+        <button id="collision-off" class="shading-btn is-active" title="Collision view off (C cycles)">Col: Off</button>
+        <button id="collision-all" class="shading-btn" title="Show collision boxes for EVERY collidable object, solid. The 'is my stage blocked out correctly' view.">All</button>
+        <button id="collision-focus" class="shading-btn" title="Show only the selected object's collision boxes, translucent, so you can see the geometry through the box you're fitting.">Focus</button>
+      </div>
       <div id="freecam-indicator" class="freecam-indicator hidden"></div>
     </main>
 
@@ -270,6 +280,50 @@
               </div>
             </details>
 
+            <!-- Solidity, deliberately NOT folded into Appearance: palette
+                 is how the instance LOOKS, Collide is what it DOES. Model
+                 instances only - entities have no geometry to collide
+                 with. -->
+            <details class="props-section" open id="collision-section">
+              <summary>Collision</summary>
+              <div class="props-body">
+                <label class="checkbox-row" title="Solid to the player at runtime. With authored collision boxes below, those are used; with none, the runtime falls back to an automatic box per mesh. Defaults ON: untick for foliage, decals and detail geometry the player should walk straight through.">
+                  <input type="checkbox" id="f-collide">
+                  <span>Collide</span>
+                </label>
+
+                <button id="f-auto-box" class="btn" title="Seed one collision box per mesh in this model, fitted to that mesh and named after it. A STARTING POINT - drag the boxes into shape and delete the ones you don't want. Replaces this instance's existing boxes.">Auto Box</button>
+                <button id="f-add-box" class="btn" title="Add a single unit-sized collision box at this instance's origin, to position yourself.">Add Box</button>
+
+                <p class="props-hint" id="collider-count-hint"></p>
+              </div>
+            </details>
+
+            <!-- Animation. Model-instance-only AND only shown when the
+                 instance's .glb actually carries clips (app.js checks
+                 viewer.hasAnimations). Default clip drives loop/speed/autoplay,
+                 which sit disabled while the clip is "None". -->
+            <details class="props-section hidden" open id="animation-section">
+              <summary>Animation<span class="anim-badge" title="This model carries animation clips">●</span></summary>
+              <div class="props-body">
+                <label class="field-full" title="Which clip this instance plays by default. None leaves it in bind pose. Names come straight from the source .glb.">Default Animation
+                  <select id="f-anim-default"></select>
+                </label>
+                <label class="checkbox-row" title="Loop the clip, or play it once and hold the final pose.">
+                  <input type="checkbox" id="f-anim-loop">
+                  <span>Loop</span>
+                </label>
+                <label class="field-full" title="Playback rate. 1.0 = authored speed; 0.5 = half speed, 2.0 = double.">Speed
+                  <input type="number" step="0.1" min="0" id="f-anim-speed">
+                </label>
+                <label class="checkbox-row" title="Start playing as soon as the object spawns, or sit paused on the first frame.">
+                  <input type="checkbox" id="f-anim-autoplay">
+                  <span>Autoplay on spawn</span>
+                </label>
+                <p class="props-hint" id="anim-hint"></p>
+              </div>
+            </details>
+
             <!-- Kind-specific entity parameters (spawn IDs, summon
                  behavior, billboard config, ...). Hidden for model
                  instances; app.js builds the editors dynamically from
@@ -277,6 +331,39 @@
             <details class="props-section hidden" open id="entity-props-section">
               <summary id="entity-props-title">Parameters</summary>
               <div class="props-body" id="entity-props-body"></div>
+            </details>
+          </div>
+
+          <!-- Collision box properties. A separate top-level block rather than
+               a section inside instance-fields, because a box has no
+               Transform/Appearance of its own - Center and Size ARE its
+               transform, expressed in its owning instance's local space. -->
+          <div id="collider-fields" class="hidden">
+            <p class="props-target" id="collider-target-label"></p>
+
+            <details class="props-section" open>
+              <summary>Box</summary>
+              <div class="props-body">
+                <span class="props-group-label">Center (local to the instance)</span>
+                <div class="field-grid3">
+                  <label>X<input type="number" step="0.1" id="c-center-x"></label>
+                  <label>Y<input type="number" step="0.1" id="c-center-y"></label>
+                  <label>Z<input type="number" step="0.1" id="c-center-z"></label>
+                </div>
+                <span class="props-group-label">Size</span>
+                <div class="field-grid3">
+                  <label>X<input type="number" step="0.1" min="0" id="c-size-x"></label>
+                  <label>Y<input type="number" step="0.1" min="0" id="c-size-y"></label>
+                  <label>Z<input type="number" step="0.1" min="0" id="c-size-z"></label>
+                </div>
+
+                <label class="checkbox-row" title="Whether this box starts solid. This is the INITIAL state only - the runtime keeps a live flag per box, so a trigger can switch it on or off later by its Collider ID.">
+                  <input type="checkbox" id="c-enabled">
+                  <span>Enabled</span>
+                </label>
+
+                <p class="props-hint" id="c-id-hint"></p>
+              </div>
             </details>
           </div>
 
@@ -298,6 +385,55 @@
                 <label>Y<input type="number" step="1" id="cam-rot-y"></label>
                 <label>Z<input type="number" step="1" id="cam-rot-z"></label>
               </div>
+            </div>
+          </details>
+
+          <!-- Stage Fog: a STAGE-LEVEL block like the camera above (fog has
+               no position, and there is exactly one per stage), so it lives
+               here rather than in the entity tree. Every field mirrors a
+               main.c global; the DEBUG-mode L1+L2 pad editor still overrides
+               them live on hardware - these are the authored defaults the
+               stage loads with. -->
+          <details class="props-section" open>
+            <summary>Stage Fog</summary>
+            <div class="props-body">
+              <label class="checkbox-row" title="main.c: fog_enabled. Master toggle - on hardware, DEBUG mode's L1+L2 + CROSS flips this live.">
+                <input type="checkbox" id="fog-enabled">
+                <span>Fog Enabled</span>
+              </label>
+
+              <span class="props-group-label">Distance (viewport units)</span>
+              <div class="field-grid2">
+                <label title="main.c: fog_near. The depth at which fog BEGINS (GTE depth cue IR0 = 0). Exported *1024.">Near
+                  <input type="number" step="0.1" min="0" id="fog-near">
+                </label>
+                <label title="main.c: fog_far. The depth at which fog is FULL (IR0 = 4096). Exported *1024.">Far
+                  <input type="number" step="0.1" min="0" id="fog-far">
+                </label>
+              </div>
+              <p class="props-hint" id="fog-range-hint"></p>
+
+              <label class="field-full" title="main.c: FOG_COL_R/G/B. Used by three things that must never disagree - the GTE far colour, the fog quads, and the SCREEN CLEAR colour. #808080 is the neutral multiplier for PS1 texture modulation; moving off it changes how textured geometry fogs, and requires a matching edit to FOG_COL_* in main.c.">Fog Colour
+                <input type="color" class="color-field" id="fog-color">
+              </label>
+
+              <label class="field-full" title="main.c: fog_layers. Full-screen 50%-blend quads inserted into the OT. This is the ONLY thing that fogs TEXTURED geometry - the depth cue alone just tints texels. 0..6; each layer costs one primitive per frame, not per triangle.">Quad Layers (0-6)
+                <input type="number" step="1" min="0" max="6" id="fog-layers">
+              </label>
+
+              <label class="checkbox-row" title="main.c: fog_cull_enabled. Skips geometry sitting entirely past Far, per triangle. This is the payoff fog buys - but residual at the plane is 0.5^layers of a texel's difference from the fog colour, so raise layers if it pops.">
+                <input type="checkbox" id="fog-cull">
+                <span>Cull Fog-Hidden Geometry</span>
+              </label>
+
+              <label class="checkbox-row" title="main.c: fog_drift_enabled. Slow sine breathing on the far edge. One-sided - it only ever pushes Far outward, so it can never widen a rail-safe range into a railed one.">
+                <input type="checkbox" id="fog-drift">
+                <span>Density Drift</span>
+              </label>
+
+              <p class="props-hint">
+                Preview shows in the viewport's <strong>PS1</strong> shading mode.
+              </p>
             </div>
           </details>
 

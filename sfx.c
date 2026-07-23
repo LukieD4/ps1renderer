@@ -111,9 +111,9 @@ static int stagePlaying = 0;            // master ambience on/off flag
 // The active stage's authored music entity (first mode==MUSIC sound
 // with autoplay set - autoplay is the ENABLE toggle for music, so a
 // stage can author several tracks and tick the one it wants) -
-// recorded by sfx_stage_load(), consumed via sfx_stage_music() by the
-// (future) stage-transition system; main.c reads stage 0's directly at
-// boot to pick music_load()'s VAB/SEQ pair.
+// recorded by sfx_stage_load(), reported via sfx_stage_music(). main.c's
+// actual music swap scans the STAGE_DEF itself (stage_find_music) since
+// it needs the answer before this module has loaded the stage.
 static const STAGE_SOUND *stageMusic = 0;
 
 // ------------------------------------------------------------
@@ -330,6 +330,45 @@ static int sfx_load_vag(const char *cdPath, SFX_SLOT *slot)
 //                     dr=0x00, sustain level sl=0x0f (max)
 //   ADSR2 = 0x000e -> sustain direction = increase (bit14 = 0), sustain
 //                     rate 0, release rr=0x0e (short fade on key-off)
+// ---- Batched hardware key changes -------------------------------------
+//
+// THE SPU LATCHES KEY ON/OFF ONCE PER AUDIO FRAME, so two SpuSetKey() calls
+// in the same frame do not accumulate - the second REPLACES the first, and
+// the voice named by the first is simply never keyed. Anything that touches
+// more than one voice in a pass therefore has to build ONE mask and issue a
+// single write at the end.
+//
+// This was a real bug, not a theoretical one: sfx_stage_unload() keyed each
+// slot off inside a loop, so tearing down a stage with WIND on voice 0 and
+// CAW1 on voice 1 had the CAW1 write clobber the pending WIND key-off - the
+// wind kept playing into the next stage. It went unnoticed for a long time
+// because sfx_stage_unload() never ran with live voices until runtime stage
+// switching existed; the same latent fault sat in sfx_stage_stop() (the
+// START toggle would leave one of two ambients running) and in sfx_tick()
+// (two ONCE sounds completing on the same frame - only the later stopped).
+//
+// music.c has always done this correctly ("batch the hardware key changes:
+// offs first, then ons" in music_tick, and all_music_off's single masked
+// write); this brings sfx in line with it.
+//
+// Accumulators are module-level rather than passed around so no call site
+// signature changes - key_on/key_off just record intent, and each PUBLIC
+// entry point flushes once before returning.
+static uint32_t pendingKeyOn = 0;
+static uint32_t pendingKeyOff = 0;
+
+// Issue the accumulated key changes. OFFS FIRST, THEN ONS - matching
+// music_tick's ordering, and load-bearing when a voice is keyed off and on
+// in the same pass (a software-loop retrigger): doing ons first would let
+// the off silence the note that was just started.
+static void sfx_flush_keys(void)
+{
+    if (pendingKeyOff) SpuSetKey(0, pendingKeyOff);
+    if (pendingKeyOn)  SpuSetKey(1, pendingKeyOn);
+    pendingKeyOff = 0;
+    pendingKeyOn = 0;
+}
+
 static void sfx_key_on(SFX_SLOT *slot)
 {
     if (!slot->loaded || slot->voice < 0)
@@ -345,7 +384,10 @@ static void sfx_key_on(SFX_SLOT *slot)
     SPU_CH_ADSR1(slot->voice) = 0x100f;
     SPU_CH_ADSR2(slot->voice) = 0x000e;
 
-    SpuSetKey(1, 1 << slot->voice);
+    // Per-voice registers above are written immediately (they are plain
+    // stores, not latched); only the key change itself is batched.
+    pendingKeyOn |= 1u << slot->voice;
+    pendingKeyOff &= ~(1u << slot->voice); // a re-key supersedes a pending off
     slot->active = 1;
     slot->framesLeft = slot->playFrames; // meaningful for ONCE/INTERVAL; LOOP ignores it
 }
@@ -353,7 +395,10 @@ static void sfx_key_on(SFX_SLOT *slot)
 static void sfx_key_off(SFX_SLOT *slot)
 {
     if (slot->loaded && slot->voice >= 0)
-        SpuSetKey(0, 1 << slot->voice); // release phase (rr in ADSR2) then silence
+    {
+        pendingKeyOff |= 1u << slot->voice; // release phase (rr in ADSR2) then silence
+        pendingKeyOn &= ~(1u << slot->voice);
+    }
     slot->active = 0;
 }
 
@@ -364,9 +409,29 @@ static void sfx_key_off(SFX_SLOT *slot)
 void sfx_stage_unload(void)
 {
     // Key everything off first so no voice is left reading SPU RAM we're
-    // about to hand back.
+    // about to hand back. ONE masked write for all of them - see the
+    // batching note at sfx_flush_keys(); keying off per-voice in this loop
+    // is what let a looping wind survive into the next stage.
     for (unsigned int i = 0; i < slotCount; i++)
         sfx_key_off(&slots[i]);
+
+    // Flush BEFORE releasing the memory below: the voices have to be told
+    // to stop while their waveform is still valid, not after the allocator
+    // has handed the region to the next stage's samples.
+    sfx_flush_keys();
+
+    // Belt and braces for teardown specifically. Key-off starts the ADSR
+    // RELEASE phase, which takes a fraction of a millisecond to reach
+    // silence - and the very next thing that happens is this region being
+    // freed and potentially overwritten by the incoming stage's uploads.
+    // Zeroing the voice volume is immediate and envelope-independent, so a
+    // voice cannot briefly render whatever lands in its old memory. Cheap:
+    // a couple of register writes per slot, once per stage load.
+    for (unsigned int i = 0; i < slotCount; i++)
+    {
+        if (slots[i].loaded && slots[i].voice >= 0)
+            SpuSetVoiceVolume(slots[i].voice, 0, 0);
+    }
 
     // Release in REVERSE load order - the LIFO contract of
     // sound_spu_release() (it rewinds a bump cursor, not a free list).
@@ -429,7 +494,70 @@ void sfx_stage_start(void)
 
         any = 1;
     }
+
+    // Every slot that keyed on above shares one masked write - a stage with
+    // two zero-delay ambients would otherwise start only the second.
+    sfx_flush_keys();
+
     stagePlaying = any;
+}
+
+
+// Fire ONE emitter on demand, addressed by its authored STAGE_SOUND.soundId.
+// This is the entry point for anything that wants to play a specific
+// stage-authored sound at a moment of its choosing - today a Switch Scene
+// trigger's "Upon Enter SFX" (main.c stage_transition_begin), tomorrow the
+// generic event system the trigger `event` field is reserved for.
+//
+// Returns 1 if a slot was actually begun, 0 otherwise. Callers currently
+// ignore it; it exists so a future overlay can distinguish "authored a sound
+// that didn't resolve" from "authored no sound".
+//
+// DELIBERATELY IGNORES stagePlaying. The START-toggle ambience switch
+// governs the stage's AMBIENT bed - the wind, the birds. A door creak is a
+// discrete event caused by the player, and muting the ambience shouldn't
+// silence the game's responses to what the player does. (Change this if
+// START ever becomes a true master mute rather than an ambience toggle.)
+//
+// RESPECTS `muted`, because muteAfterPlay means "this has had its one
+// playthrough and is done for the stage" - re-firing it from a trigger would
+// be exactly the retrigger that flag exists to prevent.
+//
+// SKIPS MUSIC-MODE entries: a music emitter is a stage-level marker naming a
+// VAB/SEQ pair for music.c, holds no sfx voice, and has no waveform to key
+// on. stage-gen filters these out of the picker, so reaching one here means
+// a hand-written stage.json - it degrades to "nothing played" rather than
+// keying a voice that was never loaded.
+int sfx_play_by_id(unsigned int soundId)
+{
+    for (unsigned int i = 0; i < slotCount; i++)
+    {
+        SFX_SLOT *slot = &slots[i];
+
+        if (!slot->def || slot->def->soundId != soundId)
+            continue;
+        if (slot->def->mode == SFX_MODE_MUSIC)
+            continue;
+        if (!slot->loaded || slot->muted)
+            continue;
+
+        // Bypass the authored Delay: that describes when a sound starts
+        // relative to STAGE LOAD, which has nothing to do with a trigger
+        // firing now. Clear any pending countdown so sfx_tick can't begin it
+        // a second time a few frames later.
+        slot->startIn = 0;
+        slot->nextFireIn = 0;
+
+        // Key on DIRECTLY rather than via sfx_begin(): for an INTERVAL-mode
+        // sound, begin() schedules a random future fire instead of playing -
+        // and that countdown only ticks while the ambience is on, so a
+        // trigger firing an interval emitter with START toggled off would
+        // never sound at all. "Fire on demand" means now, in every mode.
+        sfx_key_on(slot);
+        sfx_flush_keys(); // this is a public entry point - don't leave the key pending
+        return 1;
+    }
+    return 0;
 }
 
 void sfx_stage_load(const STAGE_DEF *stage)
@@ -671,6 +799,12 @@ void sfx_tick(const VECTOR *camPos, int camYaw)
         if (slot->active && slot->def->directional)
             sfx_update_directional(slot, camPos, camYaw);
     }
+
+    // Single masked write for every key change this frame produced. Several
+    // slots can change state on the same tick - two ONCE sounds completing
+    // together, an interval fire alongside a software-loop retrigger - and
+    // writing per-voice inside the loop meant only the last of them took.
+    sfx_flush_keys();
 }
 
 // ------------------------------------------------------------
@@ -685,6 +819,12 @@ void sfx_stage_stop(void)
         slots[i].nextFireIn = 0; // cancel pending interval fires
         slots[i].startIn = 0;    // cancel pending delayed starts
     }
+
+    // One masked write for the lot. Before this was batched, a START press
+    // on a stage with two ambients silenced only the last of them - the same
+    // fault that let wind survive a stage switch.
+    sfx_flush_keys();
+
     stagePlaying = 0;
 }
 

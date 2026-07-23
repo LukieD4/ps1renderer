@@ -57,11 +57,17 @@ function snapshot(state) {
       id: inst.id,
       model: inst.model,
       palette: inst.palette,
+      collide: inst.collide,
       name: inst.name,
       parentId: inst.parentId,
       pos: { ...inst.pos },
       rot: { ...inst.rot },
       scale: { ...inst.scale },
+      // anim is flat primitives (clip/loop/speed/autoplay), so a spread is a
+      // full deep clone - undo/redo restores the authored animation the same
+      // way it restores palette or collide. Paired with applySnapshot() in
+      // app.js, which reads it back through normalizeAnim.
+      anim: inst.anim ? { ...inst.anim } : undefined,
     })),
     // Folder objects are flat plain data ({ id, name, parentId,
     // collapsed }), so a shallow per-folder spread is a full deep clone.
@@ -71,6 +77,19 @@ function snapshot(state) {
     // state it was taken with, which keeps what the user SEES after an
     // undo consistent with what they saw when that state was current.
     folders: state.folders.map((folder) => ({ ...folder })),
+    // Colliders: center/size are nested one level, so each needs its own
+    // clone. Snapshotting these is what makes Auto Box, box drags and box
+    // deletion undoable at all - and it must pair with applySnapshot()'s
+    // restore, or undo silently drops every box on the stage.
+    colliders: state.colliders.map((c) => ({
+      id: c.id,
+      parentInstanceId: c.parentInstanceId,
+      name: c.name,
+      colliderId: c.colliderId,
+      enabled: c.enabled,
+      center: { ...c.center },
+      size: { ...c.size },
+    })),
     // Entities: pos/rot/scale/props each need their own clone (they're
     // nested one level deep); props values are all primitives per the
     // ENTITY_KINDS schemas, so a spread of props is a full deep clone.
@@ -88,10 +107,16 @@ function snapshot(state) {
       pos: { ...state.camera.pos },
       rot: { ...state.camera.rot },
     },
+    // Stage fog is stage-level plain data (all primitives), so it snapshots
+    // with a single spread and gets undo/redo for free - the whole point of
+    // the snapshot approach documented above.
+    fog: { ...state.fog },
     selectedInstanceId: state.selectedInstanceId,
     selectedFolderId: state.selectedFolderId,
     nextId: state.nextId,
     nextSpawnId: state.nextSpawnId,
+    nextSoundId: state.nextSoundId,
+    nextColliderId: state.nextColliderId,
   };
 }
 

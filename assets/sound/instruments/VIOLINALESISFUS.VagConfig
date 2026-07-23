@@ -1,0 +1,17 @@
+{
+  "format": "VagConfig",
+  "version": 2,
+  "targetRate": 16000,
+  "quality": "sinc",
+  "cutoffPct": 90,
+  "effort": "exhaustive",
+  "loop": false,
+  "loopStartFrac": 0,
+  "name": "VIOLINALESISFUS",
+  "volume": 1,
+  "trimStart": 0,
+  "trimEnd": 1.7860544217687075,
+  "monitor": "output",
+  "playhead": 0,
+  "sourceFileName": "Violin-Alesis-Fusion-C5.wav"
+}

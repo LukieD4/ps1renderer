@@ -225,6 +225,15 @@ body {
   overflow: hidden;
 }
 
+/* Collision view sits directly BELOW the shading toggle rather than beside
+   it. Both are absolutely positioned overlays pinned to the same corner, so
+   sharing a row would need their widths to be known in advance - and the
+   labels here ("Col: Off" / "All" / "Focus") are wider than Editor/PS1.
+   Stacking keeps them aligned on the right edge whatever the text does. */
+#viewport-collision-toggle {
+  top: 44px;
+}
+
 .shading-btn {
   padding: 4px 10px;
   font-size: 11px;
@@ -288,7 +297,7 @@ body {
   letter-spacing: 0.05em;
   color: var(--text-faint);
   cursor: pointer;
-  transition: color 0.12s ease, background-color 0.12s ease;
+  transition: color var(--dur) ease, background-color var(--dur) ease;
   white-space: nowrap;
   overflow: hidden;
   text-overflow: ellipsis;
@@ -365,7 +374,7 @@ body {
   text-transform: uppercase;
   letter-spacing: 0.05em;
   color: var(--text-dim);
-  transition: color 0.12s ease;
+  transition: color var(--dur) ease;
 }
 
 .props-section summary::-webkit-details-marker {
@@ -378,7 +387,7 @@ body {
   display: inline-block;
   margin-right: 6px;
   color: var(--text-faint);
-  transition: transform 0.12s ease;
+  transition: transform var(--dur) ease;
 }
 
 .props-section[open] > summary::before {
@@ -413,7 +422,7 @@ body {
   padding: 8px 12px;
   font-size: 13px;
   cursor: pointer;
-  transition: border-color 0.12s ease;
+  transition: border-color var(--dur) ease;
 }
 
 .btn:hover:not(:disabled) {
@@ -462,7 +471,7 @@ body {
   border-radius: var(--radius-md);
   cursor: pointer;
   margin-bottom: 8px;
-  transition: border-color 0.12s ease, background-color 0.12s ease;
+  transition: border-color var(--dur) ease, background-color var(--dur) ease;
 }
 
 .dropzone:hover,
@@ -520,6 +529,13 @@ body {
 
 .item-list li:hover {
   border-color: var(--accent);
+}
+
+/* Folder rows hover YELLOW instead of the default accent blue, so the
+   structural rows are distinguishable from asset/instance rows on hover as
+   well as by their slimmer height. */
+.item-list li.tree-folder:hover {
+  border-color: var(--folder-hover, #e0b020);
 }
 
 .item-list li.is-selected {
@@ -652,6 +668,51 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
+/* Folder rows are the tree's structure, not its contents - make them
+   vertically slimmer than instance/entity rows so the hierarchy reads at a
+   glance and folders don't look like just another asset. Horizontal padding
+   is left to .item-list li + the inline per-depth paddingLeft; only the
+   vertical rhythm changes here. */
+.item-list li.tree-folder {
+  padding-top: 2px;
+  padding-bottom: 2px;
+  min-height: 0;
+  /* A hair of breathing room after a folder row (on top of the list's 4px
+     gap) so a folder reads as the start of a group rather than just another
+     row in the run. */
+  margin-bottom: 3px;
+}
+
+/* Leading type icon on every instance row (see buildInstanceRow), Roblox-
+   Studio style: fixed-width so the names after it line up regardless of which
+   glyph a row carries. The row's gap (.item-list li) supplies the whitespace
+   between icon and name. Neutral tone by default; the animated variant below
+   overrides the color. */
+.instance-icon {
+  flex: 0 0 auto;
+  width: 12px;
+  text-align: center;
+  font-size: 10px;
+  line-height: 1;
+  color: var(--text-dim);
+}
+
+/* Red "animated" marker: the same left-hand icon slot, recolored, for an
+   instance whose model .glb carries animation clips. */
+.instance-icon.anim-marker {
+  color: var(--anim-red, #e2483d);
+}
+
+/* Small red dot in the Animation properties-section header, echoing the
+   tree marker so the section and the flagged rows read as the same feature. */
+.anim-badge {
+  margin-left: 6px;
+  font-size: 9px;
+  line-height: 1;
+  color: var(--anim-red, #e2483d);
+  vertical-align: middle;
+}
+
 /* Row currently hovered as a valid drag-drop target. */
 .item-list li.drop-target {
   border-color: var(--accent);
@@ -681,7 +742,19 @@ body {
   margin-bottom: 8px;
 }
 
+/* Two-up variant, for paired scalars that are a RANGE rather than a vector
+   (fog Near/Far). Deliberately not field-grid3 with an empty cell: these two
+   read as a pair, and a third of the width each with a hole beside them
+   invites the "is something missing?" question every time. */
+.field-grid2 {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 6px;
+  margin-bottom: 8px;
+}
+
 .field-grid3 label,
+.field-grid2 label,
 .field-full {
   display: flex;
   flex-direction: column;
@@ -694,7 +767,60 @@ body {
   margin-bottom: 8px;
 }
 
+/* Inline checkbox + label, used by the entity props panel's `bool` type and
+   the Stage Fog toggles. Previously unstyled, so it fell back to the
+   browser's block-label default and stacked the box above its own text. */
+/* Inline delete button on a collision-box row. Boxes are the one row type
+   with a per-row action: Auto Box seeds several at once and pruning them is
+   the normal first step, so making that a click rather than select-then-Delete
+   is worth the extra control. Quiet until hovered. */
+.row-btn {
+  margin-left: auto;
+  flex: none;
+  background: none;
+  border: none;
+  color: var(--text-faint);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 0 4px;
+  opacity: 0;
+}
+
+.tree-collider:hover .row-btn { opacity: 1; }
+.row-btn:hover { color: var(--danger, #e05d5d); }
+
+.checkbox-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11px;
+  color: var(--text-faint);
+  margin-bottom: 8px;
+  cursor: pointer;
+  user-select: none;
+}
+
+.checkbox-row input[type="checkbox"] {
+  margin: 0;
+  cursor: pointer;
+  accent-color: var(--accent);
+  flex: none;
+}
+
+/* Explanatory line under a field - a live readout (fog's exported engine
+   units) or a standing caveat. Quiet by design: it must be readable when
+   looked for and invisible when not. */
+.props-hint {
+  margin: -2px 0 8px;
+  font-size: 10px;
+  line-height: 1.4;
+  color: var(--text-faint);
+  opacity: 0.75;
+}
+
 .field-grid3 input,
+.field-grid2 input,
 .field-full input,
 .field-full select {
   background: var(--panel);
@@ -719,12 +845,14 @@ body {
    inputs step down to the page background for contrast instead of
    disappearing into their parent. */
 .props-body .field-grid3 input,
+.props-body .field-grid2 input,
 .props-body .field-full input,
 .props-body .field-full select {
   background: var(--panel-raised);
 }
 
 .field-grid3 input:focus,
+.field-grid2 input:focus,
 .field-full input:focus,
 .field-full select:focus {
   outline: none;
@@ -762,7 +890,7 @@ body {
   box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
   opacity: 1;
   transform: translateY(0);
-  transition: opacity 0.2s ease, transform 0.2s ease;
+  transition: opacity var(--dur-slow) ease, transform var(--dur-slow) ease;
 }
 
 .toast--closing {
@@ -785,6 +913,7 @@ body {
 /* ---------- Drag-to-scrub numeric fields (drag_scrub.js) ---------- */
 
 .field-grid3 input[type="number"],
+.field-grid2 input[type="number"],
 .field-full input[type="number"] {
   cursor: ns-resize;
   -moz-appearance: textfield; /* Firefox's spinner-hide */
@@ -799,6 +928,8 @@ body {
    of the field). */
 .field-grid3 input[type="number"]::-webkit-outer-spin-button,
 .field-grid3 input[type="number"]::-webkit-inner-spin-button,
+.field-grid2 input[type="number"]::-webkit-outer-spin-button,
+.field-grid2 input[type="number"]::-webkit-inner-spin-button,
 .field-full input[type="number"]::-webkit-outer-spin-button,
 .field-full input[type="number"]::-webkit-inner-spin-button {
   -webkit-appearance: none;
@@ -806,6 +937,7 @@ body {
 }
 
 .field-grid3 input[type="number"].is-scrubbing,
+.field-grid2 input[type="number"].is-scrubbing,
 .field-full input[type="number"].is-scrubbing {
   border-color: var(--accent);
   background: var(--panel-raised);
@@ -900,7 +1032,7 @@ body {
   height: 100%;
   width: 0%;
   background: var(--accent);
-  transition: width 0.15s ease;
+  transition: width var(--dur) ease;
 }
 
 /* Over ~90% of budget: make the bar read as a warning at a glance. */
@@ -959,4 +1091,16 @@ body {
 
 .modal-actions .btn {
   margin-bottom: 0;
+}
+
+/* ---------- Reduced motion ---------- */
+
+/* The shared --dur / --dur-slow tokens already collapse to 0s under this
+   query (see site.css), so every tokenized transition here goes still.
+   This blanket rule additionally catches any non-tokenized animation. */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    transition: none !important;
+    animation: none !important;
+  }
 }

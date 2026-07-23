@@ -1,5 +1,5 @@
 {
-  "version": 3,
+  "version": 8,
   "camera": {
     "pos": {
       "x": 3.633902135325165,
@@ -12,17 +12,40 @@
       "z": 0
     }
   },
+  "fog": {
+    "enabled": false,
+    "near": 1.400390625,
+    "far": 3.7001953125,
+    "color": "#808080",
+    "layers": 3,
+    "cull": true,
+    "drift": true
+  },
   "modelNames": [
     "house",
     "3shapes",
-    "honda"
+    "honda",
+    "roads",
+    "testnpc"
   ],
   "folders": [
     {
       "id": 6,
       "name": "Houses",
       "parentId": null,
+      "collapsed": false
+    },
+    {
+      "id": 23,
+      "name": "Door SFX",
+      "parentId": null,
       "collapsed": true
+    },
+    {
+      "id": 35,
+      "name": "Jimbob",
+      "parentId": null,
+      "collapsed": false
     }
   ],
   "instances": [
@@ -30,6 +53,7 @@
       "id": 1,
       "model": "house",
       "palette": 1,
+      "collide": true,
       "name": "red",
       "parentId": 6,
       "pos": {
@@ -46,12 +70,19 @@
         "x": 1,
         "y": 1,
         "z": 1
+      },
+      "anim": {
+        "clip": null,
+        "loop": true,
+        "speed": 1,
+        "autoplay": true
       }
     },
     {
       "id": 2,
       "model": "3shapes",
       "palette": 0,
+      "collide": true,
       "name": null,
       "parentId": null,
       "pos": {
@@ -68,12 +99,19 @@
         "x": 1,
         "y": 1,
         "z": 1
+      },
+      "anim": {
+        "clip": null,
+        "loop": true,
+        "speed": 1,
+        "autoplay": true
       }
     },
     {
       "id": 3,
       "model": "honda",
       "palette": 0,
+      "collide": false,
       "name": null,
       "parentId": null,
       "pos": {
@@ -90,12 +128,19 @@
         "x": 1,
         "y": 1,
         "z": 1
+      },
+      "anim": {
+        "clip": null,
+        "loop": true,
+        "speed": 1,
+        "autoplay": true
       }
     },
     {
       "id": 4,
       "model": "house",
       "palette": 0,
+      "collide": true,
       "name": "blue",
       "parentId": 6,
       "pos": {
@@ -112,12 +157,19 @@
         "x": 1,
         "y": 1,
         "z": 1
+      },
+      "anim": {
+        "clip": null,
+        "loop": true,
+        "speed": 1,
+        "autoplay": true
       }
     },
     {
       "id": 5,
       "model": "house",
       "palette": 2,
+      "collide": true,
       "name": "green",
       "parentId": 6,
       "pos": {
@@ -134,9 +186,190 @@
         "x": 1,
         "y": 1,
         "z": 1
+      },
+      "anim": {
+        "clip": null,
+        "loop": true,
+        "speed": 1,
+        "autoplay": true
+      }
+    },
+    {
+      "id": 24,
+      "model": "roads",
+      "palette": 0,
+      "collide": true,
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": 0.99,
+        "y": -0.165,
+        "z": 7.141
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "anim": {
+        "clip": null,
+        "loop": true,
+        "speed": 1,
+        "autoplay": true
+      }
+    },
+    {
+      "id": 25,
+      "model": "roads",
+      "palette": 0,
+      "collide": true,
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": -3.736,
+        "y": -0.165,
+        "z": 7.141
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "anim": {
+        "clip": null,
+        "loop": true,
+        "speed": 1,
+        "autoplay": true
+      }
+    },
+    {
+      "id": 26,
+      "model": "roads",
+      "palette": 0,
+      "collide": true,
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": -8.462,
+        "y": -0.165,
+        "z": 7.141
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "anim": {
+        "clip": null,
+        "loop": true,
+        "speed": 1,
+        "autoplay": true
+      }
+    },
+    {
+      "id": 33,
+      "model": "testnpc",
+      "palette": 0,
+      "collide": true,
+      "name": null,
+      "parentId": 35,
+      "pos": {
+        "x": -3.129,
+        "y": 0.308,
+        "z": 0.564
+      },
+      "rot": {
+        "x": 0,
+        "y": 90,
+        "z": 0
+      },
+      "scale": {
+        "x": 0.025,
+        "y": 0.025,
+        "z": 0.025
+      },
+      "anim": {
+        "clip": "Dance",
+        "loop": true,
+        "speed": 1,
+        "autoplay": true
+      }
+    },
+    {
+      "id": 37,
+      "model": "roads",
+      "palette": 0,
+      "collide": true,
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": 5.716,
+        "y": -0.165,
+        "z": 7.141
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "anim": {
+        "clip": null,
+        "loop": true,
+        "speed": 1,
+        "autoplay": true
+      }
+    },
+    {
+      "id": 38,
+      "model": "roads",
+      "palette": 0,
+      "collide": true,
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": 10.443,
+        "y": -0.165,
+        "z": 7.141
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "anim": {
+        "clip": null,
+        "loop": true,
+        "speed": 1,
+        "autoplay": true
       }
     }
   ],
+  "colliders": [],
   "entities": [
     {
       "id": 7,
@@ -162,31 +395,6 @@
         "trackCamera": true,
         "pivotAngle": 0,
         "seeThroughWalls": false
-      }
-    },
-    {
-      "id": 8,
-      "kind": "trigger",
-      "name": null,
-      "parentId": null,
-      "pos": {
-        "x": -0.5,
-        "y": 0.5,
-        "z": 5.5
-      },
-      "rot": {
-        "x": 0,
-        "y": 0,
-        "z": 0
-      },
-      "scale": {
-        "x": 1,
-        "y": 1,
-        "z": 1
-      },
-      "props": {
-        "event": "",
-        "once": true
       }
     },
     {
@@ -262,6 +470,7 @@
         "z": 1
       },
       "props": {
+        "soundId": 0,
         "sample": "WIND",
         "volume": 0.4,
         "mode": "loop",
@@ -296,6 +505,7 @@
         "z": 1
       },
       "props": {
+        "soundId": 1,
         "sample": "CAW1",
         "volume": 0.1,
         "mode": "loop",
@@ -306,7 +516,7 @@
         "directional": true,
         "radius": 0,
         "muteAfterPlay": false,
-        "autoplay": true
+        "autoplay": false
       }
     },
     {
@@ -330,6 +540,7 @@
         "z": 1
       },
       "props": {
+        "soundId": 2,
         "sample": "SIAMISS",
         "volume": 0.5,
         "mode": "music",
@@ -340,7 +551,7 @@
         "directional": false,
         "radius": 0,
         "muteAfterPlay": false,
-        "autoplay": true
+        "autoplay": false
       }
     },
     {
@@ -364,6 +575,7 @@
         "z": 1
       },
       "props": {
+        "soundId": 3,
         "sample": "TESTING2",
         "volume": 0.5,
         "mode": "music",
@@ -442,7 +654,7 @@
     {
       "id": 21,
       "kind": "sound",
-      "name": null,
+      "name": "Music - SIA",
       "parentId": null,
       "pos": {
         "x": 0.085,
@@ -460,6 +672,7 @@
         "z": 1
       },
       "props": {
+        "soundId": 4,
         "sample": "TEST303",
         "volume": 0.5,
         "mode": "music",
@@ -470,10 +683,178 @@
         "directional": false,
         "radius": 0,
         "muteAfterPlay": false,
+        "autoplay": false
+      }
+    },
+    {
+      "id": 22,
+      "kind": "sound",
+      "name": "Generic door upon enter",
+      "parentId": 23,
+      "pos": {
+        "x": 0.306,
+        "y": 0.145,
+        "z": 1.092
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "soundId": 5,
+        "sample": "DOOR0CLO",
+        "volume": 0.5,
+        "mode": "loop",
+        "fadeOnStageEnter": true,
+        "delay": 0,
+        "intervalMin": 2,
+        "intervalMax": 8,
+        "directional": false,
+        "radius": 0,
+        "muteAfterPlay": false,
+        "autoplay": false
+      }
+    },
+    {
+      "id": 31,
+      "kind": "postprocess",
+      "name": null,
+      "parentId": null,
+      "pos": {
+        "x": -1,
+        "y": 0.466,
+        "z": 2
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "transition": "eased",
+        "falloff": 2,
+        "intensity": 100,
+        "tintEnabled": false,
+        "tintColor": "#804060",
+        "tintMode": "blend50",
+        "tintStrength": 1,
+        "blurEnabled": true,
+        "blurAmount": 0.5,
+        "ghostEnabled": false,
+        "ghostAmount": 0.5,
+        "paletteEnabled": false,
+        "paletteRow": 1
+      }
+    },
+    {
+      "id": 32,
+      "kind": "trigger",
+      "name": "Jimbob scene",
+      "parentId": null,
+      "pos": {
+        "x": -6.83,
+        "y": 0.5,
+        "z": 2.3
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "action": "switchScene",
+        "event": "zflatplane",
+        "targetStage": "zflatplane",
+        "targetSpawnId": 0,
+        "onEnterSoundId": 5,
+        "userInteract": true,
+        "once": true
+      }
+    },
+    {
+      "id": 34,
+      "kind": "sound",
+      "name": "jimbob sfx",
+      "parentId": 35,
+      "pos": {
+        "x": -3.151,
+        "y": 0.01,
+        "z": 0.47
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "soundId": 6,
+        "sample": "JIMBOB",
+        "volume": 0.5,
+        "mode": "loop",
+        "fadeOnStageEnter": true,
+        "delay": 0,
+        "intervalMin": 2,
+        "intervalMax": 8,
+        "directional": true,
+        "radius": 5,
+        "muteAfterPlay": false,
         "autoplay": true
+      }
+    },
+    {
+      "id": 36,
+      "kind": "trigger",
+      "name": "Jimbob scene",
+      "parentId": null,
+      "pos": {
+        "x": -4.48,
+        "y": 0.5,
+        "z": 2.351
+      },
+      "rot": {
+        "x": 0,
+        "y": 0,
+        "z": 0
+      },
+      "scale": {
+        "x": 1,
+        "y": 1,
+        "z": 1
+      },
+      "props": {
+        "action": "switchScene",
+        "event": "jimbob_stage_demo",
+        "targetStage": "jimbob_stage_demo",
+        "targetSpawnId": 0,
+        "onEnterSoundId": 5,
+        "userInteract": true,
+        "once": true
       }
     }
   ],
-  "nextId": 22,
-  "nextSpawnId": 5
+  "nextId": 39,
+  "nextSpawnId": 5,
+  "nextSoundId": 7,
+  "nextColliderId": 4
 }

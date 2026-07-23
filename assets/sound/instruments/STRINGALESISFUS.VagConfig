@@ -1,0 +1,17 @@
+{
+  "format": "VagConfig",
+  "version": 2,
+  "targetRate": 8000,
+  "quality": "sinc",
+  "cutoffPct": 90,
+  "effort": "exhaustive",
+  "loop": false,
+  "loopStartFrac": 0,
+  "name": "STRINGALESISFUS",
+  "volume": 1,
+  "trimStart": 0,
+  "trimEnd": 0.9483446712018141,
+  "monitor": "output",
+  "playhead": 0,
+  "sourceFileName": "String-Alesis-Fusion-Pizzicato-C4.wav"
+}

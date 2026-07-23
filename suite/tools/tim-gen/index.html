@@ -1,0 +1,275 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>TimGen — ps1renderer / Suite of Tools</title>
+  <link rel="stylesheet" href="../../css/site.css" />
+  <link rel="stylesheet" href="css/tool.css" />
+</head>
+<body data-nav-key="tim">
+  <div id="site-navbar"></div>
+
+  <!-- =============================== SHARED TRANSPORT =============================== -->
+  <div class="transport transport--top">
+    <div class="transport__group">
+      <button class="btn" id="btn-load-project">Load project</button>
+      <input type="file" id="load-project-input" class="hidden-input" accept=".TimGen,.BppProject,.PaletteGen,.json" />
+      <button class="btn btn--primary" id="btn-save-project" disabled>Save project</button>
+      <span class="transport__sep"></span>
+      <button class="btn btn--export" id="btn-export-png" disabled>Export PNG</button>
+      <button class="btn btn--export" id="btn-export-tim" disabled>Export .TIM</button>
+    </div>
+    <div class="transport__status" id="transport-status">No image loaded</div>
+  </div>
+
+  <!-- ============================ TAB BAR (.NET style) ============================ -->
+  <div class="tabbar" role="tablist" aria-label="TimGen stages">
+    <button class="tab-btn is-active" data-tab="image" role="tab" aria-selected="true" id="tab-btn-image">
+      <span class="tab-btn__step">1</span> Image
+    </button>
+    <button class="tab-btn" data-tab="palette" role="tab" aria-selected="false" id="tab-btn-palette">
+      <span class="tab-btn__step">2</span> Palettes / CLUTs
+    </button>
+    <div class="tabbar__spacer"></div>
+  </div>
+
+  <!-- ================================ TAB 1: IMAGE ================================ -->
+  <section class="tabpanel" data-tab="image" role="tabpanel" aria-labelledby="tab-btn-image">
+    <div class="workbench workbench--image">
+      <aside class="rail">
+
+        <div class="rail__section">
+          <p class="rail__label">Source image</p>
+          <label class="dropzone" id="img-dropzone" for="img-file-input">
+            <div class="dropzone__icon">&#8593;</div>
+            <div class="dropzone__text">Drop an image, or click to browse</div>
+            <div class="dropzone__hint">PNG preferred &middot; JPG/WEBP/BMP also work</div>
+            <input type="file" id="img-file-input" accept="image/*" />
+          </label>
+          <div class="file-chip" id="img-file-chip" hidden>
+            <span class="file-chip__name" id="img-file-chip-name"></span>
+            <span class="file-chip__dims" id="img-file-chip-dims"></span>
+          </div>
+        </div>
+
+        <div class="rail__section">
+          <p class="rail__label">Resize <span class="rail__label-note" id="img-native-dims"></span></p>
+          <div class="resize-fields">
+            <label class="resize-field"><span>W</span>
+              <input type="number" id="img-width" min="1" max="4096" step="1" disabled />
+            </label>
+            <span class="resize-x">×</span>
+            <label class="resize-field"><span>H</span>
+              <input type="number" id="img-height" min="1" max="4096" step="1" disabled />
+            </label>
+            <label class="resize-lock" title="Lock aspect ratio">
+              <input type="checkbox" id="img-lock-aspect" checked /><span aria-hidden="true">&#128279;</span>
+            </label>
+          </div>
+          <span class="reset-link" id="img-reset-size">Reset to native</span>
+        </div>
+
+        <div class="rail__section">
+          <p class="rail__label">Color depth</p>
+          <div class="segmented" id="img-bpp-selector">
+            <div class="segmented__option" data-bpp="4">
+              4bpp<span class="segmented__option-sub">16 colors</span>
+            </div>
+            <div class="segmented__option is-active" data-bpp="8">
+              8bpp<span class="segmented__option-sub">256 colors</span>
+            </div>
+          </div>
+        </div>
+
+        <div class="rail__section">
+          <p class="rail__label">Adjust <span class="rail__label-note">(applied to the image)</span></p>
+
+          <div class="slider-row">
+            <div class="slider-row__head"><span>Hue</span><span class="slider-row__value" id="img-hue-value">0&deg;</span></div>
+            <input type="range" id="img-hue" min="-180" max="180" value="0" step="1" />
+          </div>
+          <div class="slider-row">
+            <div class="slider-row__head"><span>Saturation</span><span class="slider-row__value" id="img-saturation-value">0</span></div>
+            <input type="range" id="img-saturation" min="-100" max="100" value="0" step="1" />
+          </div>
+          <div class="slider-row">
+            <div class="slider-row__head"><span>Brightness</span><span class="slider-row__value" id="img-brightness-value">0</span></div>
+            <input type="range" id="img-brightness" min="-100" max="100" value="0" step="1" />
+          </div>
+          <div class="slider-row">
+            <div class="slider-row__head"><span>Contrast</span><span class="slider-row__value" id="img-contrast-value">0</span></div>
+            <input type="range" id="img-contrast" min="-100" max="100" value="0" step="1" />
+          </div>
+
+          <span class="reset-link" id="img-reset-adjust">Reset adjustments</span>
+        </div>
+
+        <div class="rail__section">
+          <p class="rail__label">Dithering</p>
+          <div class="dither-options" id="img-dither-options">
+            <div class="dither-option is-active" data-mode="none"><span class="dither-option__dot"></span> None</div>
+            <div class="dither-option" data-mode="ordered"><span class="dither-option__dot"></span> Ordered (Bayer)</div>
+            <div class="dither-option" data-mode="floyd-steinberg"><span class="dither-option__dot"></span> Floyd&ndash;Steinberg</div>
+          </div>
+          <div class="slider-row" style="margin-top: 12px;">
+            <div class="slider-row__head"><span>Strength</span><span class="slider-row__value" id="img-dither-strength-value">100%</span></div>
+            <input type="range" id="img-dither-strength" min="0" max="100" value="100" step="1" />
+          </div>
+        </div>
+
+        <div class="rail__section">
+          <p class="rail__label">Base palette</p>
+          <div class="palette-strip" id="img-palette-strip"></div>
+          <p class="palette-hint">This palette (and its pixel indices) become the base for the CLUT tab. Click a swatch to edit; lock the icon to keep it when regenerating.</p>
+          <button class="btn-secondary" id="img-regenerate">Regenerate from image</button>
+        </div>
+
+      </aside>
+
+      <main class="stage" id="img-stage">
+        <div class="stage__empty" id="img-stage-empty">
+          <div class="stage__empty-icon">&#9635;</div>
+          Drop an image on the left to get started
+        </div>
+        <canvas id="img-output-canvas" hidden></canvas>
+        <div class="stage__readout" id="img-readout" hidden></div>
+      </main>
+    </div>
+  </section>
+
+  <!-- ============================== TAB 2: PALETTES ============================== -->
+  <section class="tabpanel hidden" data-tab="palette" role="tabpanel" aria-labelledby="tab-btn-palette">
+    <div class="workbench workbench--palette">
+      <aside class="sidebar">
+
+        <section class="panel">
+          <h2>Image block</h2>
+          <div class="inherited" id="pal-source-info">
+            <div class="inherited__empty" id="pal-source-empty">
+              No image yet — load one in the <b>Image</b> tab. Its reduced palette becomes the base here.
+            </div>
+            <div class="inherited__detail hidden" id="pal-source-detail">
+              <span id="pal-source-name"></span>
+              <span id="pal-source-size" class="file-chip__dims"></span>
+              <span id="pal-source-depth" class="inherited__depth"></span>
+            </div>
+          </div>
+        </section>
+
+        <section class="panel">
+          <h2>Palettes (CLUT rows)</h2>
+          <div id="pal-palette-list" class="palette-list"></div>
+          <div class="palette-actions">
+            <button id="pal-new">+ New Palette</button>
+            <button id="pal-clone" disabled>Clone Active</button>
+            <button id="pal-delete" disabled>Delete Active</button>
+          </div>
+          <div id="pal-count" class="palette-count"></div>
+        </section>
+
+      </aside>
+
+      <main class="main">
+
+        <section class="panel preview-panel">
+          <h2>Preview Workspace</h2>
+          <p class="preview-hint">Click a pixel in either preview to select and edit its palette colour. Drag to pan, scroll to zoom.</p>
+
+          <div class="preview-workspace">
+            <div id="pal-preview-empty" class="placeholder">No image loaded (Image tab)</div>
+            <div id="pal-preview-split" class="preview-split hidden">
+              <div class="viewport-box">
+                <div class="viewport-title">Original (base palette)</div>
+                <div class="viewport" id="pal-viewport-orig"><canvas id="pal-canvas-orig"></canvas></div>
+              </div>
+              <div class="viewport-box">
+                <div class="viewport-title">Active CLUT remap</div>
+                <div class="viewport viewport--pickable" id="pal-viewport-remap"><canvas id="pal-canvas-remap"></canvas></div>
+              </div>
+            </div>
+          </div>
+
+          <div class="zoom-controls hidden" id="pal-zoom-controls">
+            <button id="pal-zoom-out" title="Zoom out">-</button>
+            <span id="pal-zoom-label">100%</span>
+            <button id="pal-zoom-in" title="Zoom in">+</button>
+            <button id="pal-zoom-reset">Reset view</button>
+          </div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2>Base Palette</h2>
+            <span class="readonly">Read only &middot; from Image tab</span>
+          </div>
+          <div id="pal-original-swatches" class="swatch-grid"></div>
+        </section>
+
+        <section class="panel">
+          <div class="panel-header">
+            <h2 id="pal-active-title">Active Palette</h2>
+            <span class="readonly">Click a swatch to edit &bull; Right-click to lock</span>
+          </div>
+          <div id="pal-active-swatches" class="swatch-grid"></div>
+
+          <div id="pal-quick-edit" class="quick-edit-panel quick-edit-panel--horizontal">
+            <div class="quick-edit-panel__header">
+              <h3>Quick Edit (Bulk)</h3>
+              <label class="checkbox-label">
+                <input type="checkbox" id="pal-prevent-trans" checked>
+                <span>Auto-Prevent Transparency</span>
+              </label>
+              <button id="pal-quick-reset" disabled>Reset Sliders</button>
+            </div>
+            <div class="quick-edit-panel__sliders">
+              <div class="control-group">
+                <div class="control-label"><span>Hue Shift</span><span id="pal-quick-hue-val">0&deg;</span></div>
+                <input type="range" id="pal-quick-hue" min="-180" max="180" value="0" disabled>
+              </div>
+              <div class="control-group">
+                <div class="control-label"><span>Saturation</span><span id="pal-quick-sat-val">0%</span></div>
+                <input type="range" id="pal-quick-sat" min="-100" max="100" value="0" disabled>
+              </div>
+              <div class="control-group">
+                <div class="control-label"><span>Brightness</span><span id="pal-quick-bright-val">0%</span></div>
+                <input type="range" id="pal-quick-bright" min="-100" max="100" value="0" disabled>
+              </div>
+              <div class="control-group">
+                <div class="control-label"><span>Contrast</span><span id="pal-quick-contrast-val">0%</span></div>
+                <input type="range" id="pal-quick-contrast" min="-100" max="100" value="0" disabled>
+              </div>
+            </div>
+          </div>
+        </section>
+
+      </main>
+    </div>
+  </section>
+
+  <div class="toast" id="toast"></div>
+
+  <!-- ================================== SCRIPTS ================================== -->
+  <script src="../../js/navbar.js"></script>
+  <!-- shared core -->
+  <script src="js/core_color.js"></script>
+  <script src="js/core_ui.js"></script>
+  <script src="js/core_viewport.js"></script>
+  <script src="js/state.js"></script>
+  <script src="js/tabs.js"></script>
+  <!-- Tab 1: image -->
+  <script src="js/img_quantizer.js"></script>
+  <script src="js/img_adjust.js"></script>
+  <script src="js/img_dither.js"></script>
+  <script src="js/img_pipeline.js"></script>
+  <script src="js/img_tab.js"></script>
+  <!-- Tab 2: palettes -->
+  <script src="js/pal_model.js"></script>
+  <script src="js/pal_tab.js"></script>
+  <!-- export + project -->
+  <script src="js/tim_writer.js"></script>
+  <script src="js/project.js"></script>
+  <!-- bootstrap -->
+  <script src="js/app.js"></script>
+</body>
+</html>

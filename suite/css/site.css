@@ -20,6 +20,14 @@
   --accent-warn-dim: #7a5310;
   --danger: #f26363;
 
+  /* Raw RGB channels for the three signal colors, so tool stylesheets can
+     mix their own tint alphas — rgba(var(--accent-rgb), 0.08) — instead of
+     hand-copying the literal triplet into dozens of rules. Keep these in
+     sync with --accent / --accent-warn / --danger above. */
+  --accent-rgb: 94, 234, 212;
+  --warn-rgb: 245, 158, 11;
+  --danger-rgb: 242, 99, 99;
+
   /* Type */
   --font-display: "JetBrains Mono", "SF Mono", Consolas, monospace;
   --font-body: "Inter", -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
@@ -28,6 +36,21 @@
   --radius-sm: 3px;
   --radius-md: 6px;
   --nav-height: 56px;
+  --transport-height: 52px; /* shared height of every tool's transport bar;
+                               used in the tools' calc(100vh - nav - transport) */
+
+  /* Motion — one interaction timing for the whole suite. --dur is the
+     standard hover/active feedback; --dur-slow is for larger transient
+     elements (toasts). Both collapse to 0 under prefers-reduced-motion. */
+  --dur: 0.12s;
+  --dur-slow: 0.18s;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  :root {
+    --dur: 0s;
+    --dur-slow: 0s;
+  }
 }
 
 * {
@@ -112,7 +135,7 @@ a {
   color: var(--text-dim);
   padding: 8px 12px;
   border-radius: var(--radius-sm);
-  transition: color 0.12s ease, background 0.12s ease;
+  transition: color var(--dur) ease, background var(--dur) ease;
 }
 
 .site-nav__link:hover {
@@ -122,7 +145,7 @@ a {
 
 .site-nav__link.is-active {
   color: var(--accent);
-  background: rgba(94, 234, 212, 0.08);
+  background: rgba(var(--accent-rgb), 0.08);
 }
 
 @media (max-width: 640px) {

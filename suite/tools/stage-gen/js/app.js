@@ -25,7 +25,14 @@
 import { pickAssetsFolder, scanModels } from './fs_assets.js';
 import { hasNativeDirectoryPicker, initDropZone } from './dnd_assets.js';
 import { resolveMaterialsByNames } from './mtl_resolver.js';
-import { StageState, ENTITY_KINDS } from './stage_state.js';
+import {
+  StageState,
+  ENTITY_KINDS,
+  FOG_DEFAULTS,
+  FOG_LIMITS,
+  clampFogViewportRange,
+  normalizeAnim,
+} from './stage_state.js';
 import { buildStageJson, downloadStageJson } from './stage_export.js';
 import { buildProjectJson, downloadProjectFile, loadProjectFile } from './stage_project.js';
 import { pushHistory, undo, redo, canUndo, canRedo, clearHistory } from './history.js';
@@ -56,6 +63,8 @@ const instanceFieldsEl = document.getElementById('instance-fields');
 const propsNoSelectionEl = document.getElementById('props-no-selection');
 const propsTargetLabelEl = document.getElementById('props-target-label');
 const appearanceSectionEl = document.getElementById('appearance-section');
+const collisionSectionEl = document.getElementById('collision-section');
+const animationSectionEl = document.getElementById('animation-section');
 const entityPropsSectionEl = document.getElementById('entity-props-section');
 const entityPropsTitleEl = document.getElementById('entity-props-title');
 const entityPropsBodyEl = document.getElementById('entity-props-body');
@@ -70,6 +79,23 @@ const fScaleX = document.getElementById('f-scale-x');
 const fScaleY = document.getElementById('f-scale-y');
 const fScaleZ = document.getElementById('f-scale-z');
 const fPalette = document.getElementById('f-palette');
+const fCollide = document.getElementById('f-collide');
+const fAnimDefault = document.getElementById('f-anim-default');
+const fAnimLoop = document.getElementById('f-anim-loop');
+const fAnimSpeed = document.getElementById('f-anim-speed');
+const fAnimAutoplay = document.getElementById('f-anim-autoplay');
+const animHintEl = document.getElementById('anim-hint');
+
+const colliderFieldsEl = document.getElementById('collider-fields');
+const colliderTargetLabelEl = document.getElementById('collider-target-label');
+const cCenterX = document.getElementById('c-center-x');
+const cCenterY = document.getElementById('c-center-y');
+const cCenterZ = document.getElementById('c-center-z');
+const cSizeX = document.getElementById('c-size-x');
+const cSizeY = document.getElementById('c-size-y');
+const cSizeZ = document.getElementById('c-size-z');
+const cEnabled = document.getElementById('c-enabled');
+const cIdHint = document.getElementById('c-id-hint');
 
 const camPosX = document.getElementById('cam-pos-x');
 const camPosY = document.getElementById('cam-pos-y');
@@ -77,6 +103,15 @@ const camPosZ = document.getElementById('cam-pos-z');
 const camRotX = document.getElementById('cam-rot-x');
 const camRotY = document.getElementById('cam-rot-y');
 const camRotZ = document.getElementById('cam-rot-z');
+
+const fogEnabled = document.getElementById('fog-enabled');
+const fogNear = document.getElementById('fog-near');
+const fogFar = document.getElementById('fog-far');
+const fogColor = document.getElementById('fog-color');
+const fogLayers = document.getElementById('fog-layers');
+const fogCull = document.getElementById('fog-cull');
+const fogDrift = document.getElementById('fog-drift');
+const fogRangeHint = document.getElementById('fog-range-hint');
 
 const modeButtons = {
   translate: document.getElementById('mode-translate'),
@@ -208,11 +243,21 @@ function resyncViewportFromState() {
 
   viewer.setCameraTransform(state.camera);
 
+  // Fog rides the same resync path as the camera, so project load and
+  // undo/redo both restore the viewport preview for free - the two callers
+  // that replace `state.fog` wholesale rather than field-by-field.
+  pushFogToViewer();
+
   if (
     state.selectedInstanceId !== null &&
     (state.getInstance(state.selectedInstanceId) || state.getEntity(state.selectedInstanceId))
   ) {
     viewer.selectInstance(state.selectedInstanceId);
+  } else if (state.selectedInstanceId !== null && state.getCollider(state.selectedInstanceId)) {
+    // A selected collision box keeps its gizmo across undo/redo and project
+    // load. Deliberately NOT falling through to selectInstance(null): that
+    // detaches, and the overlay rebuild immediately after would re-attach -
+    // a visible flicker of the handles on every undo step.
   } else {
     viewer.selectInstance(null);
   }
@@ -940,6 +985,12 @@ function startRename(nameSpan, initialValue, commit) {
   input.addEventListener('dblclick', (evt) => evt.stopPropagation());
 }
 
+// Collider rows use the same cool blue as the viewport wireframes
+// (viewer.js's COLLIDER_OVERLAY_COLOR) so a row and its box read as the same
+// object. Deliberately outside ENTITY_KINDS' palette - a collision box is not
+// an entity kind, it is a child of an instance.
+const COLLIDER_ROW_COLOR = '#4a9eda';
+
 const TREE_INDENT_PX = 16; // per-depth left padding
 const TREE_ROW_BASE_PX = 8; // matches .item-list li's own horizontal padding
 
@@ -1021,6 +1072,23 @@ function buildInstanceRow(inst, depth) {
   // Extra indent past the folder rows' chevron column so instance names
   // line up with their parent folder's NAME rather than its chevron.
   li.style.paddingLeft = `${TREE_ROW_BASE_PX + depth * TREE_INDENT_PX + 18}px`;
+
+  // Leading type icon, Roblox-Studio style: <icon> <space> <name>, so every
+  // instance row opens with a fixed-width glyph and the names line up. A model
+  // whose .glb carries animation clips gets the red "animated" marker; every
+  // other model gets a neutral generic square. (Entities have their own
+  // colored dot in buildEntityRow.)
+  const icon = document.createElement('span');
+  icon.className = 'instance-icon';
+  if (viewer.hasAnimations(inst.model)) {
+    icon.classList.add('anim-marker');
+    icon.textContent = '▶';
+    icon.title = 'Animated model (has animation clips)';
+  } else {
+    icon.textContent = '■';
+    icon.title = 'Model instance';
+  }
+  li.appendChild(icon);
 
   const nameSpan = document.createElement('span');
   nameSpan.className = 'item-name';
@@ -1131,6 +1199,85 @@ function buildEntityRow(ent, depth) {
   return li;
 }
 
+/** Display label for a collider row: its mesh-derived name, or a fallback. */
+function colliderDisplayName(col) {
+  return col.name || `Box #${col.id}`;
+}
+
+/**
+ * Row for a collision box, nested under the instance that owns it.
+ *
+ * NOT DRAGGABLE, unlike every other row type. A collider's parent is not a
+ * tree-organisation choice like a folder is - it is the local space the box's
+ * center and size are expressed in. Dragging one onto a different instance
+ * would silently reinterpret its numbers against a different origin and
+ * rotation, teleporting it. Re-parenting a box means deleting it and adding
+ * one where you want it.
+ *
+ * A disabled box still draws its row (struck through) rather than
+ * disappearing: `enabled` is the INITIAL runtime state and a trigger can flip
+ * it, so an off box is authored data, not an absence.
+ */
+function buildColliderRow(col, depth) {
+  const li = document.createElement('li');
+  li.className = 'tree-instance tree-collider' + (col.id === state.selectedInstanceId ? ' is-selected' : '');
+  li.style.paddingLeft = `${TREE_ROW_BASE_PX + depth * TREE_INDENT_PX + 18}px`;
+
+  const dot = document.createElement('span');
+  dot.className = 'entity-dot';
+  dot.style.color = COLLIDER_ROW_COLOR;
+  dot.textContent = '▣';
+  li.appendChild(dot);
+
+  const nameSpan = document.createElement('span');
+  nameSpan.className = 'item-name';
+  nameSpan.textContent = colliderDisplayName(col);
+  if (col.enabled === false) nameSpan.style.textDecoration = 'line-through';
+  nameSpan.title = `Collision box, id ${col.colliderId} (addressable by triggers)`;
+  li.appendChild(nameSpan);
+
+  li.addEventListener('click', () => {
+    if (state.selectedInstanceId === col.id) return;
+    state.selectedInstanceId = col.id;
+    state.selectedFolderId = null;
+    // Selecting a box forces a view mode on: you cannot position something
+    // you cannot see, and silently doing nothing because a viewport control
+    // happens to be Off reads as the feature being broken. FOCUS is the
+    // right default here - you have just said which object you care about,
+    // and translucent is the mode you can actually fit a box in.
+    if (viewer.getCollisionViewMode() === viewer.COLLISION_VIEW_OFF) {
+      setCollisionViewMode(viewer.COLLISION_VIEW_FOCUS);
+    }
+    updateUI();          // rebuilds the overlay, which re-attaches the gizmo
+    viewer.selectCollider(col.id);
+  });
+
+  li.addEventListener('dblclick', () => {
+    startRename(nameSpan, colliderDisplayName(col), (value) => {
+      const newName = value.length === 0 ? null : value;
+      if (newName === col.name) return;
+      pushHistory(state);
+      markDirty();
+      col.name = newName;
+    });
+  });
+
+  const del = document.createElement('button');
+  del.className = 'row-btn';
+  del.textContent = '×';
+  del.title = 'Delete this collision box';
+  del.addEventListener('click', (evt) => {
+    evt.stopPropagation();
+    pushHistory(state);
+    markDirty();
+    state.removeCollider(col.id);
+    updateUI();
+  });
+  li.appendChild(del);
+
+  return li;
+}
+
 function renderInstanceList() {
   instanceListEl.innerHTML = '';
 
@@ -1145,6 +1292,14 @@ function renderInstanceList() {
     }
     for (const inst of state.instances.filter((i) => i.parentId === parentId)) {
       instanceListEl.appendChild(buildInstanceRow(inst, depth));
+      // Collision boxes nest under the instance that owns them. Instances
+      // were previously leaves - only folders recursed - so this is the
+      // first thing in the tree that can have a model instance as a parent.
+      // Not collapsible: a couple of boxes is not a subtree worth hiding,
+      // and seeing them is the point of authoring them.
+      for (const col of state.collidersFor(inst.id)) {
+        instanceListEl.appendChild(buildColliderRow(col, depth + 1));
+      }
     }
     for (const ent of state.entities.filter((e) => e.parentId === parentId)) {
       instanceListEl.appendChild(buildEntityRow(ent, depth));
@@ -1243,6 +1398,164 @@ wireInstanceField(fScaleY, 'scale.y');
 wireInstanceField(fScaleZ, 'scale.z');
 wireInstanceField(fPalette, 'palette');
 
+/**
+ * Checkbox counterpart to wireInstanceField, for boolean instance fields.
+ *
+ * DELIBERATELY SEPARATE rather than a third mode inside applyInstanceField().
+ * That function is built around a numeric pipeline - parse the string, reject
+ * NaN, round, then branch on palette-vs-transform to decide which viewer
+ * update to fire - and a checkbox shares none of it: `.checked` is already a
+ * boolean, can't be NaN, and drives no viewport update yet (the collider
+ * wireframe overlay will change that, and is the natural place to hook in).
+ * Threading a boolean through the numeric path would mean guarding every one
+ * of those steps against a case they weren't written for.
+ *
+ * Only 'change' is wired, not 'input': a checkbox fires both together, so
+ * listening to both would push two undo entries per click.
+ */
+function wireInstanceCheckbox(inputEl, path) {
+  inputEl.addEventListener('change', () => {
+    const id = state.selectedInstanceId;
+    if (id === null) return;
+
+    pushHistory(state);
+    markDirty();
+    state.setInstanceField(id, path, inputEl.checked);
+    updateUI();
+  });
+}
+
+wireInstanceCheckbox(fCollide, 'collide');
+
+// ---- Animation fields ----
+// The Animation section is only visible for a selected model instance whose
+// model carries clips, so these handlers can assume the selection IS such an
+// instance - but each still guards on getInstance() so a stray change event
+// (e.g. from a disabled control) on an entity selection can't write an `anim`
+// block onto something that has none.
+function commitAnimField(path, value) {
+  const id = state.selectedInstanceId;
+  if (id === null || !state.getInstance(id)) return;
+  pushHistory(state);
+  markDirty();
+  state.setInstanceField(id, path, value);
+  updateUI();
+}
+
+fAnimDefault.addEventListener('change', () => {
+  // Empty option value is the "None" sentinel -> null clip (play nothing).
+  commitAnimField('anim.clip', fAnimDefault.value || null);
+});
+fAnimLoop.addEventListener('change', () => {
+  commitAnimField('anim.loop', fAnimLoop.checked);
+});
+fAnimAutoplay.addEventListener('change', () => {
+  commitAnimField('anim.autoplay', fAnimAutoplay.checked);
+});
+// Speed is numeric: only 'change' (blur/Enter) is wired, so each committed
+// value is one undo entry. A non-positive or unparseable entry snaps back to
+// 1.0 rather than shipping a zero/negative rate the runtime can't use.
+fAnimSpeed.addEventListener('change', () => {
+  let v = parseFloat(fAnimSpeed.value);
+  if (!Number.isFinite(v) || v <= 0) v = 1;
+  commitAnimField('anim.speed', round3(v));
+});
+
+// ---- Auto Box / Add Box ----
+// viewer.js owns the loaded glTF, so it is the only place that knows a
+// model's per-mesh bounds; state owns the boxes. app.js is the seam, exactly
+// as it is for palette rows and the collider overlay.
+const btnAutoBox = document.getElementById('f-auto-box');
+const btnAddBox = document.getElementById('f-add-box');
+const colliderCountHintEl = document.getElementById('collider-count-hint');
+
+btnAutoBox.addEventListener('click', () => {
+  const inst = state.selectedInstanceId !== null ? state.getInstance(state.selectedInstanceId) : null;
+  if (!inst) return;
+
+  const bounds = viewer.getModelMeshBounds(inst.model);
+  if (!bounds || bounds.length === 0) {
+    // The model isn't loaded (project opened without reopening the assets
+    // folder), so there are no bounds to fit to. Say so rather than
+    // silently producing nothing or a meaningless unit box.
+    showWarning(
+      `Can't Auto Box "${inst.model}" - its geometry isn't loaded in this session. ` +
+      'Reopen the assets folder, then try again.'
+    );
+    return;
+  }
+
+  pushHistory(state);
+  markDirty();
+  const made = state.autoBoxInstance(inst.id, bounds);
+  updateUI();
+  showInfo(
+    `Seeded ${made.length} collision box${made.length === 1 ? '' : 'es'} from ` +
+    `${made.map((c) => c.name).join(', ')}. Drag them into shape and delete what you don't need.`
+  );
+});
+
+/**
+ * Wire one Center/Size numeric field of the selected collision box.
+ *
+ * Separate from wireInstanceField() for the same reason wireInstanceCheckbox()
+ * is: that function resolves state.selectedInstanceId as an instance or entity
+ * and routes viewport updates by field group, none of which applies here.
+ *
+ * Size is clamped to a small positive minimum. A zero or negative extent makes
+ * a box that can never contain anything - it would sit in the tree looking
+ * authored while being silently inert, which is exactly the failure the
+ * runtime's own ">= 1" guarantee exists to prevent.
+ */
+const MIN_BOX_SIZE = 0.01;
+function wireColliderField(inputEl, group, axis) {
+  const apply = (pushUndo) => {
+    const col = state.getCollider(state.selectedInstanceId);
+    if (!col) return;
+
+    let value = round3(parseFloat(inputEl.value));
+    if (Number.isNaN(value)) return;
+    if (group === 'size' && value < MIN_BOX_SIZE) value = MIN_BOX_SIZE;
+
+    if (pushUndo) {
+      pushHistory(state);
+      markDirty();
+    }
+    col[group][axis] = value;
+    refreshColliderOverlay();
+  };
+
+  inputEl.addEventListener('input', () => apply(false));
+  inputEl.addEventListener('change', () => { apply(true); updateUI(); });
+}
+
+wireColliderField(cCenterX, 'center', 'x');
+wireColliderField(cCenterY, 'center', 'y');
+wireColliderField(cCenterZ, 'center', 'z');
+wireColliderField(cSizeX, 'size', 'x');
+wireColliderField(cSizeY, 'size', 'y');
+wireColliderField(cSizeZ, 'size', 'z');
+
+cEnabled.addEventListener('change', () => {
+  const col = state.getCollider(state.selectedInstanceId);
+  if (!col) return;
+  pushHistory(state);
+  markDirty();
+  col.enabled = cEnabled.checked;
+  updateUI();
+});
+
+btnAddBox.addEventListener('click', () => {
+  const inst = state.selectedInstanceId !== null ? state.getInstance(state.selectedInstanceId) : null;
+  if (!inst) return;
+
+  pushHistory(state);
+  markDirty();
+  const c = state.addCollider(inst.id, { name: 'Box' });
+  state.selectedInstanceId = c.id;   // select it so it can be dragged immediately
+  updateUI();
+});
+
 // Undo snapshot for gizmo drags: fired ONCE at drag-start (mouse-down on
 // a handle), before any of the continuous 'objectChange' events for that
 // drag - see viewer.js's onDragStart() header comment for why this has to
@@ -1278,6 +1591,12 @@ viewer.onTransformChange((id, transform) => {
     if (transform.scale) node.scale = round3Axes(transform.scale);
   }
   refreshTransformFields();
+  // Live during the drag, not just on release: a collider box that lags the
+  // object it describes is worse than no box, since the whole point is
+  // judging clearances while positioning. This fires many times per drag but
+  // rebuilds only tens of 12-line wireframes, and no-ops when the overlay is
+  // off - which is the common case.
+  refreshColliderOverlay();
 });
 
 viewer.onSelectionChange((id) => {
@@ -1335,6 +1654,139 @@ wireCameraField(camRotY, 'rot', 'y');
 wireCameraField(camRotZ, 'rot', 'z');
 
 // ==========================================================================
+// Fog panel
+// ==========================================================================
+//
+// Stage-level, like the camera panel above - fog has no position and there
+// is exactly one per stage, so it is not an entity kind. Each control maps
+// 1:1 onto a main.c global (see FOG_DEFAULTS in stage_state.js).
+//
+// THE ONE THING THIS PANEL DOES THAT THE CAMERA PANEL DOESN'T is clamp on
+// commit. main.c's fog_clamp_range() exists because near/far feed a
+// reciprocal ramp (DQA = 256*near*far/(h*span), DQB = 16777216*far/span) with
+// hard int32 limits, and a range outside them doesn't look wrong - it
+// INVERTS, fogging near geometry and leaving distant geometry clear. The pad
+// editor clamps for exactly this reason; authoring the same values in a tool
+// that didn't clamp would just move the failure to hardware, where it is far
+// more expensive to diagnose. So the panel physically cannot hold a
+// degenerate range: a committed value is corrected in place, and the author
+// is told rather than silently overruled.
+//
+// The correction runs on COMMIT ONLY (the 'change' half of the live/commit
+// split), never on the live 'input' pass - clamping mid-drag-scrub would
+// fight the drag, snapping the value back under the cursor on every frame
+// that strayed out of range.
+
+/** Live readout under Near/Far: what these actually export, in the engine
+ *  units main.c's globals hold. Makes the *1024 upscale visible instead of
+ *  implicit, so an author reading the fog block in main.c can match numbers
+ *  against the tool without doing arithmetic. */
+function refreshFogRangeHint() {
+  const nearEng = Math.round(state.fog.near * 1024);
+  const farEng = Math.round(state.fog.far * 1024);
+  fogRangeHint.textContent =
+    `Exports as fog_near ${nearEng}, fog_far ${farEng} (engine units). ` +
+    `Ramp is linear in 1/z, so fog thickens fastest just past Near.`;
+}
+
+/**
+ * Commit one fog field. `clampRange` re-runs the near/far clamp afterward
+ * (only the two distance fields need it). Mirrors applyCameraField's
+ * live-vs-commit contract: pushUndo/fullRerender are the caller's call.
+ */
+function applyFogField(key, value, { pushUndo, fullRerender, clampRange = false }) {
+  if (pushUndo) {
+    pushHistory(state);
+    markDirty();
+  }
+
+  state.fog[key] = value;
+
+  if (clampRange) {
+    const before = { near: state.fog.near, far: state.fog.far };
+    const after = clampFogViewportRange(state.fog.near, state.fog.far);
+    state.fog.near = after.near;
+    state.fog.far = after.far;
+
+    // Only shout when the clamp actually moved something, and only on a
+    // commit - a live scrub through an illegal range is not a mistake, it's
+    // just a cursor passing through.
+    if (pushUndo && (after.near !== before.near || after.far !== before.far)) {
+      showWarning(
+        `Fog range adjusted to ${after.near.toFixed(3)} / ${after.far.toFixed(3)} - the authored values would ` +
+        `rail the GTE's depth ramp (|DQA| > ${FOG_LIMITS.DQA_RAIL}) or overflow DQB, which inverts the fog on ` +
+        'hardware rather than merely looking wrong. main.c clamps identically at fog_clamp_range().'
+      );
+    }
+  }
+
+  pushFogToViewer();
+  refreshFogRangeHint();
+  if (fullRerender) updateUI();
+}
+
+/** Hand the current fog block to the viewport's PS1 parity preview. */
+function pushFogToViewer() {
+  viewer.setStageFog(state.fog);
+}
+
+fogEnabled.addEventListener('change', () => {
+  applyFogField('enabled', fogEnabled.checked, { pushUndo: true, fullRerender: false });
+});
+
+fogCull.addEventListener('change', () => {
+  applyFogField('cull', fogCull.checked, { pushUndo: true, fullRerender: false });
+});
+
+fogDrift.addEventListener('change', () => {
+  applyFogField('drift', fogDrift.checked, { pushUndo: true, fullRerender: false });
+});
+
+fogColor.addEventListener('change', () => {
+  applyFogField('color', fogColor.value, { pushUndo: true, fullRerender: false });
+});
+
+fogLayers.addEventListener('change', () => {
+  const raw = Math.round(parseFloat(fogLayers.value));
+  if (Number.isNaN(raw)) {
+    fogLayers.value = state.fog.layers; // reject nonsense, reset visibly
+    return;
+  }
+  // Hard-clamped rather than warned: FOG_MAX_LAYERS is a primitive-budget
+  // ceiling, and past ~4 layers the blend is already >94% fog, so a value
+  // above it buys nothing the author would miss.
+  const clamped = Math.max(0, Math.min(FOG_LIMITS.MAX_LAYERS, raw));
+  fogLayers.value = clamped;
+  applyFogField('layers', clamped, { pushUndo: true, fullRerender: false });
+});
+
+// Near/Far use the same live-vs-commit split as every other numeric field so
+// drag-scrub feels identical here: 'input' moves the preview with no undo
+// entry and no clamp, 'change' commits, clamps, and warns if it had to.
+function wireFogDistanceField(inputEl, key) {
+  inputEl.addEventListener('input', () => {
+    const value = parseFloat(inputEl.value);
+    if (Number.isNaN(value)) return;
+    applyFogField(key, value, { pushUndo: false, fullRerender: false });
+  });
+  inputEl.addEventListener('change', () => {
+    const value = parseFloat(inputEl.value);
+    if (Number.isNaN(value)) {
+      inputEl.value = round3(state.fog[key]);
+      return;
+    }
+    applyFogField(key, value, { pushUndo: true, fullRerender: false, clampRange: true });
+    // Write the CLAMPED values back into both fields - the clamp can move
+    // far when near was the field edited, and vice versa.
+    fogNear.value = round3(state.fog.near);
+    fogFar.value = round3(state.fog.far);
+  });
+}
+
+wireFogDistanceField(fogNear, 'near');
+wireFogDistanceField(fogFar, 'far');
+
+// ==========================================================================
 // Toolbar: transform mode
 // ==========================================================================
 
@@ -1386,6 +1838,82 @@ btnViewTop.addEventListener('click', () => viewer.setViewportView('top'));
 btnViewSide.addEventListener('click', () => viewer.setViewportView('side'));
 btnViewReset.addEventListener('click', () => viewer.resetViewportCamera());
 document.getElementById('view-grid').addEventListener('click', () => viewer.toggleGridVisible());
+
+// ---- Collision view (Off / All / Focus) ----
+// viewer.js has no access to editor state, so app.js decides which instances
+// are collidable, which boxes exist, and what "focused" resolves to - same
+// division of labour as palette rows.
+const collisionModeButtons = {
+  [viewer.COLLISION_VIEW_OFF]: document.getElementById('collision-off'),
+  [viewer.COLLISION_VIEW_ALL]: document.getElementById('collision-all'),
+  [viewer.COLLISION_VIEW_FOCUS]: document.getElementById('collision-focus'),
+};
+
+function setCollisionViewMode(mode) {
+  viewer.setCollisionViewMode(mode);
+  for (const [m, btn] of Object.entries(collisionModeButtons)) {
+    btn.classList.toggle('is-active', Number(m) === mode);
+  }
+  refreshColliderOverlay(); // rebuild now, not on the next unrelated re-render
+}
+
+for (const [mode, btn] of Object.entries(collisionModeButtons)) {
+  btn.addEventListener('click', () => setCollisionViewMode(Number(mode)));
+}
+
+/**
+ * The instance FOCUS mode should show. Selecting either an instance or one of
+ * its boxes focuses that instance - picking a box out of the tree must not
+ * hide the thing the box belongs to, which is the one object you need to see
+ * while fitting it.
+ */
+function focusedInstanceId() {
+  if (state.selectedInstanceId === null) return null;
+  if (state.getInstance(state.selectedInstanceId)) return state.selectedInstanceId;
+  const col = state.getCollider(state.selectedInstanceId);
+  return col ? col.parentInstanceId : null;
+}
+
+/** Push the current collision picture into the viewer, if a view mode is on. */
+function refreshColliderOverlay() {
+  if (viewer.getCollisionViewMode() === viewer.COLLISION_VIEW_OFF) return;
+
+  // Authored boxes grouped by owning instance. The viewer draws these INSTEAD
+  // of the automatic per-mesh fallback wherever an instance has any, matching
+  // what the runtime will do.
+  const authored = new Map();
+  for (const c of state.colliders) {
+    if (!authored.has(c.parentInstanceId)) authored.set(c.parentInstanceId, []);
+    authored.get(c.parentInstanceId).push(c);
+  }
+
+  viewer.refreshColliderOverlay(
+    new Set(state.instances.filter((inst) => inst.collide !== false).map((inst) => inst.id)),
+    authored,
+    state.selectedInstanceId,
+    focusedInstanceId()
+  );
+}
+
+// Live gizmo drags on a collision box. The viewer reports center/size in the
+// owning instance's local space, which is exactly what state stores - no
+// conversion, because the box mesh is unit geometry parented to the instance.
+//
+// Size is floored here as well as in the numeric field: a gizmo scale handle
+// dragged through zero would otherwise author a negative extent, which the
+// exporter's Math.abs would silently turn back into a positive one - a box
+// that quietly stops matching its handles.
+viewer.onColliderChange((id, transform) => {
+  const col = state.getCollider(id);
+  if (!col || !transform) return;
+  col.center = { ...transform.center };
+  col.size = {
+    x: Math.max(Math.abs(transform.size.x), MIN_BOX_SIZE),
+    y: Math.max(Math.abs(transform.size.y), MIN_BOX_SIZE),
+    z: Math.max(Math.abs(transform.size.z), MIN_BOX_SIZE),
+  };
+  refreshTransformFields(); // keep the Center/Size numbers live during the drag
+});
 
 // Viewport shading toggle (top-right overlay, Blender-style): Editor =
 // unlit full-bright textures, PS1 = live preview of the runtime's GTE
@@ -1452,6 +1980,11 @@ fileLoadProject.addEventListener('change', async () => {
     id: inst.id,
     model: inst.model,
     palette: inst.palette,
+    // v6 field. `!== false` means a v1-v5 file - which has no `collide` key
+    // at all - loads every instance SOLID. See the version note in
+    // stage_project.js: that is the intended default, and it is why
+    // reopening an old project is worth an audit pass.
+    collide: inst.collide !== false,
     // v2 fields - `?? null` also quietly flattens any pre-v2 file into
     // "no custom names, everything at root" instead of erroring.
     name: inst.name ?? null,
@@ -1459,7 +1992,31 @@ fileLoadProject.addEventListener('change', async () => {
     pos: { ...inst.pos },
     rot: { ...inst.rot },
     scale: { ...inst.scale },
+    // v8 field. A v1-v7 project has no `anim` key; normalizeAnim backfills
+    // clip=None (no default animation), which is what those stages already did.
+    anim: normalizeAnim(inst.anim),
   }));
+  // v7 field. A v1-v6 project has none, which leaves every instance on the
+  // automatic per-primitive AABB fallback - exactly what those files already
+  // shipped with, so an old project opens unchanged.
+  state.colliders = (parsed.colliders || [])
+    // Drop any box whose owning instance didn't survive the load rather than
+    // keeping an orphan that can never be selected, edited or exported.
+    .filter((c) => parsed.instances.some((inst) => inst.id === c.parentInstanceId))
+    .map((c) => ({
+      id: c.id,
+      parentInstanceId: c.parentInstanceId,
+      name: c.name ?? null,
+      colliderId: c.colliderId ?? 0,
+      enabled: c.enabled !== false,
+      center: { x: 0, y: 0, z: 0, ...(c.center || {}) },
+      size: { x: 1, y: 1, z: 1, ...(c.size || {}) },
+    }));
+  // Re-seat the id counter above whatever the file used, so the next box
+  // added can't reuse a loaded box's id. Same repair the spawn/sound
+  // namespaces already do.
+  state.nextColliderId = Math.max(parsed.nextColliderId ?? 0, state.maxColliderId() + 1);
+
   state.folders = (parsed.folders || []).map((folder) => ({
     id: folder.id,
     name: folder.name || 'Folder',
@@ -1489,6 +2046,12 @@ fileLoadProject.addEventListener('change', async () => {
     });
   state.camera.pos = { ...parsed.camera.pos };
   state.camera.rot = { ...parsed.camera.rot };
+  // Fog arrived in project format v4. Merging over FOG_DEFAULTS (rather than
+  // requiring the block) means a v1-v3 file loads with main.c's compiled-in
+  // fog values - which is precisely the fog those stages shipped with, so
+  // nothing about how they render changes. Same no-shim policy as folders/
+  // entities in v2/v3.
+  state.fog = { ...FOG_DEFAULTS, ...(parsed.fog || {}) };
   state.selectedInstanceId = null;
   state.selectedFolderId = null;
   state.nextId =
@@ -1502,6 +2065,20 @@ fileLoadProject.addEventListener('change', async () => {
   state.nextSpawnId =
     parsed.nextSpawnId ??
     Math.max(-1, ...state.entities.map((e) => (Number.isFinite(e.props.spawnId) ? e.props.spawnId : -1))) + 1;
+  // Sound IDs arrived in project format v5. A v1-v4 file has none, so the
+  // counter is derived from whatever ids the schema-default merge just
+  // handed the loaded Sound entities - max + 1, exactly the same recovery
+  // the spawn counter above uses. Deriving rather than defaulting to 0
+  // matters: starting at 0 against existing entities would mint duplicates
+  // immediately, and a trigger reference is only as good as its id.
+  state.nextSoundId = parsed.nextSoundId ?? 0;
+
+  // Fill in and de-duplicate every unique id, then re-seat both counters.
+  // Load-bearing for older files: a v1-v4 project has no soundId at all, so
+  // the schema-default merge above just gave every Sound the same 0 - which
+  // would make a trigger's "sound 0" reference resolve to whichever emitter
+  // came first. Files that were already correct pass through untouched.
+  state.repairUniqueIds();
 
   // Loading a whole new project makes the PREVIOUS project's undo history
   // meaningless (undoing "into" a different loaded file would be
@@ -1572,6 +2149,80 @@ btnExportStage.addEventListener('click', () => {
     );
   }
 
+  // Fog checks: things that are legal but probably not what was meant -
+  // zero quad layers (textured geometry silently won't fog), culling with
+  // too few layers to hide the pop, and a non-neutral fog colour (which
+  // needs a matching FOG_COL_* edit in main.c, since the screen clear colour
+  // is derived from the same constant). Warn, don't block, same policy as
+  // palette rows and the music-slot check above.
+  const fogWarnings = state.validateFog();
+  if (fogWarnings.length > 0) {
+    showWarning(fogWarnings.join('\n\n'));
+  }
+
+  // Switch Scene triggers with no destination. The runtime resolves
+  // targetStage late (by name, like model names) and counts a miss as
+  // unresolved rather than crashing - but an EMPTY target is never a typo
+  // the runtime can help with, it just means the author hasn't filled it in
+  // yet. Catch it here where the fix is one field away. Warn, don't block:
+  // a half-authored door shouldn't stop the rest of the stage exporting.
+  const danglingDoors = (state.entities || []).filter(
+    (ent) =>
+      ent.kind === 'trigger' &&
+      ent.props.action === 'switchScene' &&
+      (ent.props.targetStage || '').trim() === ''
+  );
+  if (danglingDoors.length > 0) {
+    showWarning(
+      `${danglingDoors.length} Switch Scene trigger(s) have no Target Stage set ` +
+      `(${danglingDoors.map((e) => e.name || e.props.event || `#${e.id}`).join(', ')}). ` +
+      'They are exported but will never fire - fill in the destination stage folder name.'
+    );
+  }
+
+  // Upon Enter SFX references that no longer resolve. A trigger can be left
+  // pointing at a Sound that was since deleted, had its sample cleared, or
+  // was switched to Music mode - none of which touches the trigger, so the
+  // dangling reference is invisible in the panel (the dropdown just shows
+  // "(None)"). The exporter collapses these to -1 so nothing broken ships;
+  // this says so out loud, because silently dropping an authored sound is
+  // exactly the kind of change someone should get to disagree with.
+  const liveSoundIds = new Set(state.listTriggerableSounds().map((s) => s.soundId));
+  const danglingSfx = (state.entities || []).filter(
+    (ent) =>
+      ent.kind === 'trigger' &&
+      ent.props.action === 'switchScene' &&
+      Number.isFinite(ent.props.onEnterSoundId) &&
+      ent.props.onEnterSoundId >= 0 &&
+      !liveSoundIds.has(ent.props.onEnterSoundId)
+  );
+  if (danglingSfx.length > 0) {
+    showWarning(
+      `${danglingSfx.length} Switch Scene trigger(s) reference an Upon Enter SFX that no longer exists ` +
+      `(${danglingSfx.map((e) => e.name || e.props.event || `#${e.id}`).join(', ')}). ` +
+      'The sound was deleted, had its sample cleared, or was switched to Music mode. ' +
+      'Exported as no sound - re-pick one if that was not intended.'
+    );
+  }
+
+  // Collide audit nudge. `collide` DEFAULTS TRUE, which is right for level
+  // geometry and wrong for foliage, decals and ceiling detail - and an
+  // instance placed before the field existed carries the default silently.
+  // A stage where EVERY instance is solid is the signature of a stage nobody
+  // has audited yet, so say so once, at the moment it would ship.
+  //
+  // Gated on >1 instance: a one-object test stage being fully solid is not a
+  // signal, it's arithmetic. Warn, don't block - same policy as every check
+  // above, and "all solid" is a perfectly legal thing to mean.
+  const collidableCount = state.instances.filter((inst) => inst.collide !== false).length;
+  if (state.instances.length > 1 && collidableCount === state.instances.length) {
+    showWarning(
+      `All ${collidableCount} instances are set to Collide. That is the default, so this ` +
+      'may just mean the stage has not been audited yet - untick Collide on foliage, ' +
+      'decals and detail geometry the player should walk through.'
+    );
+  }
+
   const json = buildStageJson(state);
   downloadStageJson(json, 'stage.json');
 });
@@ -1593,12 +2244,26 @@ function applySnapshot(snapshot) {
     id: inst.id,
     model: inst.model,
     palette: inst.palette,
+    collide: inst.collide !== false,
     name: inst.name ?? null,
     parentId: inst.parentId ?? null,
     pos: { ...inst.pos },
     rot: { ...inst.rot },
     scale: { ...inst.scale },
+    anim: normalizeAnim(inst.anim),
   }));
+  // The other half of history.js's snapshot(). Without this, undo restores
+  // the instances but silently drops every collider on the stage.
+  state.colliders = (snapshot.colliders || []).map((c) => ({
+    id: c.id,
+    parentInstanceId: c.parentInstanceId,
+    name: c.name,
+    colliderId: c.colliderId,
+    enabled: c.enabled !== false,
+    center: { ...c.center },
+    size: { ...c.size },
+  }));
+  state.nextColliderId = snapshot.nextColliderId ?? state.nextColliderId;
   state.folders = (snapshot.folders || []).map((folder) => ({ ...folder }));
   state.entities = (snapshot.entities || []).map((ent) => ({
     id: ent.id,
@@ -1612,10 +2277,12 @@ function applySnapshot(snapshot) {
   }));
   state.camera.pos = { ...snapshot.camera.pos };
   state.camera.rot = { ...snapshot.camera.rot };
+  state.fog = { ...FOG_DEFAULTS, ...(snapshot.fog || {}) };
   state.selectedInstanceId = snapshot.selectedInstanceId;
   state.selectedFolderId = snapshot.selectedFolderId ?? null;
   state.nextId = snapshot.nextId;
   state.nextSpawnId = snapshot.nextSpawnId ?? state.nextSpawnId;
+  state.nextSoundId = snapshot.nextSoundId ?? state.nextSoundId;
 
   resyncViewportFromState();
   updateUI();
@@ -1657,6 +2324,13 @@ window.addEventListener('keydown', (event) => {
       viewer.toggleGridVisible();
       return;
     }
+    if (event.key === 'c' || event.key === 'C') {
+      // Cycle Off -> All -> Focus -> Off. A cycle rather than a toggle
+      // because there are three states and reaching the third shouldn't
+      // require going back to the mouse.
+      setCollisionViewMode((viewer.getCollisionViewMode() + 1) % 3);
+      return;
+    }
   }
 
   if (isUndo) {
@@ -1676,6 +2350,14 @@ window.addEventListener('keydown', (event) => {
       duplicateInstance(state.selectedInstanceId);
     } else if (state.getEntity(state.selectedInstanceId)) {
       duplicateEntity(state.selectedInstanceId);
+    } else if (state.getCollider(state.selectedInstanceId)) {
+      // Ctrl+D on a box is the main way to build a wall out of several -
+      // duplicate, nudge, repeat.
+      pushHistory(state);
+      markDirty();
+      const clone = state.duplicateCollider(state.selectedInstanceId);
+      if (clone) state.selectedInstanceId = clone.id;
+      updateUI();
     }
   } else if (isCopy) {
     // Only claim Ctrl+C when we actually have a node to copy; otherwise let
@@ -1695,6 +2377,15 @@ window.addEventListener('keydown', (event) => {
     if (state.selectedInstanceId !== null) {
       if (state.getInstance(state.selectedInstanceId)) {
         deleteInstance(state.selectedInstanceId);
+      } else if (state.getCollider(state.selectedInstanceId)) {
+        // No confirm dialog, unlike instances and folders: a box is cheap to
+        // re-add, Auto Box makes several at once so pruning is routine, and
+        // Ctrl+Z restores it. A prompt per box would make the normal
+        // workflow tedious.
+        pushHistory(state);
+        markDirty();
+        state.removeCollider(state.selectedInstanceId);
+        updateUI();
       } else {
         deleteEntity(state.selectedInstanceId);
       }
@@ -1749,6 +2440,11 @@ function renderEntityProps(ent) {
       let value = rawValue;
       if (propDef.type === 'int') value = parseInt(rawValue, 10);
       else if (propDef.type === 'number') value = parseFloat(rawValue);
+      // A select's DOM value is always a STRING. Most selects store strings
+      // ('loop', 'switchScene'), but one that references an entity by id
+      // must store a NUMBER, or it would compare unequal to the id it came
+      // from everywhere downstream - and export as "3" rather than 3.
+      else if (propDef.type === 'select' && propDef.numericValue) value = parseInt(rawValue, 10);
       if ((propDef.type === 'int' || propDef.type === 'number') && !Number.isFinite(value)) {
         inputEl.value = ent.props[propDef.key]; // reject nonsense, restore visibly
         return;
@@ -1760,22 +2456,41 @@ function renderEntityProps(ent) {
       ent.props[propDef.key] = value;
       viewer.updateEntityProps(ent.id, ent.props);
 
-      // A select can change which showIf fields are relevant (e.g. Play
-      // Mode -> interval bounds) - rebuild the section so they appear/
-      // disappear immediately. Blur first: renderEntityProps skips the
-      // rebuild while focus sits inside the section (anti-keystroke-eating
-      // guard), which would otherwise swallow this refresh.
-      if (propDef.type === 'select') {
+      // A select OR a bool can change which showIf fields are relevant (Play
+      // Mode -> interval bounds; Blur -> Blur Amount) - rebuild the section
+      // so they appear/disappear immediately.
+      //
+      // BOOLS WERE MISSING HERE, which is why ticking Blur or Ghost Trails
+      // left their sub-fields hidden until you deselected and reselected the
+      // object. Every gating prop on a Post-Process Volume is a checkbox, so
+      // the whole entity read as broken.
+      //
+      // Numbers and text are deliberately NOT in this list: they commit on
+      // every change event, and rebuilding the DOM under a field someone is
+      // still typing in is how you eat keystrokes. Only the two types that
+      // actually gate anything rebuild.
+      //
+      // Blur first: renderEntityProps skips the rebuild while focus sits
+      // inside the section (that same anti-keystroke-eating guard), which
+      // would otherwise swallow this very refresh - the checkbox you just
+      // clicked holds focus.
+      if (propDef.type === 'select' || propDef.type === 'bool') {
         if (inputEl && typeof inputEl.blur === 'function') inputEl.blur();
         renderEntityProps(ent);
       }
 
-      // Spawn-ID uniqueness is soft-validated (warn, don't block), same
-      // philosophy as palette rows: the author may be mid-renumber.
-      if (propDef.uniqueSpawnId) {
-        const taken = state.isSpawnIdTaken(value, ent.id);
+      // Unique-ID collisions are soft-validated (warn, don't block), same
+      // philosophy as palette rows: the author may be mid-renumber. Keyed by
+      // prop name, so spawn/summon share one pool and sounds get their own.
+      if (propDef.uniqueId) {
+        const taken = state.isUniqueIdTaken(propDef.key, value, ent.id);
         inputEl.classList.toggle('field-warning', taken);
-        if (taken) showWarning(`Spawn ID ${value} is already used by another spawn/summon.`);
+        if (taken) {
+          showWarning(
+            `${propDef.label} ${value} is already used by another entity. ` +
+            'References to it (e.g. a trigger\'s Upon Enter SFX) will resolve to whichever comes first.'
+          );
+        }
       }
     };
 
@@ -1796,17 +2511,28 @@ function renderEntityProps(ent) {
       label.className = 'field-full';
       label.textContent = propDef.label;
       const select = document.createElement('select');
-      for (const opt of propDef.options || []) {
+      // Options are either a STATIC list on the schema (play modes, light
+      // types - fixed vocabularies) or built LIVE from current editor state
+      // via optionsFrom (the Upon Enter SFX list of this stage's Sound
+      // entities). renderEntityProps runs on every updateUI, i.e. after any
+      // mutation, so a live list reflects an added/renamed/deleted Sound
+      // straight away with no extra plumbing.
+      const options = propDef.optionsFrom
+        ? propDef.optionsFrom(state)
+        : (propDef.options || []);
+      for (const opt of options) {
         const optionEl = document.createElement('option');
         optionEl.value = opt.value;
         optionEl.textContent = opt.label;
         select.appendChild(optionEl);
       }
-      // An unknown stored value (e.g. a project file from a future
-      // schema) falls back to the DEFAULT option rather than silently
-      // committing whatever the browser picked first.
+      // An unknown stored value falls back to the DEFAULT rather than
+      // silently committing whatever the browser picked first. For a live
+      // list this is the DANGLING REFERENCE case - the Sound a trigger
+      // pointed at was deleted or made music - and showing "(None)" is the
+      // honest answer: the reference no longer resolves.
       const current = ent.props[propDef.key];
-      const valid = (propDef.options || []).some((opt) => opt.value === current);
+      const valid = options.some((opt) => opt.value === current);
       select.value = valid ? current : propDef.default;
       select.addEventListener('change', () => commit(select.value, select));
       label.appendChild(select);
@@ -1826,6 +2552,50 @@ function renderEntityProps(ent) {
       input.addEventListener('change', () => commit(input.value, input));
       label.appendChild(input);
       entityPropsBodyEl.appendChild(label);
+
+      // OPTIONAL NUMERIC R/G/B, editing the SAME hex prop as the swatch
+      // above. Two representations of one value, deliberately - not two
+      // props that have to be kept in step. A swatch is good for choosing a
+      // mood and useless for hitting an exact number, which PS1 work is full
+      // of (a tint that has to match a texture's palette, a value carried
+      // over from another stage).
+      //
+      // Each box commits the whole recomposed hex string, so the swatch and
+      // the numbers can never disagree: there is only one stored value and
+      // both editors write it.
+      if (propDef.withRgbFields) {
+        const hex = ent.props[propDef.key] ?? '#ffffff';
+        const cur = [
+          parseInt(hex.slice(1, 3), 16) || 0,
+          parseInt(hex.slice(3, 5), 16) || 0,
+          parseInt(hex.slice(5, 7), 16) || 0,
+        ];
+
+        const grid = document.createElement('div');
+        grid.className = 'field-grid3';
+        ['R', 'G', 'B'].forEach((axis, i) => {
+          const cell = document.createElement('label');
+          cell.textContent = axis;
+          const box = document.createElement('input');
+          box.type = 'number';
+          box.step = '1';
+          box.min = '0';
+          box.max = '255';
+          box.value = cur[i];
+          box.addEventListener('change', () => {
+            let v = parseInt(box.value, 10);
+            if (!Number.isFinite(v)) return;
+            v = Math.max(0, Math.min(255, v));
+            const next = cur.slice();
+            next[i] = v;
+            const toHex = (n) => n.toString(16).padStart(2, '0');
+            commit(`#${toHex(next[0])}${toHex(next[1])}${toHex(next[2])}`, box);
+          });
+          cell.appendChild(box);
+          grid.appendChild(cell);
+        });
+        entityPropsBodyEl.appendChild(grid);
+      }
     } else {
       const label = document.createElement('label');
       label.className = 'field-full';
@@ -1839,8 +2609,11 @@ function renderEntityProps(ent) {
         input.step = propDef.type === 'int' ? '1' : '0.1';
         input.value = ent.props[propDef.key];
       }
-      if (propDef.uniqueSpawnId) {
-        input.classList.toggle('field-warning', state.isSpawnIdTaken(ent.props[propDef.key], ent.id));
+      if (propDef.uniqueId) {
+        input.classList.toggle(
+          'field-warning',
+          state.isUniqueIdTaken(propDef.key, ent.props[propDef.key], ent.id)
+        );
       }
       input.addEventListener('change', () => commit(input.value, input));
       label.appendChild(input);
@@ -1855,19 +2628,111 @@ function renderEntityProps(ent) {
  * (viewer.onTransformChange above) can refresh what the drag actually
  * changes without rebuilding the whole sidebar DOM per mouse-move.
  */
+/**
+ * Populate the Animation section for a model instance whose .glb carries
+ * clips. Rebuilds the Default-Animation dropdown (None + every clip name in
+ * authored order), reflects the stored selection, and disables loop/speed/
+ * autoplay while the selection is None (they only mean something once a clip
+ * is chosen). Only called when viewer.hasAnimations(inst.model) is true, so
+ * the option list is never empty of real clips.
+ */
+function refreshAnimationFields(inst) {
+  const clips = viewer.getModelAnimations(inst.model);
+  const anim = inst.anim || {};
+
+  // Rebuild options fresh each time: the selected instance (and therefore the
+  // clip set) changes on every selection, and the list is short.
+  fAnimDefault.innerHTML = '';
+  const noneOpt = document.createElement('option');
+  noneOpt.value = '';
+  noneOpt.textContent = 'None';
+  fAnimDefault.appendChild(noneOpt);
+  for (const name of clips) {
+    const opt = document.createElement('option');
+    opt.value = name;
+    opt.textContent = name;
+    fAnimDefault.appendChild(opt);
+  }
+
+  // If the stored clip is gone (model re-exported without it), show None but
+  // flag it - the state value is left untouched until the author recommits.
+  const storedMissing = !!anim.clip && !clips.includes(anim.clip);
+  fAnimDefault.value = anim.clip && !storedMissing ? anim.clip : '';
+
+  const active = !!fAnimDefault.value;
+  fAnimLoop.checked = anim.loop !== false;
+  fAnimSpeed.value = Number.isFinite(anim.speed) && anim.speed > 0 ? anim.speed : 1;
+  fAnimAutoplay.checked = anim.autoplay !== false;
+
+  fAnimLoop.disabled = !active;
+  fAnimSpeed.disabled = !active;
+  fAnimAutoplay.disabled = !active;
+
+  if (storedMissing) {
+    animHintEl.textContent = `Saved clip "${anim.clip}" is no longer in this model - pick another.`;
+    animHintEl.classList.remove('hidden');
+  } else if (!active) {
+    animHintEl.textContent = `${clips.length} clip${clips.length === 1 ? '' : 's'} available.`;
+    animHintEl.classList.remove('hidden');
+  } else {
+    animHintEl.classList.add('hidden');
+  }
+}
+
 function refreshTransformFields() {
   const selectedInst = state.selectedInstanceId !== null ? state.getInstance(state.selectedInstanceId) : null;
   const selectedEnt = !selectedInst && state.selectedInstanceId !== null ? state.getEntity(state.selectedInstanceId) : null;
+  const selectedCol = !selectedInst && !selectedEnt && state.selectedInstanceId !== null
+    ? state.getCollider(state.selectedInstanceId) : null;
   const selected = selectedInst || selectedEnt;
+
+  // A collision box owns the whole Properties dock while selected: it has no
+  // Transform or Appearance of its own, so showing those (belonging to
+  // nothing, or worse to the previously selected object) would be misleading.
+  colliderFieldsEl.classList.toggle('hidden', !selectedCol);
+  if (selectedCol) {
+    const owner = state.getInstance(selectedCol.parentInstanceId);
+    colliderTargetLabelEl.textContent = colliderDisplayName(selectedCol);
+    colliderTargetLabelEl.title = owner
+      ? `Collision box on ${instanceDisplayName(owner)}`
+      : 'Collision box';
+
+    cCenterX.value = round3(selectedCol.center.x);
+    cCenterY.value = round3(selectedCol.center.y);
+    cCenterZ.value = round3(selectedCol.center.z);
+    cSizeX.value = round3(selectedCol.size.x);
+    cSizeY.value = round3(selectedCol.size.y);
+    cSizeZ.value = round3(selectedCol.size.z);
+    cEnabled.checked = selectedCol.enabled !== false;
+
+    // The id is what a future trigger action addresses this box by, so it is
+    // shown rather than hidden as bookkeeping - you need to be able to read
+    // it off to wire anything to it.
+    cIdHint.textContent =
+      `Collider ID ${selectedCol.colliderId} - triggers address this box by that number.`;
+  }
 
   // The Properties dock swaps between the "no selection" placeholder and
   // the object sections; the Stage Camera section below them is always
   // visible regardless. Model instances show Appearance (palette),
   // editor entities show their kind's Parameters section instead.
-  propsNoSelectionEl.classList.toggle('hidden', !!selected);
-  if (selected) {
+  // A collider counts as a selection for the placeholder's purposes - its own
+  // block above is what's showing - but it must NOT open instance-fields,
+  // which describes an instance it isn't.
+  propsNoSelectionEl.classList.toggle('hidden', !!selected || !!selectedCol);
+  if (selectedCol) {
+    instanceFieldsEl.classList.add('hidden');
+  } else if (selected) {
     instanceFieldsEl.classList.remove('hidden');
     appearanceSectionEl.classList.toggle('hidden', !selectedInst);
+    // Collision is model-instance-only: an entity is a marker with no
+    // geometry, and a trigger's volume is authored by its scale rather than
+    // by a solidity flag.
+    collisionSectionEl.classList.toggle('hidden', !selectedInst);
+    // Animation is model-instance-only AND only for models whose .glb actually
+    // carried clips - a static model has nothing to author here.
+    const instHasAnim = !!selectedInst && viewer.hasAnimations(selectedInst.model);
+    animationSectionEl.classList.toggle('hidden', !instHasAnim);
     entityPropsSectionEl.classList.toggle('hidden', !selectedEnt);
 
     if (selectedInst) {
@@ -1891,6 +2756,7 @@ function refreshTransformFields() {
 
     if (selectedInst) {
       fPalette.value = selectedInst.palette;
+      fCollide.checked = selectedInst.collide !== false;
 
       // Reflect the model's real CLUT row bound on the input itself (QOL):
       // max clamps the spinner arrows/validation to valid rows, while the
@@ -1899,6 +2765,26 @@ function refreshTransformFields() {
       const maxPalette = state.getMaxPaletteForInstance(selectedInst.id);
       fPalette.max = Math.max(0, maxPalette - 1);
       fPalette.classList.toggle('field-warning', selectedInst.palette >= maxPalette);
+
+      // Which collision this instance actually ships with. The fallback is
+      // invisible in the tree (it has no rows), so without this line an
+      // instance using it looks identical to one with no collision at all.
+      const boxes = state.collidersFor(selectedInst.id);
+      if (selectedInst.collide === false) {
+        colliderCountHintEl.textContent = 'Not solid. Authored boxes are kept but ignored.';
+      } else if (boxes.length > 0) {
+        const off = boxes.filter((c) => c.enabled === false).length;
+        colliderCountHintEl.textContent =
+          `${boxes.length} authored box${boxes.length === 1 ? '' : 'es'}` +
+          (off > 0 ? `, ${off} starting disabled.` : '.');
+      } else {
+        colliderCountHintEl.textContent =
+          'No authored boxes - falling back to one automatic box per mesh.';
+      }
+
+      // Populate the Animation section only when it's actually showing (model
+      // carries clips); otherwise its stale contents stay hidden and unread.
+      if (instHasAnim) refreshAnimationFields(selectedInst);
     }
 
     if (selectedEnt) {
@@ -1914,6 +2800,15 @@ function refreshTransformFields() {
   camRotX.value = round3(state.camera.rot.x);
   camRotY.value = round3(state.camera.rot.y);
   camRotZ.value = round3(state.camera.rot.z);
+
+  fogEnabled.checked = !!state.fog.enabled;
+  fogNear.value = round3(state.fog.near);
+  fogFar.value = round3(state.fog.far);
+  fogColor.value = state.fog.color;
+  fogLayers.value = state.fog.layers;
+  fogCull.checked = !!state.fog.cull;
+  fogDrift.checked = !!state.fog.drift;
+  refreshFogRangeHint();
 }
 
 // ---- VRAM panel ----
@@ -2038,6 +2933,11 @@ function updateUI() {
 
   refreshTransformFields();
 
+  // Collider boxes follow instance transforms, the Collide flag, and the
+  // instance set - all of which are exactly what a re-render means. No-ops
+  // when the overlay is off.
+  refreshColliderOverlay();
+
   for (const [mode, btn] of Object.entries(modeButtons)) {
     btn.classList.toggle('is-active', mode === currentTransformMode);
   }
@@ -2056,6 +2956,15 @@ const POSITION_SENSITIVITY = 0.05;
 const ROTATION_SENSITIVITY = 0.15;
 
 [fPosX, fPosY, fPosZ, fScaleX, fScaleY, fScaleZ, camPosX, camPosY, camPosZ].forEach((el) =>
+  makeScrubbable(el, { sensitivity: POSITION_SENSITIVITY })
+);
+// Fog Near/Far are world distances in the same viewport units as position,
+// so they share POSITION_SENSITIVITY. Scrubbing these is the whole point of
+// the panel - fog is a look you dial in by eye against the PS1 preview, not
+// a number you can reason your way to. (fogLayers is deliberately NOT
+// scrubbable, for the same reason fPalette isn't: it's a 0-6 integer where
+// landing on a specific value matters more than sweeping through the range.)
+[fogNear, fogFar].forEach((el) =>
   makeScrubbable(el, { sensitivity: POSITION_SENSITIVITY })
 );
 // NOTE: fPalette is deliberately NOT scrubbable. It's a small integer row

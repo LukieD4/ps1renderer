@@ -780,11 +780,15 @@ void music_tick(void)
             wait_ticks -= take;
             steps -= take;
         }
-        // guard: a degenerate zero-length loop must not spin forever
+        // guard: a degenerate zero-length loop must not spin forever.
+        // NOTE the exit test is < 0, not <= 0: the post-decrement leaves
+        // safety at exactly 0 when the loop exits LEGITIMATELY after the
+        // 4096th event set a real delta - only a negative value means the
+        // budget was exhausted mid-spin.
         int safety = 4096;
         while (wait_ticks == 0 && !ended && safety--)
             process_event(&on_mask, &off_mask);
-        if (safety <= 0) { ended = 1; }
+        if (safety < 0) { ended = 1; }
     }
 
     if (ended) {

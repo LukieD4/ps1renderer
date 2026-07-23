@@ -31,8 +31,9 @@
 // allocator ready). Voice map (see music.h): voices 0..7 belong to this
 // module, 8..23 to music.c.
 //
-// STILL LATER: one-shot barks chained to triggers/characters ("sounds"
-// entries grow a trigger field; unpinned voices get a play-by-handle call).
+// Trigger-fired one-shots landed as sfx_play_by_id() (addressed by the
+// authored soundId); unpinned-voice barks chained to characters are still
+// future work.
 #pragma once
 
 #include <psxgte.h>
@@ -96,6 +97,20 @@ void sfx_stage_stop(void);
 void sfx_stage_toggle(void);
 int  sfx_stage_playing(void); // 1 while the ambience is running (our own flag, not SPU read-back)
 
+// Fire ONE emitter on demand by its authored STAGE_SOUND.soundId - the way
+// anything plays a specific stage sound at a moment of its choosing.
+// Currently used by a Switch Scene trigger's "Upon Enter SFX" (main.c's
+// stage_transition_begin), and the intended home for the generic event
+// system the trigger `event` field is reserved for.
+//
+// Returns 1 if a slot was begun, 0 if the id matched nothing playable
+// (unknown id, music-mode entry, unresolved sample, or a muteAfterPlay-
+// latched slot). Independent of the START ambience toggle: that governs the
+// stage's ambient bed, not the game's discrete responses to player action.
+// The authored Delay is bypassed - it describes time from stage load, which
+// is unrelated to a trigger firing now.
+int  sfx_play_by_id(unsigned int soundId);
+
 // Diagnostics for the debug overlay, same self-explanatory-silence
 // philosophy as the old wind readouts:
 //   sound_count      - sounds the active stage authored (post-clamp)
@@ -128,7 +143,9 @@ int sfx_stage_src_emb_count(void);
 // stage may author several tracks and tick exactly one; unticked tracks
 // never win the slot), or NULL if the stage authors/enables none.
 // cdPath/cdPath2 are the VAB/SEQ CD paths and fadeOnStageEnter the
-// authored transition preference - consumed by the (future) live
-// stage-transition system; at BOOT main.c reads stage 0's entry
-// directly to pick which pair music_load() gets (no entity = no music).
+// authored transition preference. NOTE main.c's music swap does NOT use
+// this - load_stage_music() needs the answer BEFORE sfx_stage_load() has
+// run, so it scans the STAGE_DEF itself (stage_find_music()); this
+// accessor reports what the LOADED stage authored, for diagnostics or a
+// future consumer.
 const STAGE_SOUND *sfx_stage_music(void);

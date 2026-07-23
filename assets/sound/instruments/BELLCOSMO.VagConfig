@@ -1,0 +1,17 @@
+{
+  "format": "VagConfig",
+  "version": 2,
+  "targetRate": 11025,
+  "quality": "sinc",
+  "cutoffPct": 90,
+  "effort": "exhaustive",
+  "loop": false,
+  "loopStartFrac": 0,
+  "name": "BELLEMUPROTEUSF",
+  "volume": 1,
+  "trimStart": 0,
+  "trimEnd": 0.9483446712018141,
+  "monitor": "output",
+  "playhead": 0,
+  "sourceFileName": "Bell-E-Mu-Proteus-FX-Cosmo-C3.wav"
+}

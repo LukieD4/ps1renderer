@@ -1,5 +1,6 @@
 PS1STAGEGEN EXTRA SEMANTICS
 Editor-native entities: Billboard, Trigger, Spawn, Summon, Sound, Light
+Stage-level blocks: Fog (section 6c)
 ================================================================
 
 Companion to PS1AUDIO_SEMANTICS / PS1TIM_SEMANTICS / PS1CUSTOM_MUSIC_
@@ -53,6 +54,25 @@ upscaled *1024 to engine fixed-point. See stage_export.js's header for
 why placement uses a sign-flip, not the per-vertex model converter's
 axis SWAP - they are different transforms on purpose.
 
+ROTATION UNITS - three different units are in play, do not conflate them:
+  pos   exported in ENGINE units (viewport * 1024).
+  rot   exported in DEGREES, sign-flipped per axis but NOT scaled.
+        py_convert_stages.py converts degrees -> the runtime's 12-bit
+        angle format (4096 == 360 degrees) via as_angle_vec3().
+  scale exported as a human multiplier; the converter upscales to 4096.
+
+  This was a real bug, fixed: the converter previously assumed rot was
+  already in engine units (like pos) and merely masked it with & 4095. A
+  camera authored at -90 degrees baked as (-90 & 4095) == 4006, which the
+  runtime reads as ~352 degrees, i.e. about -8 degrees. Stage cameras
+  therefore loaded at the correct POSITION but with almost no rotation -
+  presenting as "the stage camera ignores its rotation". Every authored
+  rotation was affected (objects too); it was simply least visible on the
+  demo stages, whose objects all sit at rot 0. Correct now: -90 -> 3072.
+
+  If you add a new rotation field anywhere, route it through
+  as_angle_vec3() in the converter, NOT as_vec3().
+
 Viewport marker colors are declared twice by design: CSS string in
 ENTITY_KINDS (tree row dot) and Three.js hex in viewer.js's
 ENTITY_COLORS (3D helper). Change both or they drift.
@@ -61,26 +81,193 @@ ENTITY_COLORS (3D helper). Change both or they drift.
 2. TRIGGER  (color #ff8c42, orange)
 -----------------------------------
 
-Volume that fires an event when entered. Runtime: NOT EXPORTED YET.
+Volume that performs an action when the player enters it. EXPORTED to
+stage.json (the FOURTH kind to graduate, after Sound, Light and Spawn) -
+but only when it has a real action; see 2.1.
 
 Params:
-  event : string, default ""   - name of the event to fire.
-  once  : bool,   default true - fire a single time vs. every entry.
+  action        : select, default 'none'
+      Nothing / Switch Scene. Single-select rather than stacked tickboxes,
+      the same shape Sound's Play Mode and Light's Light Type use - a
+      trigger is the generic "something happens here" marker and the list
+      of somethings will grow. DEFAULT IS 'none' ON PURPOSE: a freshly
+      placed trigger should be inert, so sketching out a region with one
+      doesn't silently wire up a scene switch.
+  event         : string, default ""   - name; inert today (see below).
+  targetStage   : string  [shown only for Switch Scene]
+      Destination stage FOLDER NAME (the assets/stage/<name> directory,
+      which is what stageRegistry[] is keyed by). Free text, resolved late
+      at runtime - so authoring a door doesn't depend on stage ordering,
+      which changes whenever a folder is added.
+  targetSpawnId : int, default 0  [shown only for Switch Scene]
+      Which Spawn in the destination the player arrives at. This is why
+      spawnIds are addressable: a door deposits the player at its own
+      doorway on the far side, not the destination's front entrance.
+  onEnterSoundId: select, default -1 ("(None)")  [shown only for Switch Scene]
+      Sound played the moment the door fires, in THIS stage, as the fade
+      begins - a door creak, a footstep. A LIVE dropdown of this stage's
+      non-music Sound entities (see 2.3), storing the chosen soundId.
+  userInteract  : bool, default TRUE - all actions. See 2.4.
+      ON  = the player must be inside the volume AND press CROSS.
+      OFF = fires the moment they walk in (the original behaviour).
+  once          : bool, default true - fire a single time vs. every entry.
 
 Technicality:
   - The viewport helper is a unit cube (translucent fill + edge lines);
     the entity's SCALE is the volume's size, so the regular scale gizmo
     resizes the trigger region directly. There is no separate "extent"
     param - scale IS the extent.
-  - Planned runtime pairing: the Sound system already reserves a future
-    "trigger" field on sounds (a trigger's event name keying a one-shot
-    sample), and unpinned SFX voices are kept for exactly that tier.
+  - `event` is exported but nothing consumes it yet. It stays visible for
+    every action because it is how a trigger is identified in the overlay
+    and how a future generic-event system will address it - useful even on
+    an action:none marker. Planned runtime pairing: the Sound system
+    already reserves a future "trigger" field on sounds (a trigger's event
+    name keying a one-shot sample), and unpinned SFX voices are kept for
+    exactly that tier.
+
+2.1 Export shape (stage.json "triggers" array)
+  { action, event, pos [remapPos * 1024], halfExtent [*1024 / 2],
+    targetStage, targetSpawnId, onEnterSoundId, userInteract, once }
+
+  ONLY triggers with a real action are exported. An action:none trigger is
+  an authoring marker for a region with nothing for the runtime to do, so
+  shipping it would just cost a per-frame volume test that can never fire.
+
+  SCALE BECOMES HALF-EXTENT at export: the runtime test is centre +/-
+  half-size (one subtract and one compare per axis), and scale is the FULL
+  size of a unit-cube helper, hence *1024/2. Math.abs guards a negative
+  scale, which the gizmo can produce by dragging a handle through zero and
+  which would otherwise make the box silently fail every test.
+
+  ROTATION IS NOT EXPORTED. The runtime volume is an AXIS-ALIGNED box; an
+  OBB test is real work nothing has needed yet. Keep trigger volumes
+  axis-aligned - a rotated one behaves as its axis-aligned equivalent.
+
+  Export warns (doesn't block) on a Switch Scene trigger with an empty
+  Target Stage: the runtime resolves misses late and counts them, but an
+  EMPTY target is never a typo the runtime can help with.
+
+2.2 Runtime semantics (main.c update_triggers())
+  Tested once per PLAY frame, AFTER movement - against the position the
+  player actually ended the frame at, not one they were never rendered at.
+  The player is a POINT here, not a volume: that is the right
+  approximation for a doorway (fire when the player is IN the door, not
+  when their bounding box grazes the frame) and keeps the test to three
+  subtracts and three compares per trigger.
+
+  THE LATCH. triggerFired[] is really "am I currently inside this volume",
+  not merely "has this fired". Without it a volume the player is standing
+  in re-fires every frame. `once` decides whether LEAVING clears the
+  latch: once=true keeps it set forever, once=false re-arms on exit.
+
+  ARRIVAL ARMING - the subtle one. load_stage_at() latches any trigger the
+  player spawns INSIDE. Door pairs are naturally symmetric (the spawn on
+  the far side usually sits within the return door's own volume), so
+  without this the player would arrive, be found inside the return door on
+  frame one, and be sent straight back - an infinite ping-pong. Arming on
+  arrival means the return door only fires once they have LEFT it and come
+  back, which is what walking through a door actually means.
+
+  UNRESOLVED targetStage (typo, deleted stage, or an empty target) is
+  counted and ignored - the same degrade-quietly policy unresolved model
+  names get. The latch stays SET on a failed resolve so a broken door
+  doesn't re-attempt every frame and flood the counter.
+
+  An unmatched targetSpawnId falls back to the destination's lowest spawn
+  rather than the origin: the arrival is wrong either way, but only one of
+  those is recoverable by walking.
+
+2.3 Upon Enter SFX (onEnterSoundId)
+  References a Sound entity by its soundId (see 6.0), not by sample name.
+  A sample name is not unique - two emitters may deliberately share one
+  upload at different positions - and renaming the sample would silently
+  break every reference to it. The id survives renames, tree reordering
+  and re-export.
+
+  THE DROPDOWN IS LIVE, built by optionsFrom() from current editor state
+  each time the panel renders (i.e. after any mutation), so adding,
+  renaming or deleting a Sound shows up immediately. Music-mode entities
+  are excluded: a music entity is a stage-level VAB/SEQ marker for
+  music.c, holds no sfx voice, and has no waveform to key on. Emitters
+  with an empty sample name are excluded too - they export as nothing, so
+  picking one would be guaranteed silence with no clue from the list.
+
+  DANGLING REFERENCES are handled at three layers, because a Sound can be
+  deleted or switched to Music long after a trigger pointed at it, without
+  ever touching the trigger:
+    - the panel shows "(None)" when the stored id isn't in the live list;
+    - the exporter collapses it to -1 so nothing broken ships;
+    - export WARNS, because silently dropping an authored sound is exactly
+      the kind of change an author should get to disagree with.
+
+  THERE IS NO MATCHING "AFTER YOU ARRIVE" FIELD, deliberately. The source
+  stage's samples are freed by sfx_stage_unload() during the load, so a
+  sound from the departing stage physically cannot play once the player is
+  somewhere else. A destination-side arrival sound is just a fire-once
+  Sound entity in that stage, which already works with no new machinery.
+
+  TIMING / LENGTH LIMIT. main.c's stage_transition_begin_with_sfx() fires
+  it via sfx_play_by_id() at the instant the door is accepted - only when
+  the transition is actually taken, so a player standing in a doorway
+  can't retrigger the creak every frame of a fade already running. The
+  audible window is the FADE-OUT ONLY (~16 frames at the current
+  TRANSITION_FADE_SPEED); teardown then keys every voice off, so a longer
+  sample is cut off mid-play. Lengthen the fade if a door needs more room.
+
+  sfx_play_by_id() bypasses the authored Delay (that describes time from
+  stage load, unrelated to a trigger firing now), respects muteAfterPlay
+  (a spent one-shot stays spent), and ignores the START ambience toggle -
+  that governs the stage's ambient bed, not the game's discrete responses
+  to player action.
+
+2.4 userInteract - how a trigger activates
+  A top-level property, not gated to any one action: it describes HOW the
+  trigger activates, as opposed to WHAT it does.
+
+    ON  (default) - the player must be inside the volume AND press CROSS.
+                    The volume becomes a prompt; entering commits to
+                    nothing.
+    OFF           - fires the moment they walk in.
+
+  DEFAULT ON is a deliberate feel decision: being teleported for walking
+  somewhere is startling, and a door you press to open reads as a choice
+  rather than an accident. OFF is still right for anything the player
+  shouldn't be able to decline - a cutscene boundary, a point of no return.
+
+  BEHAVIOUR CHANGE FOR EXISTING CONTENT: triggers authored before this
+  field existed had no choice but to fire on entry. Both the exporter and
+  py_convert_stages.py default a missing value to TRUE, so those triggers
+  become press-to-activate. Untick userInteract to restore the old feel.
+
+  Runtime (main.c update_triggers()):
+    - CROSS is edge-detected ONCE per pass, not per trigger, so a held
+      button can't re-fire and two overlapping volumes can't both consume
+      the same press.
+    - An interact trigger does NOT latch while waiting. The player can
+      stand in a doorway indefinitely and it stays available.
+    - Once fired it latches like any other trigger, so a second press
+      without leaving does nothing; `once` still decides whether exiting
+      re-arms it.
+    - Arrival arming (2.2) covers interact triggers too, and matters more
+      for them: without it, a player who mashes CROSS through a door would
+      arrive inside the return door and be sent straight back on their next
+      press. Latching on arrival means they must step out and back in.
+
+  PROMPTING IS NOT IMPLEMENTED. main.c publishes `player_can_interact`,
+  set every PLAY frame while the player stands inside an armed volume
+  waiting on CROSS - the single flag a prompt should key on. Nothing
+  renders it yet, and until something does, an interact volume is
+  invisible: unlike a walk-in trigger, which announces itself by firing,
+  one waiting on a button press looks exactly like empty floor.
 
 
 3. SPAWN  (color #5dd06a, green)
 --------------------------------
 
-Player/actor spawn point. Runtime: NOT EXPORTED YET.
+Player/actor spawn point. EXPORTED to stage.json (the THIRD kind to
+graduate, after Sound and Light): py_convert_stages.py bakes them into
+STAGE_SPAWN[] and main.c's load_stage_spawn() places the PLAY-mode player
+at one on stage load.
 
 Params:
   spawnId : int, default 0 - UNIQUE across all spawn-like entities.
@@ -96,6 +283,43 @@ Technicality:
     way the spawned actor will face (-Z, the same "forward" convention
     as the exported camera). Rotating the entity swings the pointer -
     rotation is meaningful data here, not decoration.
+
+3.1 Export shape (stage.json "spawns" array)
+  { spawnId, pos [remapPos * 1024], rot [remapped DEGREES] }
+
+  Sorted by spawnId at export. SUMMON IS DELIBERATELY EXCLUDED from this
+  array even though it shares the spawnId namespace: a summon is an NPC
+  placement, not a player start, and merging them would make "lowest id
+  wins" pick an NPC marker whenever one was numbered below the player's.
+
+3.2 Runtime semantics (main.c load_stage_spawn())
+  Called from load_stage() on EVERY stage load - the player's transform is
+  live state, so a stage switch that skipped it would leave them standing
+  where the previous stage left them.
+
+  WHICH SPAWN WINS: the LOWEST spawnId. So spawn 0 is the player start by
+  convention, and the rest are addressable markers for later systems
+  (checkpoints, door arrivals, stage-transition entry points). The runtime
+  scans for the minimum rather than trusting index 0 - stage-gen sorts on
+  export, but a hand-edited stage.json is exactly where that assumption
+  would quietly break.
+
+  WHAT IT SETS: player_pos from pos; player_rot.vy AND player_cam_yaw from
+  rot.vy, so the follow-camera starts behind the player looking the same
+  way (setting only the player would spawn them correctly oriented but
+  viewed from an unrelated angle, which reads as the rotation being
+  ignored). It also clears the sub-unit movement accumulators, which
+  otherwise nudge the player off the spawn on their first moving frame.
+
+  HEIGHT: the player has no gravity and no collision yet - update_play()
+  re-pins vy every frame - so the spawn's Y becomes `player_ground_y`, the
+  plane the player is confined to. That is what makes a Spawn placed on a
+  raised surface actually hold the player up there instead of dropping them
+  to y=0 one frame later. When real ground collision lands, this becomes a
+  fallback plane rather than the rule.
+
+  A stage authoring NO spawns falls back to the world origin - exactly where
+  the player started before spawns existed, so older stages are unaffected.
 
 
 4. SUMMON  (color #b06ee0, purple)
@@ -147,7 +371,33 @@ Ambient / one-shot / music audio emitter. FULLY EXPORTED and loaded by
 the PS1 runtime (sfx.c / music.c). This is the reference case for how an
 entity kind "graduates".
 
+6.0 soundId - the stable handle other entities reference
+  Auto-assigned integer, unique within the stage, from the 'sound' unique-id
+  namespace (separate from the 'spawn' pool that Spawn and Summon share -
+  see the UNIQUE ID NAMESPACES note in stage_state.js). Baked into
+  STAGE_SOUND.soundId and matched by sfx_play_by_id().
+
+  This is what a Switch Scene trigger's Upon Enter SFX stores (2.3), and
+  the intended handle for anything else that needs to fire a SPECIFIC
+  emitter later. An id rather than the sample name because a sample name
+  isn't unique (two emitters may share one upload at different positions -
+  the runtime dedupes the upload but keeps separate voices) and renaming
+  the sample would silently break every reference.
+
+  BACKWARD COMPAT. Sound IDs arrived in project format v5 and in the
+  stage.json "sounds" entries at the same time:
+    - A v1-v4 PROJECT file has no soundId, so the schema-default merge on
+      load would hand every Sound the same 0. app.js calls
+      state.repairUniqueIds() straight after the merge, which fills gaps,
+      de-duplicates, and re-seats the counters - so legacy sounds come back
+      individually addressable. Files that were already correct are left
+      untouched and no existing reference is invalidated.
+    - A stage.json without soundId falls back to the ARRAY INDEX in
+      py_convert_stages.py, not 0, for the same reason: distinct ids beat
+      five emitters all answering to "sound 0".
+
 6.1 Params
+  soundId         : int, auto-assigned - see 6.0. Unique within the stage.
   sample          : string, default ""
       Free-text base name, e.g. "WIND" - NOT "WIND.VAG". Resolved late
       (see 6.3); typos degrade to silence + an UNRES count on the debug
@@ -191,9 +441,9 @@ entity kind "graduates".
   ground-plane radius ring that live-tracks `radius` (hidden at 0).
 
 6.2 Export shape (stage.json "sounds" array)
-  { sample, pos [remapPos * 1024], volume (0-1 float), radius (*1024),
-    mode, delay, intervalMin, intervalMax, directional, muteAfterPlay,
-    fadeOnStageEnter, autoplay }
+  { soundId, sample, pos [remapPos * 1024], volume (0-1 float),
+    radius (*1024), mode, delay, intervalMin, intervalMax, directional,
+    muteAfterPlay, fadeOnStageEnter, autoplay }
   Entities with an empty sample name are skipped at export. Backward
   compat: the earliest format's bare `loop: true/false` still converts
   (true -> loop, false -> once).
@@ -341,6 +591,155 @@ Params:
   bulb + wireframe glow (always), an XZ falloff ring (spherical/spot,
   hidden at range 0), a forward -Z aim rod (directional/spot), and a
   wireframe cone sized by coneAngle + range (spot only).
+
+
+6c. STAGE FOG  (stage-level - NOT an entity)
+--------------------------------------------
+
+Distance fog. EXPORTED to stage.json as a `fog` object sitting beside
+`camera`, not as an entity kind: fog has no position and there is exactly
+one per stage, so an entity marker would be a lie about what it is. The
+Properties panel puts it directly under Stage Camera for the same reason.
+
+Runtime is main.c's fog block (search `fog_enabled`), which spelled out
+this contract itself:
+
+  "WHEN STAGE-GEN AUTHORS FOG: add enable/near/far/colour to STAGE_DEF, set
+   these globals in load_stage_lights(), and leave the L1+L2 editor writing
+   the same globals as a live override - exactly the pattern the light
+   intensities already use (authored value + live offset)."
+
+So everything here is an authored DEFAULT. The DEBUG-mode pad editor
+(hold L1+L2) still overrides all of it live on hardware.
+
+6c.1 Params  (schema: FOG_DEFAULTS in stage_state.js)
+  enabled : bool,   default false            -> fog_enabled
+  near    : number, default 0.781 vp units   -> fog_near  (800 engine)
+      Depth at which fog BEGINS (GTE depth cue IR0 = 0).
+  far     : number, default 5.859 vp units   -> fog_far   (6000 engine)
+      Depth at which fog is FULL (IR0 = 4096).
+  color   : color,  default #808080          -> FOG_COL_R/G/B
+  layers  : int 0-6, default 3               -> fog_layers
+      Full-screen 50%-blend quads inserted into the OT. Costs `layers`
+      primitives PER FRAME, not per triangle.
+  cull    : bool,   default false            -> fog_cull_enabled
+  drift   : bool,   default false            -> fog_drift_enabled
+
+  Defaults are main.c's compiled-in values verbatim, and near/far were
+  chosen so Math.round(v * 1024) lands on EXACTLY 800 / 6000 - a stage that
+  never opens the fog panel exports fog byte-identical to the hardcoded
+  defaults.
+
+  NOT authored (stays a #define in main.c, mirrored in FOG_LIMITS only for
+  preview and validation): FOG_GRAD_TOP/BOTTOM, FOG_DRIFT_SPEED/AMOUNT, and
+  every rail (FOG_DQA_RAIL, FOG_SPAN_FLOOR, FOG_NEAR_MIN/FAR_MAX). Those
+  describe the GTE's arithmetic limits, not a look - promoting them to
+  stage data would let an author write a stage that cannot be rendered.
+
+6c.2 Export shape (stage.json "fog" object)
+  { enabled, near (*1024), far (*1024), color [r,g,b], layers, cull, drift }
+
+  Emitted UNCONDITIONALLY, never gated on `enabled` - unlike the sounds and
+  lights ARRAYS, which are omitted when empty. Fog is a single stage-level
+  block and main.c has no fallback fog to fall back to: load_stage sets the
+  globals from stage data, so an absent block would leave whatever the
+  PREVIOUS stage set and fog would leak across a runtime stage switch. Same
+  reasoning that made authored lights authoritative with no recovery sun.
+
+6c.3 The near/far clamp (the one thing this panel does that Camera doesn't)
+  near/far feed a reciprocal ramp with hard int32 limits:
+      DQA = 256*near*far / (h*span)      railed at |DQA| <= 16000
+      DQB = 16777216*far / span          must stay inside int32
+  A range outside those does not look subtly wrong - it INVERTS, fogging
+  near geometry and leaving distant geometry clear. main.c clamps in
+  fog_clamp_range() for exactly this reason; clampFogEngineRange() in
+  stage_state.js is a line-for-line port, integer truncations included
+  (`FOG_DQA_RAIL / 256` is 62 in C, not 62.5, and k is built from that).
+
+  Applied on COMMIT only, never on the live drag-scrub pass - clamping
+  mid-drag would snap the value back under the cursor. If the clamp moved
+  anything, the author is told; the panel can never HOLD a degenerate range.
+
+  h = FOCAL_LENGTH + fov. fov is live-tunable in DEBUG mode, so the tool
+  validates against main.c's BOOT value (fov initialises to FOCAL_LENGTH,
+  giving h = 512) - the projection an authored stage actually loads with.
+
+6c.4 Export-time warnings (soft - warn, never block)
+  - layers == 0: textured geometry will not fog at all (see 6c.5).
+  - cull on with < 3 layers: residual at the cull plane is 0.5^layers of a
+    texel's difference from the fog colour, so geometry may visibly pop.
+  - colour != #808080: FOG_COL_* in main.c must be changed to match, since
+    the SCREEN CLEAR colour is derived from the same constant. If they
+    drift, geometry fades to one shade against a background of another -
+    which reads instantly as a broken renderer, and is the actual bug the
+    first fog cut shipped with.
+
+6c.5 Why the colour is not a free aesthetic choice
+  PS1 texture modulation is texel * tint / 128, so 128 is the NEUTRAL
+  multiplier. At #808080 a fully depth-cued textured surface therefore
+  renders as its raw unmodified texel - the GTE depth cue contributes
+  literally nothing to textured geometry, and every bit of textured fogging
+  comes from the OT quads instead. That is why `layers` exists at all, and
+  why layers == 0 fogs untextured geometry only.
+
+  A brighter fog colour would let the depth cue reach textured surfaces
+  too, at the cost of everything trending brighter with distance rather
+  than toward grey. The quads exist precisely so the colour doesn't have to
+  be chosen for the hardware's convenience.
+
+6c.6 Viewport preview
+  Lives in the viewport's PS1 shading mode, alongside the GTE lighting
+  preview (viewer.js, "PS1 FOG PARITY PREVIEW") - deliberately NOT in
+  Editor mode, where it would need THREE.Fog, which is linear in DISTANCE
+  while main.c's ramp is linear in 1/z. Two visibly different curves both
+  labelled "fog" in one tool is worse than one curve in one mode.
+
+  Emulated: the depth cue's reciprocal ramp applied to the LIT term before
+  texture modulation (which reproduces 6c.5's raw-texel result for free);
+  the quads at near + (far-near)*sqrt((i+1)/(L+1)) with their vertical
+  Gouraud gradient and 1 - 0.5^k blend; the cull as a discard past Far; and
+  drift as a one-sided ~9% widening of Far on a ~12.1s cycle. The scene
+  background becomes the fog colour, mirroring main.c deriving its clear
+  colour from FOG_COL_*.
+
+  Drift and the quads read the AUTHORED far; only the depth-cue ramp sees
+  the drifted value - matching main.c, where setup_frame_fog is the only
+  thing drift touches and draw_fog_layers/the cull read fog_far raw.
+
+  NOT emulated: DQA/DQB fixed-point rails (the panel's clamp keeps the
+  author out of that territory), 15-bit truncation, dithering. This
+  previews the fog MODEL, not the console's rasterizer - the same scope
+  line the lighting preview draws.
+
+6c.7 Runtime pipeline (DONE - full round trip lands a stage's fog on screen)
+  The `fog` block is loaded end to end:
+   - py_convert_stages.py bakes it into STAGE_DEF.fog (a STAGE_FOG struct in
+     stage_common.h): { enabled, cull, drift, layers, nearZ, farZ, r,g,b }.
+     Emitted for EVERY stage, not just fogged ones - unlike the sounds and
+     lights ARRAYS (which are omitted when empty), fog is a single block
+     main.c has no fallback for, so an absent one would let the previous
+     stage's fog leak across a runtime stage switch. Absent fields default
+     to main.c's own compiled-in constants, so a stage.json with no `fog`
+     converts to fog byte-identical to the hardcoded values. nearZ/farZ are
+     baked RAW (engine units) and the layer count is clamped to
+     FOG_MAX_LAYERS; the near/far clamp is left to the runtime (below).
+   - main.c load_stage_fog() (beside load_stage_lights(), called from
+     load_stage() on every load incl. the no-stage path) copies STAGE_FOG
+     into the fog_* globals, clamps near/far with the SAME fog_clamp_range()
+     the L1+L2 editor uses, and repaints the screen clear colour. FOG_COL_*
+     is now a runtime global (g_fog_col_*) seeded from the #define default;
+     init()'s clear colour, setup_frame_fog()'s far colour and
+     draw_fog_layers()'s gradient all read it, so an authored colour moves
+     the clear colour with it - the drift-apart bug can't recur.
+   - The L1+L2 pad editor still writes the same globals as a live override,
+     exactly the "authored value + live offset" pattern light intensity
+     uses - so a stage boots with its authored fog and DEBUG can still tune.
+
+  STILL OPEN (optional polish, not blocking):
+   - Debug overlay: the FOG page shows the LIVE globals, so it already
+     reflects authored values, but does not distinguish authored-vs-live-
+     overridden. An "authored" column would make the pad editor's overrides
+     legible. Low priority - silence here is not a correctness issue.
 
 
 7. GRADUATING ANOTHER KIND (the recipe Sound proved)

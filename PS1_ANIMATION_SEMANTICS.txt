@@ -1,0 +1,311 @@
+PS1 SKELETAL ANIMATION SEMANTICS
+How this engine rigs, skins, and plays animated models
+======================================================================
+
+Companion to PS1_GTE_LIGHTING_SEMANTICS / PS1_TIM_SEMANTICS /
+PS1_MUSIC_SEMANTICS / PS1_STAGEGEN_EXTRA_SEMANTICS. Covers the skeletal
+animation system end to end: what the offline converter bakes out of a
+glTF rig, the fixed-point and coordinate conventions that keep the
+skeleton and mesh in agreement, how the runtime turns a clip plus a
+playback time into posed vertices, and how a stage authors all of it.
+
+This document explains the SEMANTICS - what each piece computes and why -
+at the level needed to reason about the code. The authoritative source is
+py_convert_assets.py (bake), animation.c/.h (runtime), and main.c (draw
+integration). It supersedes the old ANIMATION_ACTION_PLAN.md, which was
+the build-time scoping record.
+
+Fixed-point convention: two scales are in play and must not be confused.
+  ONE == 4096   - rotations, quaternions, and every 3x3 matrix element,
+                  the same scale RotMatrix() / the GTE use.
+  UNIT == 1024  - vertex coordinates AND every translation (bone offsets,
+                  inverse-bind .t, keyframe positions). This is the model
+                  coordinate scale, so a skin matrix applied to an SVECTOR
+                  vertex lands back in the same integer space.
+
+
+1. PIPELINE OVERVIEW
+--------------------
+
+The console never sees the source rig. As with meshes and textures, the
+flow is: an offline Python converter bakes compact C arrays into
+generated/, and a lean runtime consumes them.
+
+  Blender (.blend)
+     -> glTF (.glb)                  single armature, single skinned mesh
+     -> py_convert_assets.py         reads skin + clips, bakes to C
+     -> generated/<model>.c          BONE_DEF/VERT_SKIN/BONE_KEY/ANIM_CLIP
+     -> animation.c (runtime)        pose eval + CPU skinning
+     -> main.c draw loop             projects the posed vertices as usual
+
+The mesh's static path is unchanged: a model with no rig bakes exactly as
+before and pays nothing. Rig data is purely additive - MODEL_DEF's rig
+pointers are NULL/0 on every static model.
+
+
+2. THE SOURCE RIG (glTF)
+------------------------
+
+The converter consumes ONE skin per model (the mesh node's referenced
+skin). From it:
+
+  joints[]              - the deform bones, in glTF order. This order MUST
+                          be parents-before-children (the runtime composes
+                          the hierarchy in a single forward pass); the
+                          converter asserts it.
+  inverseBindMatrices   - one 4x4 (column-major) per joint: the transform
+                          that takes a bind-pose vertex from MODEL space
+                          into that bone's local space.
+  animations[]          - each becomes one clip. A channel is a (node,
+                          path) track sampled over time; paths are
+                          translation / rotation / scale.
+
+Per-vertex, the skinned primitive carries JOINTS_0 (bone indices, already
+skin-relative == our bone indices) and WEIGHTS_0 (up to four influences).
+
+WHAT IS DROPPED, and why it is safe here:
+  - Bone SCALE. Measured <= ~1.6% across all authored clips and unused by
+    the skinner; only rotation + translation are baked.
+  - Influences beyond the top TWO (see section 4).
+  - A skinned mesh node's own transform: glTF places a skinned mesh by its
+    skeleton, not its node, so vertices bake in mesh-local (bind) space.
+    The converter warns if that node is not at identity.
+
+
+3. THE COORDINATE INVARIANT (the one thing that must be right)
+--------------------------------------------------------------
+
+The engine renders in a space reached from glTF by R = diag(1, -1, -1)
+(a 180-degree rotation about X; remap_pos / remap_dir apply it to points
+and directions). A whole TRANSFORM M in glTF space becomes R*M*R in engine
+space. R is its own inverse, so the conjugation is a pure per-element sign
+flip with s = (1, -1, -1, 1):
+
+    M'[i][j] = s[i] * s[j] * M[i][j]
+
+The rotation block gets the sign pattern; the translation column (j==3)
+becomes exactly remap_pos of the translation.
+
+The converter applies this conjugation to the inverse-bind matrices AND to
+every keyframe's local transform, so the skeleton, the bind pose, and the
+clips all live in the SAME space as the baked vertices. Because everything
+is pre-conjugated offline, the runtime does plain matrix math with NO
+coordinate remap on-console. Getting this wrong makes the skeleton and
+mesh disagree; it is the single most important correctness point.
+
+
+4. SKINNING MODEL: 2-BONE (with a 1-bone fast path)
+---------------------------------------------------
+
+Each vertex is bound to its TWO heaviest bones, weights renormalised to
+0..255 summing to exactly 255 (so w1 == 255 - w0, and only w0 is stored).
+When one bone dominates completely the vertex is flagged w0 == 255 and the
+runtime skips the second bone entirely - a free 1-bone path.
+
+Why two and not four: the measured weight distribution is strongly
+single-bone dominated (most vertices > 0.8 on their top bone); the 3rd/4th
+influences are noise. Dropping to the top two reproduces the authored
+deformation to well under 1% of model height while halving the per-vertex
+work versus full 4-bone linear blend skinning. 1-bone alone pinches
+slightly at joint seams (~2% at the worst vertex) and is the cheaper
+fallback if a heavy scene ever needs the cycles back.
+
+
+5. BAKED DATA FORMATS (generated/model_common.h)
+------------------------------------------------
+
+Emitted only for skinned models; NULL/0 on static ones.
+
+  BONE_DEF   { short parent;      // index into bones[]; -1 = root
+               MATRIX invBind; }  // engine-space inverse bind,
+                                  // rotation @ ONE, translation @ UNIT
+             bones[] are parents-first, so one forward pass composes them.
+
+  VERT_SKIN  { unsigned char bone0, bone1, w0; }  // parallel to verts[];
+             w1 = 255 - w0. bone1/w0 ignored on the 1-bone path.
+
+  BONE_KEY   { short qx,qy,qz,qw;  // local rotation quaternion @ ONE
+               int   tx,ty,tz; }   // local translation @ UNIT
+
+  ANIM_CLIP  { const char *name;
+               unsigned short frameCount, fps;   // uniform sample grid
+               unsigned char  loop;              // 1 wrap, 0 clamp
+               const BONE_KEY *keys; }           // [bone*frameCount + frame]
+
+MODEL_DEF gains: bones, boneCount, vertSkin, clips, clipCount.
+
+Clips are RESAMPLED onto a uniform frame grid (ANIM_SAMPLE_FPS, currently
+15). glTF channels have wildly different key counts and can be LINEAR or
+STEP; resampling onto a common grid means the runtime finds a frame with a
+multiply+shift instead of a per-channel key-time search. Rotations are
+stored as quaternions (not euler) for clean interpolation of large joint
+swings; nlerp + quat->matrix happen on-console.
+
+
+6. RUNTIME: POSE EVALUATION AND SKINNING (animation.c)
+------------------------------------------------------
+
+Per animated object, per frame, main.c calls:
+
+  anim_advance(st, g_dt)        advance the clock (and any cross-fade)
+  anim_evaluate(st, boneMtx)    -> model-space skin matrices
+  anim_skin_vertices(...)       -> posed vertices (g_posedVerts)
+  anim_skin_normals(...)        -> posed normals  (optional, section 9)
+
+anim_evaluate builds the pose in three stages:
+
+  a. LOCAL pose. For each bone, find the two straddling keyframes, nlerp
+     the quaternions (shortest-arc, renormalised via integer isqrt) and
+     lerp the translation by the sub-frame fraction. Scale is ignored.
+  b. COMPOSE. Walk the parents-first hierarchy: global[b] = global[parent]
+     * local[b] (a full affine 3x3+translation compose, >>12 to stay in
+     ONE/UNIT). This is the same hand-rolled compose main.c uses for
+     world*view.
+  c. SKIN MATRIX. boneMtx[b] = global[b] * invBind[b] - the matrix that
+     carries a bind vertex to its posed model-space position.
+
+anim_skin_vertices then transforms each bind vertex on the CPU: one matrix
+apply for a 1-bone vertex, or two applies blended by w0/w1 for a 2-bone
+vertex. The blend is done in MODEL SPACE (before projection) so it is
+correct under perspective. The output is an ordinary SVECTOR buffer.
+
+WHY CPU, NOT GTE: skinning is a matrix*vector per vertex with no
+projection; the GTE's transform ops also project, and juggling a
+per-bone matrix into the GTE registers per vertex costs more than the
+plain integer multiply. The GTE still does what it is good at - it
+projects the POSED buffer exactly as it projects a static model's verts,
+so lighting, fog, culling, texturing and the OT insertion are all
+unchanged. Skinning drops in by swapping the vertex source; nothing
+downstream knows the difference.
+
+
+7. TIMING (32-bit safe)
+-----------------------
+
+Play time is accumulated in DT_ONE ticks (256 == 1/60s, main.c's g_dt
+unit); one second is 15360 ticks. A clip frame is ANIM_TICKS_PER_SEC / fps
+ticks (1024 at 15fps), so:
+
+    frame = timeTicks / ticksPerFrame
+    frac  = (timeTicks % ticksPerFrame) * 4096 / ticksPerFrame   (0..4096)
+
+CRITICAL: the R3000's int/long are 32-bit. A running clock multiplied by
+fps and shifted left 12 overflows within a couple of hours of play, so the
+clock is kept BOUNDED - looping clips wrap timeTicks modulo one loop
+length, one-shots clamp at the final frame - and the frame index is
+computed with divides only, never a <<12 on the raw clock. (A host build,
+where long is 64-bit, will NOT surface this; it was caught by reasoning
+about the target.)
+
+LOOP vs ONCE is per object (st->loop, seeded from the clip, overridable):
+looping wraps and the last frame blends back to the first; a one-shot
+holds its final frame forever. Playback speed (st->speed, ONE == 1.0x)
+scales the delta.
+
+
+8. CROSS-FADE (anim_crossfade)
+------------------------------
+
+Switching clips with a blend rather than a snap. The blend happens at the
+LOCAL bone level (before the hierarchy compose), which is where blending
+is meaningful - blending final matrices would distort.
+
+On a fade request the current LOCAL pose (already blended, if a fade was
+in progress) is SNAPSHOTTED into st->fadeFrom, the new clip is selected
+and restarted, and fadeRemaining is set. Each frame anim_evaluate blends
+the live new-clip pose back toward the snapshot by wFrom = fadeRemaining /
+fadeTicks (4096 at the switch, 0 at the end) - so the pose is exactly the
+old clip at the instant of the switch and exactly the new clip when the
+fade completes.
+
+This is the walk->run mechanism, and the call a trigger or a future
+player movement state machine makes to change animation.
+
+
+9. POSED NORMALS (lighting follows the pose)
+--------------------------------------------
+
+By default lighting would use the BIND-pose normals, so shading would not
+track a swinging limb. anim_skin_normals rotates each normal by the
+ROTATION part of its bone's skin matrix (translation ignored - a normal is
+a direction) and 2-bone blends it like the vertices.
+
+PERF: a single bone's rotation is length-preserving (orthonormal up to
+fixed-point drift, measured within ~0.5% of UNIT), so the 1-bone case -
+most vertices - and every FACE normal store the rotated vector directly
+with NO renormalise. Only the 2-bone BLEND, which genuinely shortens the
+vector, pays the integer sqrt. This keeps the per-frame normal cost close
+to a bare rotation. (gte_ncs scales by normal length, so the small 1-bone
+drift is a sub-percent brightness ripple, invisible in practice.)
+
+Vertex normals use the vertex's own skin. FACE normals carry no skin of
+their own, so they are rotated by the dominant bone of the triangle's
+first vertex - a deliberate approximation, fine for flat shading.
+
+compute_object_lighting() takes the normal arrays as arguments (posed for
+an animated object, model->faceNormals/vertNormals otherwise), the same
+source-swap pattern as the vertex path. The global g_posed_normals (main.c)
+gates the whole normal-skin pass.
+
+DEFAULT OFF, and this is a real gotcha, not just a perf knob. Posed normals
+are geometrically MORE correct, but the GTE lighting path is ONE-SIDED
+(section 3 of PS1_GTE_LIGHTING_SEMANTICS): a face turned away from every
+light gets only the ambient back colour. On a stage with NO ambient light
+that back colour is 0, so every away-facing posed face renders PURE BLACK -
+a large, moving fraction of a dancing character. The BIND-pose normals used
+when this is off all point outward in the rest pose and keep catching the
+light regardless of how the mesh actually deforms, giving the familiar
+"lit everywhere" look for free. So: leave posed normals OFF unless the
+stage authors an ambient/fill light, in which case the honest shadow side
+has somewhere to sit instead of black.
+
+
+10. STAGE AUTHORING (stage.json -> STAGE_OBJECT)
+------------------------------------------------
+
+A placed object authors its animation with optional keys; all are ignored
+on a model with no rig, and all have sane defaults:
+
+  "anim"      : clip NAME to play. Resolved to an index via
+                anim_find_clip() at stage load. Absent or unmatched falls
+                back to clip 0. (Selecting by NAME, not index, keeps
+                stages robust against clip reordering.)
+  "animSpeed" : playback rate, 1.0 = normal. Baked to ONE fixed point.
+  "animLoop"  : true = loop, false = play once then hold the final frame.
+                Overrides the clip's own loop flag per placement.
+  "animStart" : start-time offset in SECONDS (baked to ticks). Desyncs
+                otherwise-identical NPCs so a crowd does not move in
+                lockstep.
+
+The player is NOT a stage object; it is a persistent entity drawn outside
+the stage loop, so its animation is gameplay-driven (a movement-speed
+state machine cross-fading idle/walk/run) and carries across scenes. Stage
+authoring is for NPCs; the two layers do not interact.
+
+
+11. MODULE BOUNDARY AND LIMITS
+------------------------------
+
+  animation.c/.h   Owns clip timing, pose evaluation, cross-fade, and CPU
+                   skinning of vertices and normals. Pure integer math (no
+                   math.h - no float on the R3000). No GPU/OT work.
+  main.c           Owns the draw loop; advances/evaluates/skins each rigged
+                   object, then projects the posed buffers through the
+                   unchanged pipeline. Holds the shared transient buffers
+                   (g_boneMtx, g_posedVerts, g_posedVertNormals,
+                   g_posedFaceNormals) and per-object ANIM_STATE.
+  generated/       Owns the baked rig data.
+
+Bounds and assumptions to respect:
+  - ANIM_MAX_BONES (32) caps deform bones per model.
+  - Posed buffers are sized MAX_MODEL_VERTS / MAX_MODEL_TRIS; a rigged
+    model must stay within those, same cap the static path assumes.
+  - ONE skin per model; joints parents-first; the converter enforces both.
+  - The shared posed/pose buffers hold one object at a time - each object
+    is evaluated, skinned, and drawn before the next, so the buffers are
+    reused, not per-object.
+
+Accuracy: the runtime, host-compiled against real baked data and compared
+to glTF's own 4-weight skinning, reproduces it to a mean ~0.1% and worst
+~1% of model height across clips, interpolation, and loop wrap - the
+residual being the 2-bone collapse, the 15fps resample, and fixed point.

@@ -1,0 +1,68 @@
+{
+    "original": [
+        "#d6bfbc",
+        "#f4efea",
+        "#998688",
+        "#a4a3a5",
+        "#6d6057",
+        "#181716",
+        "#2f2920",
+        "#7a797c",
+        "#322d2e",
+        "#904f53",
+        "#544c41",
+        "#857f81",
+        "#6f3e43",
+        "#814a4d",
+        "#cc4f57",
+        "#e2878a"
+    ],
+    "palettes": [
+        {
+            "name": "Palette 1",
+            "colours": [
+                "#d6bfbc",
+                "#f4efea",
+                "#998688",
+                "#a4a3a5",
+                "#6d6057",
+                "#181716",
+                "#2f2920",
+                "#7a797c",
+                "#322d2e",
+                "#904f53",
+                "#544c41",
+                "#857f81",
+                "#6f3e43",
+                "#814a4d",
+                "#cc4f57",
+                "#e2878a"
+            ],
+            "locks": [
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false,
+                false
+            ],
+            "hue": 0,
+            "saturation": 17,
+            "brightness": 0,
+            "contrast": 0,
+            "preventTransparency": true
+        }
+    ],
+    "active": 0,
+    "sourceFileName": "Jimbob_2D_View_1001_4bpp.png"
+}
