@@ -4,6 +4,7 @@ generated/
 _idea/
 _indev/
 SD2psx/
+__pycache__/
 
 *.blend
 *.blend1
