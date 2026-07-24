@@ -61,14 +61,15 @@
     <div class="toolbar-sep"></div>
 
     <div class="toolbar-group" aria-label="View">
-      <button id="view-front" class="btn tb-btn" title="Front view (Numpad 1)">Front</button>
-      <button id="view-top" class="btn tb-btn" title="Top view (Numpad 7)">Top</button>
-      <button id="view-side" class="btn tb-btn" title="Side view (Numpad 3)">Side</button>
-      <button id="view-reset" class="btn tb-btn" title="Reset the orbit camera">Reset</button>
+      <label class="tb-field" title="Stage name - used for the exported &lt;name&gt;.json and saved &lt;name&gt;.StageGen filenames">
+        <span>Stage</span>
+        <input type="text" id="f-stage-name" class="tb-text" placeholder="House" spellcheck="false" autocomplete="off">
+      </label>
+      <button id="view-reset" class="btn tb-btn" title="Reset the orbit camera">Reset Cam</button>
       <button id="view-grid" class="btn tb-btn" title="Toggle grid (G)">Grid</button>
-      <label class="tb-check" title="Show missing-texture materials as solid white instead of magenta. Under the PS1 shading preview, a white untextured face displays the raw lit colour - a live probe of the exact brightness the runtime would output.">
-        <input type="checkbox" id="f-missing-white">
-        <span>Missing=White</span>
+      <label class="tb-check" title="Flag missing-texture materials as magenta so they stand out. Untick to render them solid white instead - under the PS1 shading preview a white untextured face shows the raw lit colour, a live probe of the exact brightness the runtime would output.">
+        <input type="checkbox" id="f-missing-white" checked>
+        <span>Missing Textures</span>
       </label>
     </div>
 

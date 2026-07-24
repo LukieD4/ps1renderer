@@ -517,17 +517,18 @@ function renderLoop() {
       THREE.MathUtils.degToRad(inst.props.pivotAngle || 0);
   }
 
-  // Keep custom OBJ markers a fixed world size by counter-scaling them
+  // Keep fixed-size pick markers a constant world size by counter-scaling them
   // against their entity's transform, so a large trigger volume or patrol
-  // radius doesn't inflate its clickable marker (the finicky-selection fix).
+  // radius (customMarker) or a stretched post-process volume (pickCore)
+  // doesn't inflate its clickable target (the finicky-selection fix).
   for (const inst of instances.values()) {
-    if (!inst.customMarker) continue;
+    if (!inst.customMarker && !inst.pickCore) continue;
     const s = inst.object3D.scale;
-    inst.customMarker.scale.set(
-      s.x ? 1 / s.x : 1,
-      s.y ? 1 / s.y : 1,
-      s.z ? 1 / s.z : 1
-    );
+    const ix = s.x ? 1 / s.x : 1;
+    const iy = s.y ? 1 / s.y : 1;
+    const iz = s.z ? 1 / s.z : 1;
+    if (inst.customMarker) inst.customMarker.scale.set(ix, iy, iz);
+    if (inst.pickCore) inst.pickCore.scale.set(ix, iy, iz);
   }
 
   // PS1 parity preview: re-derive the Three.js light rig from the stage's
@@ -1925,14 +1926,33 @@ function buildEntityMeshes(group, kind, color, props) {
           color: tint, transparent: true, opacity: 0.10, side: THREE.DoubleSide, depthWrite: false,
         })
       );
-      fill.userData.noPick = true; // huge translucent volume - select via the edges
+      fill.userData.noPick = true; // huge translucent volume - select via the centre square
       group.add(fill);
 
       const edges = new THREE.LineSegments(
         new THREE.EdgesGeometry(new THREE.BoxGeometry(1, 1, 1)),
         new THREE.LineBasicMaterial({ color: tint })
       );
+      // The outline scales with the region, so as a click target it's both
+      // huge and finicky (a raycast against its long thin lines fires from
+      // well off the edge). Make it non-pickable and select via the small
+      // centre square below instead - the reported "selects when I'm not even
+      // clicking it" bug. This kind has no special/<kind>.glb marker, so
+      // unlike triggers it never gets a custom pickable marker; the centre
+      // square is that marker's built-in equivalent.
+      edges.userData.noPick = true;
       group.add(edges);
+
+      // Bright solid centre square - the ONLY pickable part of the volume.
+      // Counter-scaled to a fixed world size every frame (see the render
+      // loop's pickCore handling) so it stays a small, precise click target no
+      // matter how large the volume is stretched.
+      const core = new THREE.Mesh(
+        new THREE.BoxGeometry(0.18, 0.18, 0.18),
+        new THREE.MeshBasicMaterial({ color: tint })
+      );
+      core.name = 'pickCore';
+      group.add(core);
 
       // FALLOFF SHELL. The effect ramps in across this distance OUTSIDE the
       // solid box, so the authored volume is where the effect is at FULL
@@ -1984,20 +2004,24 @@ function buildEntityMeshes(group, kind, color, props) {
       break;
     }
     case 'billboard': {
+      // Half the previous size (was 1.2 x 0.8): the marker read as oversized
+      // next to the other entity markers. Height centred at y = height/2 so
+      // the quad still sits with its base on the origin's ground plane.
+      const BB_W = 0.6, BB_H = 0.4;
       const plane = new THREE.Mesh(
-        new THREE.PlaneGeometry(1.2, 0.8),
+        new THREE.PlaneGeometry(BB_W, BB_H),
         new THREE.MeshBasicMaterial({
           color, transparent: true, opacity: 0.25, side: THREE.DoubleSide, depthWrite: false,
         })
       );
-      plane.position.y = 0.4;
+      plane.position.y = BB_H / 2;
       plane.userData.noPick = true; // billboard quad - select via its wireframe frame
       group.add(plane);
       const frame = new THREE.LineSegments(
-        new THREE.EdgesGeometry(new THREE.PlaneGeometry(1.2, 0.8)),
+        new THREE.EdgesGeometry(new THREE.PlaneGeometry(BB_W, BB_H)),
         new THREE.LineBasicMaterial({ color })
       );
-      frame.position.y = 0.4;
+      frame.position.y = BB_H / 2;
       group.add(frame);
       break;
     }
@@ -2187,6 +2211,11 @@ export function addEntityHelper(id, kind, initialTransform = {}, props = {}) {
     props: { ...props },
   });
   const inst = instances.get(id);
+  // Built-in fixed-size pick target (postprocess centre square). Kept a
+  // constant world size by the render loop so a large volume doesn't inflate
+  // its clickable core - the same job attachCustomMarker does for kinds that
+  // ship a special/<kind>.glb marker.
+  inst.pickCore = group.getObjectByName('pickCore') || null;
   applyEntityPropsToMeshes(inst);
   attachCustomMarker(inst);
   return group;

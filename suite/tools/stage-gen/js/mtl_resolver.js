@@ -28,8 +28,17 @@ import { decodeTim } from './tim_reader.js';
 /**
  * Resolve a list of glTF material names to their decoded .tim texture data.
  *
- * `dirHandle` is the model's own directory handle; each name resolves to
+ * `dirHandle` is the model's own directory handle; each name resolves first to
  * <dirHandle>/textures/<name>.tim.
+ *
+ * `fallbackDirHandles` are OTHER model directories to search if the texture
+ * isn't in the model's own folder. This mirrors the PS1 runtime, which matches
+ * a material name against ONE GLOBAL texture-blob name table - so a model can
+ * legitimately reference a texture that physically lives in another model's
+ * textures/ folder (e.g. zflatplane's plane reusing house_demo's grass). The
+ * editor used to only look in the model's own folder and render those shared
+ * textures as missing; searching the other model folders too matches what the
+ * game actually does.
  *
  * Returns a Map<materialName, decodedTimData | null>. A null entry means the
  * material could not be resolved (missing file or a decode failure) - logged
@@ -38,7 +47,7 @@ import { decodeTim } from './tim_reader.js';
  * "(none)" material that untextured glTF primitives carry is skipped up front
  * (it has no texture by definition).
  */
-export async function resolveMaterialsByNames(dirHandle, materialNames) {
+export async function resolveMaterialsByNames(dirHandle, materialNames, fallbackDirHandles = []) {
   const result = new Map();
 
   // De-dupe while preserving first-seen order - a model can reference the
@@ -54,11 +63,28 @@ export async function resolveMaterialsByNames(dirHandle, materialNames) {
     const timPath = `textures/${name}.tim`;
 
     try {
-      const fileHandle = await resolveRelativePath(dirHandle, timPath);
+      // The model's own folder first (the common case), then every other
+      // model folder - quietly, since a miss here is expected and only the
+      // final all-folders-missed case is worth a warning.
+      let fileHandle = await resolveRelativePath(dirHandle, timPath, { quiet: true });
+      let foundIn = 'own folder';
       if (!fileHandle) {
-        console.warn(`resolveMaterialsByNames: material "${name}" - could not resolve "${timPath}"`);
+        for (const fbDir of fallbackDirHandles) {
+          const fbHandle = await resolveRelativePath(fbDir, timPath, { quiet: true });
+          if (fbHandle) {
+            fileHandle = fbHandle;
+            foundIn = `shared folder "${fbDir.name}"`;
+            break;
+          }
+        }
+      }
+      if (!fileHandle) {
+        console.warn(`resolveMaterialsByNames: material "${name}" - could not resolve "${timPath}" in the model's folder or any other model folder`);
         result.set(name, null);
         continue;
+      }
+      if (foundIn !== 'own folder') {
+        console.log(`resolveMaterialsByNames: material "${name}" resolved from ${foundIn} (shared texture)`);
       }
 
       const file = await fileHandle.getFile();

@@ -87,6 +87,14 @@ body {
   border-color: var(--accent);
 }
 
+/* Stage-name text field: wider than the numeric fields and NOT uppercased
+   (the .tb-field label is, but the typed stage name should read verbatim). */
+.tb-field input.tb-text {
+  width: 110px;
+  text-transform: none;
+  letter-spacing: normal;
+}
+
 .tb-check {
   display: flex;
   align-items: center;
@@ -668,12 +676,15 @@ body {
   font-variant-numeric: tabular-nums;
 }
 
-/* Folder rows are the tree's structure, not its contents - make them
-   vertically slimmer than instance/entity rows so the hierarchy reads at a
-   glance and folders don't look like just another asset. Horizontal padding
-   is left to .item-list li + the inline per-depth paddingLeft; only the
-   vertical rhythm changes here. */
+/* Folder rows are the tree's STRUCTURE, not its contents - so they drop the
+   panel fill and border box entirely and read as a plain header: just the
+   dropdown chevron + bold name + count. This is what visually separates a
+   folder from the instance/asset rows (which keep their boxes) and makes the
+   nesting obvious. The chevron and per-depth indent are unchanged. Border is
+   made transparent rather than removed so row height doesn't shift. */
 .item-list li.tree-folder {
+  background: transparent;
+  border-color: transparent;
   padding-top: 2px;
   padding-bottom: 2px;
   min-height: 0;
@@ -681,6 +692,27 @@ body {
      gap) so a folder reads as the start of a group rather than just another
      row in the run. */
   margin-bottom: 3px;
+}
+
+/* Hover: a folder is background-less, so hint at it with the chevron/name
+   turning the folder-hover yellow rather than drawing a box around the row. */
+.item-list li.tree-folder:hover {
+  background: transparent;
+  border-color: transparent;
+}
+.item-list li.tree-folder:hover .tree-chevron,
+.item-list li.tree-folder:hover .tree-folder-name {
+  color: var(--folder-hover, #e0b020);
+}
+
+/* Selected folder: accent the name instead of filling the row, keeping the
+   "folders have no background" rule intact. */
+.item-list li.tree-folder.is-selected {
+  background: transparent;
+  border-color: transparent;
+}
+.item-list li.tree-folder.is-selected .tree-folder-name {
+  color: var(--accent);
 }
 
 /* Leading type icon on every instance row (see buildInstanceRow), Roblox-

@@ -46,10 +46,8 @@ import * as viewer from './viewer.js';
 const canvasEl = document.getElementById('viewport-canvas');
 const gizmoCanvasEl = document.getElementById('viewport-gizmo-canvas');
 
-const btnViewFront = document.getElementById('view-front');
-const btnViewTop = document.getElementById('view-top');
-const btnViewSide = document.getElementById('view-side');
 const btnViewReset = document.getElementById('view-reset');
+const fStageName = document.getElementById('f-stage-name');
 
 const btnOpenAssets = document.getElementById('btn-open-assets');
 const dropZoneAssets = document.getElementById('dropzone-assets');
@@ -381,12 +379,22 @@ async function loadModelData(modelEntry) {
   // The viewer parses the .glb, then calls back with the material names it
   // found so we can resolve textures/<name>.tim against THIS model's folder.
   // It returns the resolved map, which we store for per-instance palette rows.
+  //
+  // Other discovered model folders are passed as fallbacks: the runtime
+  // resolves textures against ONE global name table, so a model can reference
+  // a texture that lives in another model's textures/ folder (e.g. a shared
+  // grass texture). resolveMaterialsByNames searches those folders when the
+  // texture isn't in this model's own - see its header for the full rationale.
+  const allDiscovered = window.__stageGenDiscoveredModels || [];
+  const fallbackDirs = allDiscovered
+    .filter((m) => m.name !== modelEntry.name)
+    .map((m) => m.dirHandle);
   let materialsMap;
   try {
     materialsMap = await viewer.loadModelIntoStage(
       modelEntry.name,
       glbBuffer,
-      (names) => resolveMaterialsByNames(modelEntry.dirHandle, names)
+      (names) => resolveMaterialsByNames(modelEntry.dirHandle, names, fallbackDirs)
     );
   } catch (err) {
     showError(`Failed to load model "${modelEntry.name}": ${err.message}`);
@@ -993,6 +1001,22 @@ const COLLIDER_ROW_COLOR = '#4a9eda';
 
 const TREE_INDENT_PX = 16; // per-depth left padding
 const TREE_ROW_BASE_PX = 8; // matches .item-list li's own horizontal padding
+// Constant inner left padding for non-folder rows: base row padding plus the
+// chevron-column offset (18px) that lines a row's icon/name up under its
+// parent folder's NAME rather than its chevron.
+const TREE_CHILD_PAD_PX = TREE_ROW_BASE_PX + 18;
+
+// Indent a non-folder tree row (instance / entity / collider). The per-depth
+// step is applied as MARGIN, not padding, so the whole row BOX - its border
+// and background - steps to the right for nested rows instead of every box
+// sharing one left edge with only the text indented. The inner content
+// padding stays constant so names still line up under the parent folder's
+// name. Folder rows keep using padding (they're background-less, so shifting
+// only their chevron/name is exactly what's wanted).
+function indentRow(li, depth) {
+  li.style.marginLeft = `${depth * TREE_INDENT_PX}px`;
+  li.style.paddingLeft = `${TREE_CHILD_PAD_PX}px`;
+}
 
 function buildFolderRow(folder, depth) {
   const li = document.createElement('li');
@@ -1069,9 +1093,7 @@ function buildFolderRow(folder, depth) {
 function buildInstanceRow(inst, depth) {
   const li = document.createElement('li');
   li.className = 'tree-instance' + (inst.id === state.selectedInstanceId ? ' is-selected' : '');
-  // Extra indent past the folder rows' chevron column so instance names
-  // line up with their parent folder's NAME rather than its chevron.
-  li.style.paddingLeft = `${TREE_ROW_BASE_PX + depth * TREE_INDENT_PX + 18}px`;
+  indentRow(li, depth);
 
   // Leading type icon, Roblox-Studio style: <icon> <space> <name>, so every
   // instance row opens with a fixed-width glyph and the names line up. A model
@@ -1148,7 +1170,7 @@ function buildEntityRow(ent, depth) {
   const def = ENTITY_KINDS[ent.kind];
   const li = document.createElement('li');
   li.className = 'tree-instance tree-entity' + (ent.id === state.selectedInstanceId ? ' is-selected' : '');
-  li.style.paddingLeft = `${TREE_ROW_BASE_PX + depth * TREE_INDENT_PX + 18}px`;
+  indentRow(li, depth);
 
   const dot = document.createElement('span');
   dot.className = 'entity-dot';
@@ -1221,7 +1243,7 @@ function colliderDisplayName(col) {
 function buildColliderRow(col, depth) {
   const li = document.createElement('li');
   li.className = 'tree-instance tree-collider' + (col.id === state.selectedInstanceId ? ' is-selected' : '');
-  li.style.paddingLeft = `${TREE_ROW_BASE_PX + depth * TREE_INDENT_PX + 18}px`;
+  indentRow(li, depth);
 
   const dot = document.createElement('span');
   dot.className = 'entity-dot';
@@ -1833,9 +1855,6 @@ fSeamSnap.addEventListener('change', () => {
 // above via wireCameraField()).
 // ==========================================================================
 
-btnViewFront.addEventListener('click', () => viewer.setViewportView('front'));
-btnViewTop.addEventListener('click', () => viewer.setViewportView('top'));
-btnViewSide.addEventListener('click', () => viewer.setViewportView('side'));
 btnViewReset.addEventListener('click', () => viewer.resetViewportCamera());
 document.getElementById('view-grid').addEventListener('click', () => viewer.toggleGridVisible());
 
@@ -1932,22 +1951,37 @@ function setViewportShading(ps1) {
 shadingEditorBtn.addEventListener('click', () => setViewportShading(false));
 shadingPs1Btn.addEventListener('click', () => setViewportShading(true));
 
-// Missing=White (View group): render missing-texture materials solid white
-// instead of magenta. Pairs with the PS1 shading preview as a brightness
-// probe (an untextured white face shows the raw lit colour). Editor
-// preference only, like the shading toggle.
+// Missing Textures (View group): when TICKED (the default), flag
+// missing-texture materials as magenta so they stand out. Unticking renders
+// them solid white, which pairs with the PS1 shading preview as a brightness
+// probe (an untextured white face shows the raw lit colour). The viewer's
+// underlying flag is `missingTextureWhite`, so it is the INVERSE of this
+// checkbox. Editor preference only, like the shading toggle.
 const fMissingWhite = document.getElementById('f-missing-white');
 fMissingWhite.addEventListener('change', () => {
-  viewer.setMissingTextureWhite(fMissingWhite.checked);
+  viewer.setMissingTextureWhite(!fMissingWhite.checked);
 });
+// Sync the viewer to the checkbox's initial (checked = magenta) state.
+viewer.setMissingTextureWhite(!fMissingWhite.checked);
 
 // ==========================================================================
 // Toolbar: file group - Load / Save / Export
 // ==========================================================================
 
+// The stage name drives BOTH exported filenames: <name>.StageGen for the
+// project save and <name>.json for the runtime export. Sanitise to a safe
+// filename base (the field is free text) and fall back to a sensible default
+// when the artist has not named the stage yet.
+function stageFileBase() {
+  const raw = (fStageName.value || '').trim();
+  // Strip anything that isn't safe in a filename; collapse whitespace to _.
+  const cleaned = raw.replace(/[<>:"/\\|?*\x00-\x1f]/g, '').replace(/\s+/g, '_').trim();
+  return cleaned || 'development';
+}
+
 btnSaveProject.addEventListener('click', () => {
   const json = buildProjectJson(state);
-  downloadProjectFile(json, 'development.StageGen');
+  downloadProjectFile(json, `${stageFileBase()}.StageGen`);
   isDirty = false; // saved - beforeunload prompt no longer needed until the next mutation
 });
 
@@ -1967,6 +2001,10 @@ fileLoadProject.addEventListener('change', async () => {
     showError(`Could not load project: ${err.message}`);
     return;
   }
+
+  // Seed the stage-name field from the loaded filename (strip the
+  // .StageGen extension) so a Save/Export round-trips to the same name.
+  fStageName.value = file.name.replace(/\.StageGen$/i, '');
 
   // Reset instance/camera state from the loaded project. Model BINARY data
   // (dirHandle, materialsMap) is NOT restored - see stage_project.js
@@ -2224,7 +2262,7 @@ btnExportStage.addEventListener('click', () => {
   }
 
   const json = buildStageJson(state);
-  downloadStageJson(json, 'stage.json');
+  downloadStageJson(json, `${stageFileBase()}.json`);
 });
 
 // ==========================================================================

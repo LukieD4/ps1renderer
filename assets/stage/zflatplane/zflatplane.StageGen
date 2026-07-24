@@ -1,5 +1,5 @@
 {
-  "version": 5,
+  "version": 8,
   "camera": {
     "pos": {
       "x": 0,
@@ -25,6 +25,8 @@
     "house",
     "3shapes",
     "honda",
+    "roads",
+    "testnpc",
     "plane",
     "arrow"
   ],
@@ -34,6 +36,7 @@
       "id": 1,
       "model": "plane",
       "palette": 0,
+      "collide": true,
       "name": null,
       "parentId": null,
       "pos": {
@@ -50,12 +53,19 @@
         "x": 1,
         "y": 1,
         "z": 1
+      },
+      "anim": {
+        "clip": null,
+        "loop": true,
+        "speed": 1,
+        "autoplay": true
       }
     },
     {
       "id": 2,
       "model": "arrow",
       "palette": 0,
+      "collide": true,
       "name": null,
       "parentId": null,
       "pos": {
@@ -72,9 +82,16 @@
         "x": 1,
         "y": 1,
         "z": 1
+      },
+      "anim": {
+        "clip": null,
+        "loop": true,
+        "speed": 1,
+        "autoplay": true
       }
     }
   ],
+  "colliders": [],
   "entities": [
     {
       "id": 3,
@@ -234,5 +251,6 @@
   ],
   "nextId": 8,
   "nextSpawnId": 1,
-  "nextSoundId": 2
+  "nextSoundId": 2,
+  "nextColliderId": 0
 }

@@ -108,15 +108,17 @@ export async function scanModels(rootDirHandle) {
  * to forward slashes defensively, though the texture paths built today
  * (textures/<materialName>.tim) already use forward slashes.
  *
- * Returns the FileSystemFileHandle, or null (with console.warn) if any
- * segment along the way is missing.
+ * Returns the FileSystemFileHandle, or null if any segment along the way is
+ * missing. Pass { quiet: true } to suppress the console.warn on a miss - used
+ * when the caller expects misses and handles them itself (e.g. probing a
+ * fallback directory for a texture that lives in another model's folder).
  */
-export async function resolveRelativePath(dirHandle, relativePath) {
+export async function resolveRelativePath(dirHandle, relativePath, { quiet = false } = {}) {
   const normalized = relativePath.replace(/\\/g, '/');
   const segments = normalized.split('/').filter((s) => s.length > 0);
 
   if (segments.length === 0) {
-    console.warn(`resolveRelativePath: empty path`);
+    if (!quiet) console.warn(`resolveRelativePath: empty path`);
     return null;
   }
 
@@ -129,7 +131,7 @@ export async function resolveRelativePath(dirHandle, relativePath) {
     const fileHandle = await current.getFileHandle(segments[segments.length - 1]);
     return fileHandle;
   } catch (err) {
-    console.warn(`resolveRelativePath: could not resolve "${relativePath}" (${err.message})`);
+    if (!quiet) console.warn(`resolveRelativePath: could not resolve "${relativePath}" (${err.message})`);
     return null;
   }
 }
